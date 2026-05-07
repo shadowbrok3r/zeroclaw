@@ -798,45 +798,22 @@ impl Agent {
     async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
         let start = Instant::now();
 
-        // ── Hook: before_tool_call (modifying) ──────────────────
-        // Mirrors the hook pipeline in run_tool_call_loop (loop_.rs) so that
-        // library-integrated runs honour the same hook chain.  See #5462.
-        let mut tool_name = call.name.clone();
-        let mut tool_args = call.arguments.clone();
-        if let Some(ref hooks) = self.hook_runner {
-            match hooks
-                .run_before_tool_call(tool_name.clone(), tool_args.clone())
-                .await
-            {
-                crate::hooks::HookResult::Continue((n, a)) => {
-                    tool_name = n;
-                    tool_args = a;
-                }
-                crate::hooks::HookResult::Cancel(reason) => {
-                    tracing::info!(
-                        tool = %call.name, %reason,
-                        "tool call cancelled by hook"
-                    );
-                    return ToolExecutionResult {
-                        name: call.name.clone(),
-                        output: format!("Cancelled by hook: {reason}"),
-                        success: false,
-                        tool_call_id: call.tool_call_id.clone(),
-                    };
-                }
-            }
-        }
-
         // ── Approval hook ──────────────────────────────────────
+        // Run **before** before_tool_call hooks so supervised-mode operators
+        // (WebSocket / Telegram) see `approval_request` immediately instead of
+        // waiting on potentially slow hooks (audit logging, webhook dispatch).
+        // Policy uses the model-emitted tool id / args (`call.*`), matching
+        // what the user saw in `tool_call` frames.
+        //
         // The ACP/WebSocket Agent path executes tools directly instead of
         // going through run_tool_call_loop. Keep its policy behavior aligned
         // with the shared loop by honoring auto_approve / always_ask here too.
         if let Some(mgr) = self.approval_manager.as_deref()
-            && mgr.needs_approval(&tool_name)
+            && mgr.needs_approval(&call.name)
         {
             let request = ApprovalRequest {
-                tool_name: tool_name.clone(),
-                arguments: tool_args.clone(),
+                tool_name: call.name.clone(),
+                arguments: call.arguments.clone(),
             };
 
             let (decision, decision_channel) = if mgr.is_non_interactive() {
@@ -874,7 +851,7 @@ impl Agent {
                         Ok(None) => continue,
                         Err(e) => {
                             tracing::warn!(
-                                tool = %tool_name,
+                                tool = %call.name,
                                 channel = %ch_name,
                                 error = %e,
                                 "channel approval request failed"
@@ -894,7 +871,7 @@ impl Agent {
                     }
                     None => {
                         tracing::warn!(
-                            tool = %tool_name,
+                            tool = %call.name,
                             "no approval channel handled this request — denying. \
                              Configure a back-channel (ACP or WS) that implements \
                              request_approval to enable interactive approval."
@@ -907,15 +884,44 @@ impl Agent {
                 (mgr.prompt_cli(&request), String::new())
             };
 
-            mgr.record_decision(&tool_name, &tool_args, decision, &decision_channel);
+            mgr.record_decision(&call.name, &call.arguments, decision, &decision_channel);
 
             if decision == ApprovalResponse::No {
                 return ToolExecutionResult {
-                    name: tool_name,
+                    name: call.name.clone(),
                     output: "Denied by user.".to_string(),
                     success: false,
                     tool_call_id: call.tool_call_id.clone(),
                 };
+            }
+        }
+
+        // ── Hook: before_tool_call (modifying) ──────────────────
+        // Mirrors the hook pipeline in run_tool_call_loop (loop_.rs) so that
+        // library-integrated runs honour the same hook chain.  See #5462.
+        let mut tool_name = call.name.clone();
+        let mut tool_args = call.arguments.clone();
+        if let Some(ref hooks) = self.hook_runner {
+            match hooks
+                .run_before_tool_call(tool_name.clone(), tool_args.clone())
+                .await
+            {
+                crate::hooks::HookResult::Continue((n, a)) => {
+                    tool_name = n;
+                    tool_args = a;
+                }
+                crate::hooks::HookResult::Cancel(reason) => {
+                    tracing::info!(
+                        tool = %call.name, %reason,
+                        "tool call cancelled by hook"
+                    );
+                    return ToolExecutionResult {
+                        name: call.name.clone(),
+                        output: format!("Cancelled by hook: {reason}"),
+                        success: false,
+                        tool_call_id: call.tool_call_id.clone(),
+                    };
+                }
             }
         }
 

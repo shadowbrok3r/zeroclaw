@@ -115,6 +115,26 @@ export class WebSocketClient {
     this.ws.send(JSON.stringify({ type: 'message', content }));
   }
 
+  /**
+   * Answer a supervised-mode `approval_request` from the gateway.
+   * @see crates/zeroclaw-gateway/src/ws.rs (tool approvals)
+   */
+  sendApprovalResponse(
+    requestId: string,
+    decision: 'approve' | 'deny' | 'always',
+  ): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error('WebSocket is not connected');
+    }
+    this.ws.send(
+      JSON.stringify({
+        type: 'approval_response',
+        request_id: requestId,
+        decision,
+      }),
+    );
+  }
+
   /** Close the connection without auto-reconnecting. */
   disconnect(): void {
     this.intentionallyClosed = true;

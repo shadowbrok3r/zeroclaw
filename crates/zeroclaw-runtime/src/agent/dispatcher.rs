@@ -2,6 +2,7 @@ use crate::tools::{Tool, ToolSpec};
 use serde_json::Value;
 use std::fmt::Write;
 use zeroclaw_providers::{ChatMessage, ChatResponse, ConversationMessage, ToolResultMessage};
+use zeroclaw_tool_call_parser::normalize_tool_arguments;
 
 #[derive(Debug, Clone)]
 pub struct ParsedToolCall {
@@ -178,14 +179,16 @@ impl ToolDispatcher for NativeToolDispatcher {
             .iter()
             .map(|tc| ParsedToolCall {
                 name: tc.name.clone(),
-                arguments: serde_json::from_str(&tc.arguments).unwrap_or_else(|e| {
-                    tracing::warn!(
-                        tool = %tc.name,
-                        error = %e,
-                        "Failed to parse native tool call arguments as JSON; defaulting to empty object"
-                    );
-                    Value::Object(serde_json::Map::new())
-                }),
+                arguments: normalize_tool_arguments(
+                    serde_json::from_str(&tc.arguments).unwrap_or_else(|e| {
+                        tracing::warn!(
+                            tool = %tc.name,
+                            error = %e,
+                            "Failed to parse native tool call arguments as JSON; defaulting to empty object"
+                        );
+                        Value::Object(serde_json::Map::new())
+                    }),
+                ),
                 tool_call_id: Some(tc.id.clone()),
             })
             .collect();
@@ -336,6 +339,43 @@ mod tests {
             }
             _ => panic!("expected tool results"),
         }
+    }
+
+    #[test]
+    fn native_dispatcher_unwraps_stringified_nested_json() {
+        let arguments = serde_json::json!({
+            "bones": "{\"hips\": {\"pitch_deg\": -5}}",
+            "plain": "hello",
+        })
+        .to_string();
+        let response = ChatResponse {
+            text: Some(String::new()),
+            tool_calls: vec![zeroclaw_providers::ToolCall {
+                id: "tc1".into(),
+                name: "avatar".into(),
+                arguments,
+                extra_content: None,
+            }],
+            usage: None,
+            reasoning_content: None,
+        };
+        let dispatcher = NativeToolDispatcher;
+        let (_, calls) = dispatcher.parse_response(&response);
+        assert_eq!(calls.len(), 1);
+        let v = &calls[0].arguments;
+        let bones = v.get("bones").expect("bones key");
+        assert!(
+            bones
+                .get("hips")
+                .and_then(|h| h.get("pitch_deg"))
+                .and_then(serde_json::Value::as_f64)
+                == Some(-5.0),
+            "bones should be a parsed object, got {bones:?}"
+        );
+        assert_eq!(
+            v.get("plain").and_then(serde_json::Value::as_str),
+            Some("hello")
+        );
     }
 
     #[test]

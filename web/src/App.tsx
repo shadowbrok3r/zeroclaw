@@ -5,8 +5,8 @@ import { ThemeProvider } from './contexts/ThemeContext';
 import { loadLocale, saveLocale } from './contexts/ThemeContext';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { DraftContext, useDraftStore } from './hooks/useDraft';
+import { Bot } from 'lucide-react';
 import { getAdminPairCode, getOnboardStatus } from './lib/api';
-import { basePath } from './lib/basePath';
 import { setLocale, type Locale } from './lib/i18n';
 import { Router } from './router/router';
 import { AgentProvider } from './contexts/AgentContext';
@@ -124,12 +124,16 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
       <div className="relative surface-panel p-8 w-full max-w-md animate-fade-in-scale">
 
         <div className="text-center mb-8">
-          <img
-            src={`${basePath}/_app/zeroclaw-trans.png`}
-            alt="ZeroClaw"
-            className="h-20 w-20 rounded-2xl object-cover mx-auto mb-4 animate-float"
-            onError={(e) => { e.currentTarget.style.display = 'none'; }}
-          />
+          <div
+            className="h-20 w-20 rounded-2xl mx-auto mb-4 flex items-center justify-center border animate-float"
+            style={{
+              borderColor: 'var(--pc-border)',
+              background: 'var(--pc-bg-elevated)',
+            }}
+            aria-hidden
+          >
+            <Bot className="h-12 w-12" style={{ color: 'var(--pc-accent)' }} />
+          </div>
           <h1 className="text-2xl font-bold mb-2 text-gradient-blue">ZeroClaw</h1>
           <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
             {displayCode ? 'Your pairing code — click Pair to connect' : 'Enter the pairing code from your terminal'}

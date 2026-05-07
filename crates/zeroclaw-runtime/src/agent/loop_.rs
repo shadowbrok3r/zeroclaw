@@ -1280,8 +1280,12 @@ pub async fn run_tool_call_loop(
                     .iter()
                     .map(|call| ParsedToolCall {
                         name: call.name.clone(),
-                        arguments: serde_json::from_str::<serde_json::Value>(&call.arguments)
-                            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+                        arguments: zeroclaw_tool_call_parser::normalize_tool_arguments(
+                            serde_json::from_str::<serde_json::Value>(&call.arguments)
+                                .unwrap_or_else(|_| {
+                                    serde_json::Value::Object(serde_json::Map::new())
+                                }),
+                        ),
                         tool_call_id: Some(call.id.clone()),
                     })
                     .collect();
@@ -1526,6 +1530,95 @@ pub async fn run_tool_call_loop(
         let mut executable_calls: Vec<ParsedToolCall> = Vec::new();
 
         for (idx, call) in tool_calls.iter().enumerate() {
+            // ── Approval hook (before hooks / inject so prompts are not delayed) ──
+            if let Some(mgr) = approval
+                && mgr.needs_approval(&call.name)
+            {
+                let request = ApprovalRequest {
+                    tool_name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                };
+
+                // Interactive CLI: prompt the operator.
+                // Non-interactive (channels): try the channel's inline
+                // approval (e.g. Telegram inline keyboard) before falling
+                // back to auto-deny.
+                let decision = if mgr.is_non_interactive() {
+                    let channel_decision = if let Some(ch) = channel {
+                        let ch_request = zeroclaw_api::channel::ChannelApprovalRequest {
+                            tool_name: request.tool_name.clone(),
+                            arguments_summary: crate::approval::summarize_args(&request.arguments),
+                        };
+                        let recipient = channel_reply_target.unwrap_or_default();
+                        match ch.request_approval(recipient, &ch_request).await {
+                            Ok(Some(r)) => Some(r),
+                            Ok(None) => None,
+                            Err(e) => {
+                                tracing::warn!("Channel approval request failed: {e}");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    match channel_decision {
+                        Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve) => {
+                            ApprovalResponse::Yes
+                        }
+                        Some(zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove) => {
+                            ApprovalResponse::Always
+                        }
+                        Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny) => {
+                            ApprovalResponse::No
+                        }
+                        // Channel doesn't support approval — auto-deny.
+                        None => ApprovalResponse::No,
+                    }
+                } else {
+                    mgr.prompt_cli(&request)
+                };
+
+                mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
+
+                if decision == ApprovalResponse::No {
+                    let denied = "Denied by user.".to_string();
+                    runtime_trace::record_event(
+                        "tool_call_result",
+                        Some(channel_name),
+                        Some(provider_name),
+                        Some(model),
+                        Some(&turn_id),
+                        Some(false),
+                        Some(&denied),
+                        serde_json::json!({
+                            "iteration": iteration + 1,
+                            "tool": call.name,
+                            "arguments": scrub_credentials(&call.arguments.to_string()),
+                        }),
+                    );
+                    if let Some(ref tx) = on_delta {
+                        let _ = tx
+                            .send(StreamDelta::Status(format!(
+                                "\u{274c} {}: {}\n",
+                                call.name, denied
+                            )))
+                            .await;
+                    }
+                    ordered_results[idx] = Some((
+                        call.name.clone(),
+                        call.tool_call_id.clone(),
+                        ToolExecutionOutcome {
+                            output: denied.clone(),
+                            success: false,
+                            error_reason: Some(denied),
+                            duration: Duration::ZERO,
+                            receipt: None,
+                        },
+                    ));
+                    continue;
+                }
+            }
+
             // ── Hook: before_tool_call (modifying) ──────────
             let mut tool_name = call.name.clone();
             let mut tool_args = call.arguments.clone();
@@ -1586,95 +1679,6 @@ pub async fn run_tool_call_loop(
                 channel_name,
                 channel_reply_target,
             );
-
-            // ── Approval hook ────────────────────────────────
-            if let Some(mgr) = approval
-                && mgr.needs_approval(&tool_name)
-            {
-                let request = ApprovalRequest {
-                    tool_name: tool_name.clone(),
-                    arguments: tool_args.clone(),
-                };
-
-                // Interactive CLI: prompt the operator.
-                // Non-interactive (channels): try the channel's inline
-                // approval (e.g. Telegram inline keyboard) before falling
-                // back to auto-deny.
-                let decision = if mgr.is_non_interactive() {
-                    let channel_decision = if let Some(ch) = channel {
-                        let ch_request = zeroclaw_api::channel::ChannelApprovalRequest {
-                            tool_name: request.tool_name.clone(),
-                            arguments_summary: crate::approval::summarize_args(&request.arguments),
-                        };
-                        let recipient = channel_reply_target.unwrap_or_default();
-                        match ch.request_approval(recipient, &ch_request).await {
-                            Ok(Some(r)) => Some(r),
-                            Ok(None) => None,
-                            Err(e) => {
-                                tracing::warn!("Channel approval request failed: {e}");
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    match channel_decision {
-                        Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve) => {
-                            ApprovalResponse::Yes
-                        }
-                        Some(zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove) => {
-                            ApprovalResponse::Always
-                        }
-                        Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny) => {
-                            ApprovalResponse::No
-                        }
-                        // Channel doesn't support approval — auto-deny.
-                        None => ApprovalResponse::No,
-                    }
-                } else {
-                    mgr.prompt_cli(&request)
-                };
-
-                mgr.record_decision(&tool_name, &tool_args, decision, channel_name);
-
-                if decision == ApprovalResponse::No {
-                    let denied = "Denied by user.".to_string();
-                    runtime_trace::record_event(
-                        "tool_call_result",
-                        Some(channel_name),
-                        Some(provider_name),
-                        Some(model),
-                        Some(&turn_id),
-                        Some(false),
-                        Some(&denied),
-                        serde_json::json!({
-                            "iteration": iteration + 1,
-                            "tool": tool_name.clone(),
-                            "arguments": scrub_credentials(&tool_args.to_string()),
-                        }),
-                    );
-                    if let Some(ref tx) = on_delta {
-                        let _ = tx
-                            .send(StreamDelta::Status(format!(
-                                "\u{274c} {}: {}\n",
-                                tool_name, denied
-                            )))
-                            .await;
-                    }
-                    ordered_results[idx] = Some((
-                        tool_name.clone(),
-                        call.tool_call_id.clone(),
-                        ToolExecutionOutcome {
-                            output: denied.clone(),
-                            success: false,
-                            error_reason: Some(denied),
-                            duration: Duration::ZERO,
-                            receipt: None,
-                        },
-                    ));
-                    continue;
-                }
-            }
 
             let signature = {
                 let canonical_args = canonicalize_json_for_tool_signature(&tool_args);

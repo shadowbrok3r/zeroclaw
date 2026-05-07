@@ -25,7 +25,7 @@
 //!     "request_id": "<uuid>",
 //!     "tool": "shell",
 //!     "arguments_summary": "command: git status",
-//!     "timeout_secs": 120
+//!     "timeout_secs": 300
 //! }
 //! Client -> Server: {
 //!     "type": "approval_response",
@@ -76,7 +76,9 @@ use zeroclaw_api::channel::ChannelApprovalResponse;
 /// Default wall-clock budget for the operator to answer an
 /// `approval_request` frame before the channel auto-denies. Mirrors the
 /// channel-side default on `TelegramConfig::approval_timeout_secs`.
-const WS_APPROVAL_TIMEOUT_SECS: u64 = 120;
+/// Wall-clock budget for `approval_request` → `approval_response`. MCP-heavy
+/// sessions often queue multiple tools before the operator notices the banner.
+const WS_APPROVAL_TIMEOUT_SECS: u64 = 300;
 
 /// Optional connection parameters sent as the first WebSocket message.
 ///
@@ -709,33 +711,13 @@ async fn process_chat_message(
         loop {
             tokio::select! {
                 biased;
-                client_msg = receiver.next() => {
-                    let Some(Ok(Message::Text(text))) = client_msg else { continue };
-                    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
-                        continue;
-                    };
-                    if parsed["type"].as_str() != Some("approval_response") {
-                        // Mid-turn `message` / other frames are ignored. The
-                        // outer `select!` will not see them either; we drop
-                        // them deliberately rather than queueing.
-                        continue;
-                    }
-                    let request_id = parsed["request_id"].as_str().unwrap_or("");
-                    let decision = match parsed["decision"].as_str().unwrap_or("") {
-                        "approve" => Some(ChannelApprovalResponse::Approve),
-                        "always" => Some(ChannelApprovalResponse::AlwaysApprove),
-                        "deny" => Some(ChannelApprovalResponse::Deny),
-                        _ => None,
-                    };
-                    if request_id.is_empty() || decision.is_none() {
-                        continue;
-                    }
-                    if let Some(tx) = pending_approvals.lock().remove(request_id) {
-                        let _ = tx.send(decision.expect("checked above"));
-                    } else {
-                        debug!(%request_id, "approval_response with no matching pending request (mid-turn)");
-                    }
-                }
+                // Outbound approval prompts must win races against both streamed
+                // agent events and inbound WebSocket frames. Previously
+                // `receiver.next()` was listed first in this biased select; any
+                // ready activity on the socket (including control frames that
+                // complete without yielding) could repeatedly preempt
+                // `approval_event_rx`, so clients saw many `tool_call` frames but
+                // never received `approval_request`. See gateway WS handler docs.
                 approval = approval_event_rx.recv() => {
                     let Some(event) = approval else { continue };
                     if let TurnEvent::ApprovalRequest {
@@ -814,6 +796,39 @@ async fn process_chat_message(
                         }),
                     };
                     let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
+                }
+                client_msg = receiver.next() => {
+                    let Some(Ok(Message::Text(text))) = client_msg else {
+                        tokio::task::yield_now().await;
+                        continue;
+                    };
+                    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
+                        tokio::task::yield_now().await;
+                        continue;
+                    };
+                    if parsed["type"].as_str() != Some("approval_response") {
+                        // Mid-turn traffic other than approval_response: yield so
+                        // we never spin tightly on ignored frames while approval
+                        // events are waiting on other branches.
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    let request_id = parsed["request_id"].as_str().unwrap_or("");
+                    let decision = match parsed["decision"].as_str().unwrap_or("") {
+                        "approve" => Some(ChannelApprovalResponse::Approve),
+                        "always" => Some(ChannelApprovalResponse::AlwaysApprove),
+                        "deny" => Some(ChannelApprovalResponse::Deny),
+                        _ => None,
+                    };
+                    if request_id.is_empty() || decision.is_none() {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    if let Some(tx) = pending_approvals.lock().remove(request_id) {
+                        let _ = tx.send(decision.expect("checked above"));
+                    } else {
+                        debug!(%request_id, "approval_response with no matching pending request (mid-turn)");
+                    }
                 }
             }
         }

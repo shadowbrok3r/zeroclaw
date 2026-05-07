@@ -418,9 +418,18 @@ interactive_feature_picker() {
 # ── Web dashboard build for source installs ──────────────────────
 #
 # When a source build includes the `gateway` feature, the dashboard
-# (`web/dist`) needs to be built so the gateway can serve it. If Node.js
-# is on PATH we run `npm install && npm run build` in `web/`. Without
-# Node.js we warn — the gateway still starts but the dashboard route
+# (`web/dist`) needs to be built so the gateway can serve it.
+#
+# The TypeScript client `web/src/lib/api-generated.ts` is generated from the
+# gateway OpenAPI spec (gitignored). A bare `npm run build` fails on a clean
+# clone because `tsc` imports that file — the supported pipeline is
+# `cargo web build` (see `.cargo/config.toml` → xtask `web` binary), which runs
+# gen-api then Vite. Same flow as `docs/book/src/developing/web.md`.
+#
+# Fallback: if `cargo web build` is unavailable, try `npm run build` only
+# (works only when api-generated.ts already exists from a prior dev run).
+#
+# Without npm we warn — the gateway still starts but the dashboard route
 # returns 404 until `web/dist` is populated.
 build_web_dashboard() {
   src_dir="$1"
@@ -435,12 +444,22 @@ build_web_dashboard() {
   if ! command -v npm >/dev/null 2>&1; then
     warn "npm not found — skipping dashboard build. The gateway will run"
     warn "  in API-only mode until you build the dashboard:"
-    warn "  cd $src_dir/web && npm install && npm run build"
+    warn "  cd $src_dir && cargo web build"
     return 0
+  fi
+  if [ -f "$src_dir/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
+    info "Building web dashboard (cargo web build: OpenAPI → api-generated.ts → vite)..."
+    if (cd "$src_dir" && cargo web build); then
+      info "Web dashboard built at $src_dir/web/dist"
+      return 0
+    fi
+    warn "cargo web build failed — falling back to npm run build"
+    warn "  (this only works if web/src/lib/api-generated.ts already exists)"
   fi
   info "Building web dashboard (npm install + npm run build)..."
   (cd "$src_dir/web" && npm install --silent && npm run build --silent) || {
     warn "Dashboard build failed — gateway will run in API-only mode."
+    warn "  Fix from repo root: cargo web build"
     return 0
   }
   info "Web dashboard built at $src_dir/web/dist"

@@ -1134,6 +1134,12 @@ pub async fn handle_migrate(State(state): State<AppState>, headers: HeaderMap) -
     }
 }
 
+/// GET /api/config — same JSON Schema body as schema-discovery `OPTIONS` (no values).
+///
+/// Some browsers, proxies, and API explorers issue `GET` after CORS preflight
+/// advertised `GET` for this path; the router historically only registered
+/// `PATCH` + `OPTIONS`, which produced confusing `405` responses from the UI.
+///
 /// OPTIONS /api/config — whole-config schema (capabilities, not values)
 ///
 /// Returns the JSON Schema document for the `Config` type. Distinguishes CORS
@@ -1148,7 +1154,7 @@ pub async fn handle_options_config(headers: HeaderMap) -> Response {
         let h = response.headers_mut();
         h.insert(
             "Access-Control-Allow-Methods",
-            HeaderValue::from_static("GET, PUT, PATCH, OPTIONS"),
+            HeaderValue::from_static("GET, PATCH, OPTIONS"),
         );
         h.insert(
             "Access-Control-Allow-Headers",

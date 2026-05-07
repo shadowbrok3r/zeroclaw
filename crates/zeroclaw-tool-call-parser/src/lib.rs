@@ -26,7 +26,20 @@ fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
         Some(value) => value.clone(),
         None => serde_json::Value::Object(serde_json::Map::new()),
     };
-    unwrap_nested_json_strings(initial)
+    normalize_tool_arguments(initial)
+}
+
+/// Recursively unwrap stringified JSON objects/arrays nested inside tool arguments.
+///
+/// Call this after parsing a native tool-call `arguments` string with
+/// [`serde_json::from_str`] so nested maps and arrays are real JSON values (not
+/// inner strings), matching the behavior of text/XML tool parsing in this crate.
+///
+/// Why: Some providers double-encode nested object/array parameters as JSON strings
+/// inside the outer arguments payload, which breaks tools and MCP servers that expect
+/// [`serde_json::Value::Object`] / [`serde_json::Value::Array`] at those positions.
+pub fn normalize_tool_arguments(value: serde_json::Value) -> serde_json::Value {
+    unwrap_nested_json_strings(value)
 }
 
 /// Recursively unwrap stringified JSON objects/arrays nested inside tool arguments.

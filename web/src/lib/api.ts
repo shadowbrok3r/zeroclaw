@@ -302,7 +302,15 @@ export function deleteProp(path: string): Promise<PropResponse> {
 
 export function listProps(prefix?: string): Promise<ListResponse> {
   const q = prefix ? `?prefix=${encodeURIComponent(prefix)}` : '';
-  return apiFetch<ListResponse>(`/api/config/list${q}`);
+  return apiFetch<ListResponse>(`/api/config/list${q}`).then((resp) => ({
+    ...resp,
+    entries: Array.isArray(resp.entries)
+      ? resp.entries.filter(
+          (e): e is ListResponseEntry =>
+            Boolean(e && typeof (e as ListResponseEntry).path === 'string'),
+        )
+      : [],
+  }));
 }
 
 export function patchConfig(ops: PatchOp[]): Promise<PatchResponse> {
@@ -536,7 +544,7 @@ export function objectArrayElementProps(
   schema: JsonSchema,
   kebabPath: string,
 ): ObjectArrayPropMeta[] | null {
-  if (!schema) return null;
+  if (!schema || typeof kebabPath !== 'string') return null;
   let cur: unknown = schema;
   for (const seg of kebabPath.split('.')) {
     cur = unwrapOptional(resolveRef(cur, schema));
@@ -595,7 +603,7 @@ export function objectArrayElementProps(
 }
 
 export function descriptionForPath(schema: JsonSchema, kebabPath: string): string | null {
-  if (!schema) return null;
+  if (!schema || typeof kebabPath !== 'string') return null;
   let cur: unknown = schema;
   let last: unknown = null;
   for (const seg of kebabPath.split('.')) {

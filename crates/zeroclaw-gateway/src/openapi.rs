@@ -197,6 +197,17 @@ pub fn build_spec() -> serde_json::Value {
             }
         },
         "/api/config": {
+            "get": {
+                "tags": ["config"],
+                "summary": "Whole-config JSON Schema (capabilities, not values)",
+                "description": "Same document as schema-discovery `OPTIONS /api/config` — schemars-derived JSON Schema for `Config`. Use `GET` or `OPTIONS`; both return identical bodies for clients that default to GET.",
+                "responses": {
+                    "200": {
+                        "description": "JSON Schema for the entire config type.",
+                        "content": { "application/json": { "schema": { "type": "object" } } }
+                    }
+                }
+            },
             "patch": {
                 "tags": ["config"],
                 "summary": "Apply a JSON Patch (RFC 6902) document atomically",

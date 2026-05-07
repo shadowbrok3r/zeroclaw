@@ -1,5 +1,5 @@
 import { memo, useState, useEffect, useRef, useCallback } from 'react';
-import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench } from 'lucide-react';
+import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, ArrowDown } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useAgent, type ChatMessage } from '@/contexts/AgentContext';
@@ -26,6 +26,8 @@ export default function AgentChat() {
     deleteMessage,
     clearAllMessages,
     abortSession,
+    approvalPrompt,
+    respondToApproval,
   } = useAgent();
 
   const { draft, saveDraft, clearDraft } = useDraft(DRAFT_KEY);
@@ -45,7 +47,10 @@ export default function AgentChat() {
     try { return localStorage.getItem('zeroclaw_show_tool_activity') === '1'; } catch { return false; }
   });
 
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  /** When false, new tokens/messages do not yank the viewport (same idea as Logs live view). */
+  const [autoScroll, setAutoScroll] = useState(true);
+
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const modelDropdownRef = useRef<HTMLDivElement>(null);
 
@@ -54,13 +59,26 @@ export default function AgentChat() {
     saveDraft(input);
   }, [input, saveDraft]);
 
-  // Scroll to bottom on new messages / streaming.
-  // Note: WebSocket lifecycle, hydration, and tool_call/tool_result handling
-  // moved to AgentContext (PR #6101). Tool activity is filtered at render
-  // time below using `showToolActivity`, not at the message-handler layer.
+  // Stick to bottom while streaming only when the user has not scrolled up to read.
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, typing, streamingContent]);
+    if (!autoScroll || !messagesContainerRef.current) return;
+    const el = messagesContainerRef.current;
+    el.scrollTop = el.scrollHeight;
+  }, [messages, typing, streamingContent, compact, autoScroll]);
+
+  const handleMessagesScroll = useCallback(() => {
+    if (!messagesContainerRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = messagesContainerRef.current;
+    const isAtBottom = scrollHeight - scrollTop - clientHeight < 50;
+    setAutoScroll(isAtBottom);
+  }, []);
+
+  const jumpChatToBottom = useCallback(() => {
+    if (messagesContainerRef.current) {
+      messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
+    }
+    setAutoScroll(true);
+  }, []);
 
   // Close model dropdown when clicking outside
   useEffect(() => {
@@ -78,6 +96,7 @@ export default function AgentChat() {
     if (!trimmed || !connected) return;
 
     sendMessage(trimmed);
+    setAutoScroll(true);
     setInput('');
     clearDraft();
     if (inputRef.current) {
@@ -122,6 +141,7 @@ export default function AgentChat() {
 
   const handleClearAll = useCallback(() => {
     clearAllMessages();
+    setAutoScroll(true);
   }, [clearAllMessages]);
 
   // Stop button: POST /api/sessions/{id}/abort. The gateway cancels the
@@ -269,9 +289,24 @@ export default function AgentChat() {
       {/* Chat toolbar */}
       {messages.length > 0 && (
         <div
-          className="flex items-center justify-end gap-2 px-4 py-2 border-b"
+          className="flex items-center justify-between gap-2 px-4 py-2 border-b"
           style={{ background: 'var(--pc-bg-surface)', borderColor: 'var(--pc-border)' }}
         >
+          <div className="min-w-0 shrink-0">
+            {!autoScroll && (
+              <button
+                type="button"
+                onClick={jumpChatToBottom}
+                className="btn-electric flex items-center gap-1.5 text-xs"
+                style={{ padding: '0.3rem 0.75rem', borderRadius: '0.5rem' }}
+                aria-label={t('logs.jump_to_bottom')}
+              >
+                <ArrowDown className="h-3 w-3" />
+                {t('logs.jump_to_bottom')}
+              </button>
+            )}
+          </div>
+          <div className="flex items-center justify-end gap-2 shrink-0 flex-wrap">
           <button
             type="button"
             onClick={toggleCompact}
@@ -303,11 +338,16 @@ export default function AgentChat() {
             <Trash2 className="h-3 w-3" />
             {t('agent.clear_all')}
           </button>
+          </div>
         </div>
       )}
 
       {/* Messages area */}
-      <div className={`flex-1 overflow-y-auto p-4 ${compact ? 'space-y-1.5' : 'space-y-4'}`}>
+      <div
+        ref={messagesContainerRef}
+        onScroll={handleMessagesScroll}
+        className={`flex-1 overflow-y-auto p-4 ${compact ? 'space-y-1.5' : 'space-y-4'}`}
+      >
         {messages.length === 0 && (
           <div className="flex flex-col items-center justify-center h-full text-center animate-fade-in" style={{ color: 'var(--pc-text-muted)' }}>
             <div className="h-16 w-16 rounded-3xl flex items-center justify-center mb-4 animate-float" style={{ background: 'var(--pc-accent-glow)' }}>
@@ -357,7 +397,70 @@ export default function AgentChat() {
           </div>
         )}
 
-        <div ref={messagesEndRef} />
+        {/* Sticky above scroll bottom so approval stays visible when many tool cards fill the thread */}
+        {approvalPrompt && (
+          <div
+            className="sticky bottom-0 z-20 max-w-4xl mx-auto mt-2 rounded-xl border px-4 py-3 shadow-lg"
+            style={{
+              borderColor: 'var(--pc-accent-dim)',
+              background: 'var(--pc-bg-surface)',
+              boxShadow: '0 -4px 24px rgba(0,0,0,0.12)',
+            }}
+            role="dialog"
+            aria-live="assertive"
+            aria-labelledby="agent-approval-heading"
+          >
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
+              <div className="min-w-0 flex-1">
+                <p
+                  id="agent-approval-heading"
+                  className="text-sm font-semibold"
+                  style={{ color: 'var(--pc-text-primary)' }}
+                >
+                  {t('agent.approval_heading')}:{' '}
+                  <span style={{ color: 'var(--pc-accent)' }}>{approvalPrompt.tool}</span>
+                </p>
+                {approvalPrompt.argumentsSummary ? (
+                  <p className="text-xs mt-1.5 break-words" style={{ color: 'var(--pc-text-muted)' }}>
+                    <span className="font-medium" style={{ color: 'var(--pc-text-secondary)' }}>
+                      {t('agent.approval_summary_label')}
+                      {': '}
+                    </span>
+                    {approvalPrompt.argumentsSummary}
+                  </p>
+                ) : null}
+                <p className="text-[10px] mt-1.5" style={{ color: 'var(--pc-text-faint)' }}>
+                  {t('agent.approval_timeout_note')} ({approvalPrompt.timeoutSecs}s)
+                </p>
+              </div>
+              <div className="flex flex-wrap gap-2 shrink-0">
+                <button
+                  type="button"
+                  className="btn-electric px-3 py-1.5 rounded-lg text-xs font-medium"
+                  onClick={() => respondToApproval('approve')}
+                >
+                  {t('agent.approval_approve')}
+                </button>
+                <button
+                  type="button"
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium border"
+                  style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-primary)' }}
+                  onClick={() => respondToApproval('always')}
+                >
+                  {t('agent.approval_always')}
+                </button>
+                <button
+                  type="button"
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium border"
+                  style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-muted)' }}
+                  onClick={() => respondToApproval('deny')}
+                >
+                  {t('agent.approval_deny')}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Input area */}
@@ -373,10 +476,12 @@ export default function AgentChat() {
             onCompositionEnd={() => { isComposingRef.current = false; }}
             placeholder={!connected
               ? t('agent.connecting')
-              : typing
-                ? t('agent.running')
-                : t('agent.type_message')}
-            disabled={!connected || typing}
+              : approvalPrompt
+                ? t('agent.approval_heading')
+                : typing
+                  ? t('agent.running')
+                  : t('agent.type_message')}
+            disabled={!connected || typing || !!approvalPrompt}
             className="input-electric flex-1 px-4 text-sm resize-none disabled:opacity-40"
             style={{ minHeight: '44px', maxHeight: '200px', paddingTop: '10px', paddingBottom: '10px' }}
           />

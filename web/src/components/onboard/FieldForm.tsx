@@ -82,7 +82,9 @@ function rendererFor(
 }
 
 function fieldShortLabel(entry: ListResponseEntry): string {
-  return entry.path.split('.').pop()!.replace(/[-_]/g, ' ');
+  const p = entry.path;
+  if (typeof p !== 'string' || !p) return '—';
+  return p.split('.').pop()!.replace(/[-_]/g, ' ');
 }
 
 function defaultInputValue(entry: ListResponseEntry): string {
@@ -130,6 +132,7 @@ function parseInput(entry: ListResponseEntry, raw: string): unknown {
 // emit), with comma- / newline-separated as a fallback for hand-typed
 // freeform input. Trims whitespace and drops empty entries on save.
 function parseArrayDraft(raw: string): string[] {
+  if (typeof raw !== 'string') return [];
   const trimmed = raw.trim();
   if (!trimmed) return [];
   if (trimmed.startsWith('[')) {
@@ -152,7 +155,7 @@ function parseArrayDraft(raw: string): string[] {
 }
 
 function parseArrayRows(value: string): string[] {
-  if (!value) return [];
+  if (typeof value !== 'string' || !value) return [];
   try {
     const parsed = JSON.parse(value);
     if (Array.isArray(parsed)) return parsed.map((v) => String(v));
@@ -319,7 +322,8 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
     // matters), then secrets (most-needed), then alphabetical by short
     // label. Curating `enabled` is safe — it's a load-bearing standard
     // field name across every section that has on/off semantics.
-    const isEnabledLeaf = (e: ListResponseEntry) => e.path.endsWith('.enabled') || e.path === 'enabled';
+    const isEnabledLeaf = (e: ListResponseEntry) =>
+      typeof e.path === 'string' && (e.path.endsWith('.enabled') || e.path === 'enabled');
     return [...entries].sort((a, b) => {
       const ea = isEnabledLeaf(a);
       const eb = isEnabledLeaf(b);
@@ -539,10 +543,12 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
   const renderer = rendererFor(entry);
   const [providerModels, setProviderModels] = useState<string[] | null>(null);
   const [modelsFetchFailed, setModelsFetchFailed] = useState(false);
-  const isProviderModelField = /^providers\.models\.[^.]+\.model$/.test(entry.path);
+  const isProviderModelField =
+    typeof entry.path === 'string' &&
+    /^providers\.models\.[^.]+\.model$/.test(entry.path);
 
   useEffect(() => {
-    if (!isProviderModelField) return;
+    if (!isProviderModelField || typeof entry.path !== 'string') return;
     const provider = entry.path.split('.')[2];
     if (!provider) return;
     const cached = modelsCache[provider];

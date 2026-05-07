@@ -459,6 +459,12 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.tool_activity_hide': 'Hide tool activity',
     'agent.running': 'Running…',
     'agent.stop': 'Stop',
+    'agent.approval_heading': 'Tool approval',
+    'agent.approval_summary_label': 'Summary',
+    'agent.approval_approve': 'Approve once',
+    'agent.approval_deny': 'Deny',
+    'agent.approval_always': 'Always approve',
+    'agent.approval_timeout_note': 'If you do not choose, the request is denied after the timeout.',
 
     // Tools
     'tools.title': 'Available Tools',

@@ -38,9 +38,10 @@ Two endpoints answer the question "what can I do here?":
 `OPTIONS` returns capabilities. `GET /api/config/prop` and `GET /api/config/list`
 return the user's current values. Forms in the dashboard issue `OPTIONS` once
 at load time to learn types and constraints, then `GET` to populate fields,
-then `PUT`/`PATCH` to write. There is no whole-file `GET /api/config` —
-deliberately. Walk the per-property surface; the schema is the source of truth
-for what fields exist.
+then `PUT`/`PATCH` to write. `GET /api/config` returns the same whole-config JSON
+Schema as schema-discovery `OPTIONS /api/config` (capabilities only, never
+live values) so browsers and tools that default to `GET` match the CORS
+`Access-Control-Allow-Methods` advertisement on this path.
 
 CORS preflight requests (those carrying `Access-Control-Request-Method`) get
 the standard preflight response and short-circuit before the schema body is
@@ -51,6 +52,7 @@ returned.
 | Method | Path | Purpose |
 |---|---|---|
 | `PATCH` | `/api/config` | Apply a JSON Patch (RFC 6902) document atomically. |
+| `GET` | `/api/config` | Same whole-config JSON Schema as `OPTIONS /api/config` (capabilities, not values). |
 | `OPTIONS` | `/api/config` | Whole-config JSON Schema (capabilities, not values). |
 | `GET` | `/api/config/prop?path=...` | Read one field. Secrets return `{path, populated}` only. |
 | `PUT` | `/api/config/prop` | Write one field. Body: `{path, value, comment?}`. Secrets respond with `{path, populated: true}` only. |

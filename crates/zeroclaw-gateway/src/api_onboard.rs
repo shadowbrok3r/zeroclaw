@@ -256,8 +256,14 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
     let sections: Vec<SectionInfo> = roots
         .into_iter()
         .map(|key| {
-            let has_picker = SECTIONS_WITH_PICKER.contains(&key.as_str())
-                || map_keyed_roots.contains(key.as_str());
+            // `map_key_sections()` registers `mcp.servers` (List), whose first
+            // path segment is `mcp`. That usually implies a catalog-style
+            // picker — but MCP servers are edited as an object-array on the
+            // direct `mcp` form (`GET /api/config/list?prefix=mcp`), not via
+            // `GET /api/onboard/sections/mcp`. Treat like workspace/hardware.
+            let has_picker = (SECTIONS_WITH_PICKER.contains(&key.as_str())
+                || map_keyed_roots.contains(key.as_str()))
+                && key != "mcp";
             SectionInfo {
                 completed: completed.contains(&key),
                 label: humanize_section(&key),
@@ -363,6 +369,10 @@ fn section_help(key: &str) -> &'static str {
         "tunnel" => {
             "Optional: expose your gateway over the public internet via Cloudflare or ngrok. \
                      Pick `none` to keep it localhost-only."
+        }
+        "mcp" => {
+            "External MCP servers (stdio, HTTP, or SSE). Enable MCP here, then add and edit server rows \
+             in the table below."
         }
         _ => "",
     }
@@ -741,6 +751,30 @@ mod tests {
 
     fn empty_cfg() -> zeroclaw_config::schema::Config {
         zeroclaw_config::schema::Config::default()
+    }
+
+    #[test]
+    fn mcp_section_is_direct_form_despite_map_key_servers() {
+        // Regression: `mcp.servers` is list-shaped map-key metadata, which
+        // puts `mcp` in `map_keyed_roots` — but the dashboard must not route
+        // Config › MCP through `handle_section_picker` (no catalog); editors
+        // use FieldForm with prefix `mcp` and the servers object-array.
+        let map_keyed_roots: std::collections::HashSet<&'static str> =
+            zeroclaw_config::schema::Config::map_key_sections()
+                .iter()
+                .filter_map(|s| s.path.split('.').next())
+                .collect();
+        assert!(
+            map_keyed_roots.contains("mcp"),
+            "mcp must remain discoverable as map-keyed for templates/map-key API"
+        );
+        let key = "mcp";
+        let has_picker =
+            (SECTIONS_WITH_PICKER.contains(&key) || map_keyed_roots.contains(key)) && key != "mcp";
+        assert!(
+            !has_picker,
+            "mcp must use direct form (has_picker=false), not onboard picker"
+        );
     }
 
     #[test]

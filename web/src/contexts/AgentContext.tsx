@@ -3,7 +3,7 @@ import type { WsMessage } from '@/types/api';
 import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { t } from '@/lib/i18n';
-import { getProp, putProp, getStatus, getSessionMessages, abortSession } from '@/lib/api';
+import { listProps, putProp, getStatus, getSessionMessages, abortSession } from '@/lib/api';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
 import {
   loadChatHistory,
@@ -23,6 +23,14 @@ export interface ChatMessage {
   timestamp: Date;
 }
 
+/** Supervised tool consent prompt from the gateway WebSocket (`approval_request`). */
+export interface AgentApprovalPrompt {
+  requestId: string;
+  tool: string;
+  argumentsSummary: string;
+  timeoutSecs: number;
+}
+
 interface AgentContextValue {
   messages: ChatMessage[];
   sendMessage: (content: string) => void;
@@ -40,6 +48,9 @@ interface AgentContextValue {
   deleteMessage: (id: string) => void;
   clearAllMessages: () => void;
   abortSession: () => Promise<void>;
+  /** Non-null while the agent waits for `approval_response` on the WebSocket. */
+  approvalPrompt: AgentApprovalPrompt | null;
+  respondToApproval: (decision: 'approve' | 'deny' | 'always') => void;
 }
 
 const AgentContext = createContext<AgentContextValue | null>(null);
@@ -76,6 +87,29 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
   const pendingModelSwitchRef = useRef<string | null>(null);
   const switchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsVersionRef = useRef(0);
+  const [approvalPrompt, setApprovalPrompt] = useState<AgentApprovalPrompt | null>(null);
+  const approvalPromptRef = useRef<AgentApprovalPrompt | null>(null);
+
+  const clearApprovalPrompt = useCallback(() => {
+    approvalPromptRef.current = null;
+    setApprovalPrompt(null);
+  }, []);
+
+  const respondToApproval = useCallback((decision: 'approve' | 'deny' | 'always') => {
+    const pending = approvalPromptRef.current;
+    if (!pending) return;
+    const ws = wsRef.current;
+    if (!ws?.connected) {
+      clearApprovalPrompt();
+      return;
+    }
+    try {
+      ws.sendApprovalResponse(pending.requestId, decision);
+    } catch {
+      // Socket closed mid-send — server will treat as deny on timeout.
+    }
+    clearApprovalPrompt();
+  }, [clearApprovalPrompt]);
 
   // Hydrate chat from server (preferred) or localStorage fallback
   useEffect(() => {
@@ -177,6 +211,7 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
       }
 
       case 'tool_call': {
+        clearApprovalPrompt();
         const toolName = msg.name ?? 'unknown';
         const toolArgs = msg.args;
         setMessages((prev) => {
@@ -206,6 +241,7 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
       }
 
       case 'tool_result': {
+        clearApprovalPrompt();
         setMessages((prev) => {
           const idx = prev.findIndex((m) => m.toolCall && m.toolCall.output === undefined);
           if (idx !== -1) {
@@ -268,9 +304,29 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
         pendingThinkingRef.current = '';
         setStreamingContent('');
         setStreamingThinking('');
+        clearApprovalPrompt();
+        break;
+
+      case 'approval_request': {
+        const requestId = msg.request_id;
+        const tool = msg.tool;
+        if (!requestId || !tool) break;
+        const next: AgentApprovalPrompt = {
+          requestId,
+          tool,
+          argumentsSummary: typeof msg.arguments_summary === 'string' ? msg.arguments_summary : '',
+          timeoutSecs: typeof msg.timeout_secs === 'number' ? msg.timeout_secs : 120,
+        };
+        approvalPromptRef.current = next;
+        setApprovalPrompt(next);
+        break;
+      }
+
+      case 'aborted':
+        clearApprovalPrompt();
         break;
     }
-  }, []);
+  }, [clearApprovalPrompt]);
 
   // Wire up a WebSocketClient instance with version-guarded callbacks.
   const attachSocketCallbacks = useCallback((ws: WebSocketClient) => {
@@ -297,6 +353,8 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
     ws.onClose = (ev: CloseEvent) => {
       if (version !== wsVersionRef.current) return;
       setConnected(false);
+      approvalPromptRef.current = null;
+      setApprovalPrompt(null);
 
       if (pendingModelSwitchRef.current) {
         // We intentionally closed the old socket; non-normal codes mean the reconnect failed.
@@ -354,15 +412,14 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
 
         let activeModel = status.model;
 
-        // Prefer the model written to config over the startup status value.
+        // Resolve the concrete model id from providers.models.<fallback>.model when possible.
         try {
-          const modelProp = await getProp('model');
-          if (modelProp.populated && typeof modelProp.value === 'string') {
-            activeModel = modelProp.value;
-          } else {
-            const defaultModelProp = await getProp('default_model');
-            if (defaultModelProp.populated && typeof defaultModelProp.value === 'string') {
-              activeModel = defaultModelProp.value;
+          const fb = status.provider;
+          if (fb) {
+            const list = await listProps(`providers.models.${fb}`);
+            const row = list.entries.find((e) => e.path.endsWith('.model'));
+            if (row?.populated && typeof row.value === 'string' && row.value.length > 0) {
+              activeModel = row.value;
             }
           }
         } catch {
@@ -370,17 +427,14 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
         }
         setCurrentModel(activeModel);
 
-        // Fetch model_routes from config
+        // Enumerate configured provider models for the dropdown (schema paths use dotted prefixes).
         try {
-          const routesProp = await getProp('model_routes');
-          if (routesProp.populated && Array.isArray(routesProp.value)) {
-            const models = routesProp.value
-              .map((r) => (r as Record<string, unknown>).model)
-              .filter((m): m is string => typeof m === 'string');
-            setAvailableModels(models.length > 0 ? models : [activeModel]);
-          } else {
-            setAvailableModels([activeModel]);
-          }
+          const list = await listProps('providers.models');
+          const models = list.entries
+            .filter((e) => e.path.endsWith('.model') && e.populated && typeof e.value === 'string')
+            .map((e) => e.value as string)
+            .filter((m) => m.length > 0);
+          setAvailableModels(models.length > 0 ? models : [activeModel]);
         } catch {
           setAvailableModels([activeModel]);
         }
@@ -433,10 +487,12 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
     }, MODEL_SWITCH_TIMEOUT_MS);
 
     try {
-      // Determine whether 'model' or 'default_model' is the active key, then write to it.
-      const modelProp = await getProp('model');
-      const targetKey = modelProp.populated ? 'model' : 'default_model';
-      await putProp(targetKey, model);
+      const statusFresh = await getStatus();
+      const profile = statusFresh.provider;
+      if (!profile) {
+        throw new Error('No providers.fallback — configure a provider first');
+      }
+      await putProp(`providers.models.${profile}.model`, model);
 
       // If a turn is actively streaming, abort it on the backend before we tear
       // down the socket. This prevents the old model from continuing to execute
@@ -521,6 +577,8 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
         // Best-effort abort
       }
     },
+    approvalPrompt,
+    respondToApproval,
   };
 
   return <AgentContext.Provider value={value}>{children}</AgentContext.Provider>;

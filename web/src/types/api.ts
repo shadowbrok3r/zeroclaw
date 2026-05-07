@@ -146,7 +146,9 @@ export interface WsMessage {
     | 'error'
     | 'session_start'
     | 'connected'
-    | 'cron_result';
+    | 'cron_result'
+    | 'approval_request'
+    | 'aborted';
   content?: string;
   full_response?: string;
   name?: string;
@@ -160,6 +162,12 @@ export interface WsMessage {
   timestamp?: string;
   job_id?: string;
   success?: boolean;
+  /** Present on `approval_request` frames from the gateway WebSocket. */
+  request_id?: string;
+  /** Tool name on `approval_request`. */
+  tool?: string;
+  arguments_summary?: string;
+  timeout_secs?: number;
 }
 
 /** Row from GET /api/sessions/{id}/messages */
