@@ -1,4 +1,4 @@
-import type { WsMessage } from '../types/api';
+import type { ApprovalDecision, WsMessage } from '../types/api';
 import { getToken } from './auth';
 import { apiOrigin, basePath } from './basePath';
 import { isTauri } from './tauri';
@@ -116,22 +116,15 @@ export class WebSocketClient {
   }
 
   /**
-   * Answer a supervised-mode `approval_request` from the gateway.
-   * @see crates/zeroclaw-gateway/src/ws.rs (tool approvals)
+   * Reply to a supervised-mode tool `approval_request`. The backend matches
+   * the response by `request_id` and resolves the parked approval oneshot.
+   * If the socket is closed the request will auto-deny on the server side
+   * after the timeout, so we silently no-op rather than throwing.
    */
-  sendApprovalResponse(
-    requestId: string,
-    decision: 'approve' | 'deny' | 'always',
-  ): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      throw new Error('WebSocket is not connected');
-    }
+  sendApprovalResponse(requestId: string, decision: ApprovalDecision): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     this.ws.send(
-      JSON.stringify({
-        type: 'approval_response',
-        request_id: requestId,
-        decision,
-      }),
+      JSON.stringify({ type: 'approval_response', request_id: requestId, decision }),
     );
   }
 

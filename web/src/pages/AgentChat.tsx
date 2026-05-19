@@ -7,6 +7,7 @@ import { useDraft } from '@/hooks/useDraft';
 import { t } from '@/lib/i18n';
 
 import ToolCallCard from '@/components/ToolCallCard';
+import ApprovalBanner from '@/components/ApprovalBanner';
 
 const DRAFT_KEY = 'agent-chat';
 
@@ -26,7 +27,7 @@ export default function AgentChat() {
     deleteMessage,
     clearAllMessages,
     abortSession,
-    approvalPrompt,
+    pendingApproval,
     respondToApproval,
   } = useAgent();
 
@@ -397,71 +398,12 @@ export default function AgentChat() {
           </div>
         )}
 
-        {/* Sticky above scroll bottom so approval stays visible when many tool cards fill the thread */}
-        {approvalPrompt && (
-          <div
-            className="sticky bottom-0 z-20 max-w-4xl mx-auto mt-2 rounded-xl border px-4 py-3 shadow-lg"
-            style={{
-              borderColor: 'var(--pc-accent-dim)',
-              background: 'var(--pc-bg-surface)',
-              boxShadow: '0 -4px 24px rgba(0,0,0,0.12)',
-            }}
-            role="dialog"
-            aria-live="assertive"
-            aria-labelledby="agent-approval-heading"
-          >
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
-              <div className="min-w-0 flex-1">
-                <p
-                  id="agent-approval-heading"
-                  className="text-sm font-semibold"
-                  style={{ color: 'var(--pc-text-primary)' }}
-                >
-                  {t('agent.approval_heading')}:{' '}
-                  <span style={{ color: 'var(--pc-accent)' }}>{approvalPrompt.tool}</span>
-                </p>
-                {approvalPrompt.argumentsSummary ? (
-                  <p className="text-xs mt-1.5 break-words" style={{ color: 'var(--pc-text-muted)' }}>
-                    <span className="font-medium" style={{ color: 'var(--pc-text-secondary)' }}>
-                      {t('agent.approval_summary_label')}
-                      {': '}
-                    </span>
-                    {approvalPrompt.argumentsSummary}
-                  </p>
-                ) : null}
-                <p className="text-[10px] mt-1.5" style={{ color: 'var(--pc-text-faint)' }}>
-                  {t('agent.approval_timeout_note')} ({approvalPrompt.timeoutSecs}s)
-                </p>
-              </div>
-              <div className="flex flex-wrap gap-2 shrink-0">
-                <button
-                  type="button"
-                  className="btn-electric px-3 py-1.5 rounded-lg text-xs font-medium"
-                  onClick={() => respondToApproval('approve')}
-                >
-                  {t('agent.approval_approve')}
-                </button>
-                <button
-                  type="button"
-                  className="px-3 py-1.5 rounded-lg text-xs font-medium border"
-                  style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-primary)' }}
-                  onClick={() => respondToApproval('always')}
-                >
-                  {t('agent.approval_always')}
-                </button>
-                <button
-                  type="button"
-                  className="px-3 py-1.5 rounded-lg text-xs font-medium border"
-                  style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-muted)' }}
-                  onClick={() => respondToApproval('deny')}
-                >
-                  {t('agent.approval_deny')}
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
       </div>
+
+      {/* Tool approval banner — supervised-mode consent prompt (#6522). */}
+      {pendingApproval && (
+        <ApprovalBanner pending={pendingApproval} onRespond={respondToApproval} />
+      )}
 
       {/* Input area */}
       <div className="border-t p-4" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
@@ -476,12 +418,12 @@ export default function AgentChat() {
             onCompositionEnd={() => { isComposingRef.current = false; }}
             placeholder={!connected
               ? t('agent.connecting')
-              : approvalPrompt
-                ? t('agent.approval_heading')
+              : pendingApproval
+                ? t('agent.approval_title')
                 : typing
                   ? t('agent.running')
                   : t('agent.type_message')}
-            disabled={!connected || typing || !!approvalPrompt}
+            disabled={!connected || typing || !!pendingApproval}
             className="input-electric flex-1 px-4 text-sm resize-none disabled:opacity-40"
             style={{ minHeight: '44px', maxHeight: '200px', paddingTop: '10px', paddingBottom: '10px' }}
           />

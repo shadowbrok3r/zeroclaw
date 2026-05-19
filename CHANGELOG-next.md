@@ -282,11 +282,155 @@
 | Runtime / channels | Unify session backend behind one factory (#6384); share canvas store across daemon subsystems (#6221). |
 | Runtime / cost | WARN once per `(provider, model)` for missing pricing (#6356). |
 | Security | Distinguish `git -C` from `git -c` in security policy (0bc0dc676). |
+| Skills (config) | Reject unknown fields in `[skill]` block to surface silent typo drops (#6128); relocate SkillForge provenance to a sibling `[forge]` table and surface `SKILL.toml` parse failures via `tracing::warn` instead of swallowing them silently (#6210). |
 | Tools | Honour `tool_timeout_secs` for HTTP SSE tool calls (#5945); derive HTTP client timeout from `tool_timeout_secs` (#6397); pass `allow_scripts` through `ReadSkillTool` to the skill loader (#5981). |
 | Tools (web_search) | Authenticate Tavily via Bearer header rather than body (46cb4510c). |
 | Web | Fix theme switching, session crash, and CSS token consistency (#5207); agent tool button height (#6369); default `tool_call`/`tool_result` rendering off with toolbar toggle (#6388). |
 | xtask:web | Re-run `npm install` when `node_modules` is stale vs lockfile (#6355). |
 | Doctor | Self-test report shows configured host alongside probed loopback (#6219). |
+
+---
+
+## Breaking Changes
+
+### Ollama provider sends explicit `num_ctx` / `num_predict` on every request
+
+The Ollama provider now stamps `num_ctx=8192` and `num_predict=2048` into the
+`options` block of every `/api/chat` request body. Previously these fields were
+unset on the wire, defaulting to Ollama's server-side `num_ctx=2048` and
+`num_predict=128` — which silently truncated prompts and responses on any
+structured tool-calling workflow (200 OK with garbage rather than an error).
+
+For most deployments this is strictly an improvement. **Operators on tight VRAM
+budgets** should be aware that jumping from server-default `num_ctx=2048` to
+the new `8192` increases the model's context-allocation footprint and can OOM
+the GPU on small cards. Pin lower values via the new optional fields under
+`[providers.models.<name>]` if needed:
+
+```toml
+[providers.models.my-ollama-llama3]
+kind = "ollama"
+ollama_num_ctx = 4096           # default 8192
+ollama_num_predict = 1024       # default 2048
+ollama_temperature_override = 0.1   # optional; when unset, per-call temperature wins
+```
+
+The new defaults are sent on every `/api/chat` request unless lower numeric
+values are pinned via `ollama_num_ctx` / `ollama_num_predict` as shown above.
+There is no in-config way to omit these keys from the wire body in this
+release: VRAM-constrained operators (or operators whose server caps these
+values lower than `8192` / `2048`) should pin lower supported numerics via
+the fields above. Operators running an Ollama build old enough to outright
+reject the keys themselves will need to upgrade Ollama or wait on a
+follow-up that introduces a true omit mode. (`ollama_temperature_override`
+is the one knob with a true `None` semantic — when it is unset, the
+per-call temperature passed through `Provider::chat_with_system` wins and
+`temperature` on the wire continues to reflect the call site rather than
+this config.)
+
+---
+
+## Behavior Changes
+
+### Tool outputs that mention local image paths are now uploaded to the provider
+
+Tool results — including `shell` and skill output — that print real local
+image paths (e.g. `ls /pictures`, `find . -name '*.png'`, an image-generation
+tool that prints the saved file path) are now canonicalized into
+`[IMAGE:...]` markers before history replay and base64-inlined into the next
+provider request. This is the fix for #6097 (local image reading failed) and
+#5453 (WebSocket `/ws/chat` did not process `[IMAGE:]` markers), and brings
+the agent and provider sides of the multimodal pipeline back into parity.
+
+The behavior shift is real and worth flagging: image bytes that previously
+stayed on the local filesystem when surfaced by a shell-style tool are now
+uploaded to whichever provider the next turn dispatches to. Only paths where
+`Path::is_file()` returns `true` and the extension is one of `png`, `jpg`,
+`jpeg`, `webp`, `gif`, `bmp` are wrapped, and existing `[IMAGE:...]` markers
+are not double-wrapped, but operators running shell tools over directories
+of personal or sensitive images should be aware.
+
+The per-request image budget (`max_images`, default `4`) and the LRU
+`trim_old_images` policy bound the cumulative upload cost — older images are
+dropped before the cap is exceeded — but the privacy posture has shifted.
+See `docs/book/src/contributing/privacy.md` and the new doc note on
+`MultimodalConfig.max_images` for the current upload semantics. Operators
+who do not want this behavior can keep tool outputs free of literal image
+paths, or scope shell tools away from image-bearing directories. (#6183)
+
+---
+
+### `[skill]` block in SKILL.toml rejects unknown fields; SkillForge provenance moves to `[forge]`
+
+Three coordinated changes that ship together so the strictness in #6128 is
+safe for users with `auto_integrate = true`:
+
+**1. `[skill]` is strict.** The `SkillMeta` struct backing the `[skill]` block of
+`SKILL.toml` now carries `#[serde(deny_unknown_fields)]`. Previously, unrecognised
+keys inside `[skill]` were silently dropped during deserialization — a typo in a
+field name would be accepted without error while the intended value was ignored.
+This is the bug class tracked in #6128, identified as a follow-up to the
+`SkillManifest` parsing refactor in #5972.
+
+Any `SKILL.toml` whose `[skill]` block contains a key not defined in the current
+schema will now fail to load with a descriptive serde error. Example:
+
+```toml
+[skill]
+name = "my-skill"
+descriptin = "Fixes a common issue"  # typo — was silently ignored, now an error
+```
+
+There is no per-field opt-out. The strictness is intentional: a skill that loads
+with a silently-dropped typo is harder to debug than one that fails loudly.
+Operators must correct or remove unrecognised fields from the `[skill]` block of
+their `SKILL.toml` before upgrading.
+
+**2. SkillForge provenance moves to a top-level `[forge]` table.** The SkillForge
+integrator (`auto_integrate = true`) previously emitted `source`, `owner`,
+`language`, `license`, `stars`, `updated_at` and the sub-tables
+`[skill.requirements]` / `[skill.metadata]` directly inside `[skill]`. With
+`SkillMeta` now strict, those keys would be rejected — every auto-integrated
+skill would fail to load. The integrator now emits a sibling top-level `[forge]`
+table instead, with `[forge.requirements]` and `[forge.metadata]` underneath.
+This keeps the runtime's canonical skill identity contract (`SkillMeta`) decoupled
+from the integrator's emit format (FND-001 §4.2 dependency rule). `[forge]` is
+optional on hand-authored skills and also strict (`deny_unknown_fields`) so
+typos in the provenance namespace surface the same way typos in `[skill]` do.
+
+**3. `SKILL.toml` parse failures are now logged.** The skill loader at both
+`load_skills_from_directory` and `load_open_skills_from_directory` previously
+swallowed every error from `load_skill_toml` silently. With `[skill]` now strict,
+that swallow would have flipped the failure mode from "field value silently
+ignored" to "skill silently never loads." Both sites now emit a structured
+`tracing::warn!` with `path` and `err` fields when a `SKILL.toml` fails to
+deserialize, so an operator running `RUST_LOG=warn zeroclaw` can identify the
+offending file.
+
+#### Migration for users with `auto_integrate = true`
+
+If you have `SKILL.toml` files on disk that were generated by SkillForge before
+this release, run the bundled migration script to move the provenance fields
+from `[skill]` into the new `[forge]` table layout. The script is idempotent —
+re-running it on already-migrated files is a no-op. Dry-run by default; pass
+`--apply` to write changes:
+
+```sh
+# Inspect the planned changes (dry-run):
+python3 scripts/migrate-skill-toml.py ~/.zeroclaw/workspace/skills
+
+# Apply the migration in place:
+python3 scripts/migrate-skill-toml.py ~/.zeroclaw/workspace/skills --apply
+```
+
+The script can also target a single file (`scripts/migrate-skill-toml.py
+path/to/skill/SKILL.toml --apply`) and uses standard library only (Python 3.8+,
+no `tomli` / `tomli_w` required). Hand-authored `SKILL.toml` files without
+SkillForge provenance are left untouched.
+
+If you do not run the migration before upgrading, auto-integrated skills will
+fail to load and the failure will surface as a `tracing::warn` line naming the
+offending path.
 
 ---
 
