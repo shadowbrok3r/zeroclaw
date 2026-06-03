@@ -138,7 +138,8 @@ struct OutgoingFunction {
 
 #[derive(Debug, Serialize)]
 struct Options {
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     num_ctx: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -254,7 +255,21 @@ impl OllamaModelProvider {
         reqwest::Url::parse(&self.base_url)
             .ok()
             .and_then(|url| url.host_str().map(|host| host.to_string()))
-            .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"))
+            .is_some_and(|host| {
+                matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "0.0.0.0")
+            })
+    }
+
+    fn is_official_cloud_endpoint(&self) -> bool {
+        reqwest::Url::parse(&self.base_url)
+            .ok()
+            .and_then(|url| {
+                url.host_str().map(|host| {
+                    host.eq_ignore_ascii_case("ollama.com")
+                        || host.eq_ignore_ascii_case("api.ollama.com")
+                })
+            })
+            .unwrap_or(false)
     }
 
     fn http_client(&self) -> Client {
@@ -267,23 +282,29 @@ impl OllamaModelProvider {
 
     fn resolve_request_details(&self, model: &str) -> anyhow::Result<(String, bool)> {
         let requests_cloud = model.ends_with(":cloud");
-        let normalized_model = model.strip_suffix(":cloud").unwrap_or(model).to_string();
+        let official_cloud_endpoint = self.is_official_cloud_endpoint();
+        let local_endpoint = self.is_local_endpoint();
+        let normalized_model = if requests_cloud && official_cloud_endpoint {
+            model.strip_suffix(":cloud").unwrap_or(model).to_string()
+        } else {
+            model.to_string()
+        };
 
-        if requests_cloud && self.is_local_endpoint() {
+        if requests_cloud && local_endpoint {
             anyhow::bail!(
                 "Model '{}' requested cloud routing, but Ollama endpoint is local. Configure api_url with a remote Ollama endpoint.",
                 model
             );
         }
 
-        if requests_cloud && self.api_key.is_none() {
+        if requests_cloud && official_cloud_endpoint && self.api_key.is_none() {
             anyhow::bail!(
-                "Model '{}' requested cloud routing, but no API key is configured. Set OLLAMA_API_KEY or config api_key.",
+                "Model '{}' requested cloud routing, but no API key is configured. Set api_key on [providers.models.ollama.<alias>] or via the schema-mirror grammar.",
                 model
             );
         }
 
-        let should_auth = self.api_key.is_some() && !self.is_local_endpoint();
+        let should_auth = self.api_key.is_some() && !local_endpoint;
 
         Ok((normalized_model, should_auth))
     }
@@ -394,7 +415,7 @@ impl OllamaModelProvider {
         &self,
         messages: Vec<Message>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         tools: Option<&[serde_json::Value]>,
     ) -> ChatRequest {
         self.build_chat_request_with_think(
@@ -411,7 +432,7 @@ impl OllamaModelProvider {
         &self,
         messages: Vec<Message>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         tools: Option<&[serde_json::Value]>,
         think: Option<bool>,
     ) -> ChatRequest {
@@ -420,7 +441,7 @@ impl OllamaModelProvider {
             messages,
             stream: false,
             options: Options {
-                temperature: self.tuning.temperature_override.unwrap_or(temperature),
+                temperature: self.tuning.temperature_override.or(temperature),
                 num_ctx: Some(self.tuning.num_ctx),
                 num_predict: Some(self.tuning.num_predict),
             },
@@ -555,7 +576,7 @@ impl OllamaModelProvider {
         &self,
         messages: &[Message],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         should_auth: bool,
         tools: Option<&[serde_json::Value]>,
         think: Option<bool>,
@@ -569,7 +590,7 @@ impl OllamaModelProvider {
             DEBUG,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             &format!(
-                "Ollama request: url={} model={} message_count={} temperature={} think={:?} tool_count={}",
+                "Ollama request: url={} model={} message_count={} temperature={:?} think={:?} tool_count={}",
                 url,
                 model,
                 request.messages.len(),
@@ -651,7 +672,7 @@ impl OllamaModelProvider {
         &self,
         messages: Vec<Message>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         should_auth: bool,
         tools: Option<&[serde_json::Value]>,
     ) -> anyhow::Result<ApiChatResponse> {
@@ -785,6 +806,7 @@ impl ModelProvider for OllamaModelProvider {
             native_tool_calling: false,
             vision: true,
             prompt_caching: false,
+            extended_thinking: false,
         }
     }
 
@@ -795,7 +817,6 @@ impl ModelProvider for OllamaModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let (normalized_model, should_auth) = self.resolve_request_details(model)?;
 
         let mut messages = Vec::new();
@@ -856,7 +877,6 @@ impl ModelProvider for OllamaModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let (normalized_model, should_auth) = self.resolve_request_details(model)?;
 
         let api_messages = self.convert_messages(messages);
@@ -905,7 +925,6 @@ impl ModelProvider for OllamaModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let (normalized_model, should_auth) = self.resolve_request_details(model)?;
 
         let api_messages = self.convert_messages(messages);
@@ -1142,6 +1161,19 @@ mod tests {
     }
 
     #[test]
+    fn cloud_suffix_with_unspecified_local_endpoint_errors() {
+        let p = OllamaModelProvider::new("test", Some("http://0.0.0.0:11434"), Some("ollama-key"));
+        let error = p
+            .resolve_request_details("qwen3:cloud")
+            .expect_err("cloud suffix should fail on unspecified local endpoint");
+        assert!(
+            error
+                .to_string()
+                .contains("requested cloud routing, but Ollama endpoint is local")
+        );
+    }
+
+    #[test]
     fn cloud_suffix_without_api_key_errors() {
         let p = OllamaModelProvider::new("test", Some("https://ollama.com"), None);
         let error = p
@@ -1150,8 +1182,28 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("requested cloud routing, but no API key is configured")
+                .contains("Set api_key on [providers.models.ollama.<alias>]")
         );
+    }
+
+    #[test]
+    fn cloud_suffix_preserved_for_private_remote_without_api_key() {
+        let p = OllamaModelProvider::new("test", Some("http://192.168.1.100:11434"), None);
+        let (model, should_auth) = p.resolve_request_details("qwen3:cloud").unwrap();
+        assert_eq!(model, "qwen3:cloud");
+        assert!(!should_auth);
+    }
+
+    #[test]
+    fn cloud_suffix_preserved_for_private_remote_with_api_key() {
+        let p = OllamaModelProvider::new(
+            "test",
+            Some("https://private-ollama.example.com"),
+            Some("ollama-key"),
+        );
+        let (model, should_auth) = p.resolve_request_details("qwen3:cloud").unwrap();
+        assert_eq!(model, "qwen3:cloud");
+        assert!(should_auth);
     }
 
     #[test]
@@ -1189,7 +1241,7 @@ mod tests {
                 tool_name: None,
             }],
             "llama3",
-            0.7,
+            Some(0.7),
             None,
         );
 
@@ -1213,7 +1265,7 @@ mod tests {
                 tool_name: None,
             }],
             "llama3",
-            0.7,
+            Some(0.7),
             None,
         );
 
@@ -1236,7 +1288,7 @@ mod tests {
                 tool_name: None,
             }],
             "llama3",
-            0.2,
+            Some(0.2),
             None,
         );
 
@@ -1249,11 +1301,10 @@ mod tests {
 
     #[test]
     fn build_chat_request_with_think_emits_explicit_options() {
-        // Wire-shape snapshot: the JSON body of every Ollama /api/chat
-        // request MUST carry an `options` object with all three keys
-        // (`temperature`, `num_ctx`, `num_predict`) populated. Older
-        // tests cover individual fields piecemeal; this one locks the
-        // full shape so a future refactor can't silently drop a field.
+        // Wire-shape snapshot: when temperature is Some, the JSON body of
+        // every Ollama /api/chat request must carry an `options` object
+        // with `num_ctx` and `num_predict`, and a `temperature` matching
+        // the value passed. None must omit the temperature key entirely.
         let provider = OllamaModelProvider::new("test", None, None);
         let request = provider.build_chat_request_with_think(
             vec![Message {
@@ -1264,7 +1315,7 @@ mod tests {
                 tool_name: None,
             }],
             "llama3",
-            0.3,
+            Some(0.3),
             None,
             Some(true),
         );
@@ -1274,9 +1325,10 @@ mod tests {
             .get("options")
             .expect("options object missing from request body");
 
-        assert!(
-            options.get("temperature").is_some(),
-            "options.temperature must be present on every wire request"
+        assert_eq!(
+            options.get("temperature"),
+            Some(&serde_json::json!(0.3)),
+            "options.temperature must match the value passed in"
         );
         assert!(
             options.get("num_ctx").is_some(),
@@ -1308,7 +1360,7 @@ mod tests {
                 tool_name: None,
             }],
             "llama3",
-            0.5,
+            Some(0.5),
             None,
         );
 
@@ -1334,7 +1386,7 @@ mod tests {
                 tool_name: None,
             }],
             "llama3",
-            0.9,
+            Some(0.9),
             None,
         );
 
@@ -1355,7 +1407,7 @@ mod tests {
                 tool_name: None,
             }],
             "llama3",
-            0.42,
+            Some(0.42),
             None,
         );
 
@@ -1387,11 +1439,12 @@ mod tests {
         let first = provider.build_chat_request_with_think(
             messages.clone(),
             "llama3",
-            0.4,
+            Some(0.4),
             None,
             Some(true),
         );
-        let retry = provider.build_chat_request_with_think(messages, "llama3", 0.4, None, None);
+        let retry =
+            provider.build_chat_request_with_think(messages, "llama3", Some(0.4), None, None);
 
         let first_json = serde_json::to_value(first).unwrap();
         let retry_json = serde_json::to_value(retry).unwrap();

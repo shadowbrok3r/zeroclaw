@@ -383,6 +383,7 @@ async fn handle_socket(
             &agent_alias,
             Some(&session_cwd),
             true,
+            false,
         )
         .await
         {
@@ -437,17 +438,47 @@ async fn handle_socket(
         .channel_handles()
         .register_channel("ws", approval_channel.clone());
 
+    // Seed agent's channel handles with configured channels (telegram,
+    // etc.) so the dashboard agent can deliver to external channels.
+    // The agent creates its own fresh handles in
+    // from_config_with_session_cwd_and_mcp_backchannel, so they need
+    // to be populated here — separate from the gateway boot-time seeding.
+    let ch = agent.channel_handles();
+    let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
+        &config,
+        &ch.ask_user,
+        &Some(ch.reaction.clone()),
+        &ch.poll,
+        &ch.escalate,
+    );
+    if !channel_names.is_empty() {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({"channels": channel_names, "session": session_key})
+            ),
+            "Seeded {} channel(s) into dashboard agent session",
+        );
+    }
+
     // Process the first message if it was not a connect frame
     if let Some(ref text) = first_msg_fallback {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
             if parsed["type"].as_str() == Some("message") {
                 let content = parsed["content"].as_str().unwrap_or("").to_string();
                 if !content.is_empty() {
-                    // Persist user message
-                    if let Some(ref backend) = state.session_backend {
-                        let user_msg = zeroclaw_providers::ChatMessage::user(&content);
-                        let _ = backend.append(&session_key, &user_msg);
-                    }
+                    let _session_guard = match state.session_queue.acquire(&session_key).await {
+                        Ok(guard) => guard,
+                        Err(e) => {
+                            let err = serde_json::json!({
+                                "type": "error",
+                                "message": e.to_string(),
+                                "code": session_queue_ws_error_code(&e)
+                            });
+                            let _ = sender.send(Message::Text(err.to_string().into())).await;
+                            return;
+                        }
+                    };
                     process_chat_message(
                         &state,
                         &mut agent,
@@ -582,18 +613,12 @@ async fn handle_socket(
                         let err = serde_json::json!({
                             "type": "error",
                             "message": e.to_string(),
-                            "code": "SESSION_BUSY"
+                            "code": session_queue_ws_error_code(&e)
                         });
                         let _ = sender.send(Message::Text(err.to_string().into())).await;
                         continue;
                     }
                 };
-
-                // Persist user message
-                if let Some(ref backend) = state.session_backend {
-                    let user_msg = zeroclaw_providers::ChatMessage::user(&content);
-                    let _ = backend.append(&session_key, &user_msg);
-                }
 
                 process_chat_message(
                     &state,
@@ -674,16 +699,49 @@ fn resolve_session_cwd(
     })
 }
 
+fn session_queue_ws_error_code(error: &crate::session_queue::SessionQueueError) -> &'static str {
+    match error {
+        crate::session_queue::SessionQueueError::QueueFull { .. } => "SESSION_QUEUE_FULL",
+        crate::session_queue::SessionQueueError::Timeout { .. } => "SESSION_QUEUE_TIMEOUT",
+    }
+}
+
+fn persist_conversation_messages(
+    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    session_key: &str,
+    messages: &[zeroclaw_providers::ConversationMessage],
+) {
+    for message in messages {
+        let zeroclaw_providers::ConversationMessage::Chat(message) = message else {
+            continue;
+        };
+        if message.role == "system" {
+            continue;
+        }
+        let _ = backend.append(session_key, message);
+    }
+}
+
+fn has_assistant_chat_message(messages: &[zeroclaw_providers::ConversationMessage]) -> bool {
+    messages.iter().any(|message| {
+        matches!(
+            message,
+            zeroclaw_providers::ConversationMessage::Chat(message)
+                if message.role == "assistant"
+        )
+    })
+}
+
 fn needs_onboarding_ws_error(
     config: &zeroclaw_config::schema::Config,
 ) -> Option<serde_json::Value> {
     let model = config.resolve_default_model().unwrap_or_default();
-    crate::needs_onboarding_for(&model)?;
+    crate::needs_quickstart_for(&model)?;
     Some(serde_json::json!({
         "type": "error",
         "error": "needs_onboarding",
         "code": "NEEDS_ONBOARDING",
-        "message": crate::needs_onboarding_channel_reply(),
+        "message": crate::needs_quickstart_channel_reply(),
         "url": "/onboard",
     }))
 }
@@ -712,12 +770,15 @@ async fn process_chat_message(
     use futures_util::StreamExt as _;
     use zeroclaw_runtime::agent::TurnEvent;
 
-    let provider_label = state
-        .config
-        .read()
-        .first_model_provider_type()
-        .unwrap_or("unknown")
-        .to_string();
+    let provider_label = {
+        let cfg = state.config.read();
+        cfg.providers
+            .models
+            .iter_entries()
+            .next()
+            .map(|(ty, alias, _)| format!("{ty}.{alias}"))
+            .unwrap_or_else(|| "unknown".to_string())
+    };
 
     // Broadcast agent_start event
     let _ = state.event_tx.send(serde_json::json!({
@@ -747,6 +808,7 @@ async fn process_chat_message(
 
     // Channel for streaming turn events from the agent.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+    let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(32);
 
     // Run the streamed turn concurrently: the agent produces events
     // while we forward them to the WebSocket below.  We cannot move
@@ -755,10 +817,28 @@ async fn process_chat_message(
     // from the other branch.
     let content_owned = content.to_string();
     let session_key_owned = session_key.to_string();
+    let (turn_alias, turn_provider, turn_model) = agent.attribution_fields();
     let turn_fut = async {
+        use ::zeroclaw_log::Instrument as _;
+        let span = ::zeroclaw_log::info_span!(
+            target: "zeroclaw_log_internal_scope",
+            "zeroclaw_scope",
+            session_key = %session_key_owned,
+            agent_alias = %turn_alias,
+            model_provider = %turn_provider,
+            model = %turn_model,
+            channel = "wss",
+        );
         zeroclaw_runtime::agent::loop_::scope_session_key(
-            Some(session_key_owned),
-            agent.turn_streamed(&content_owned, event_tx, Some(cancel_token.clone())),
+            Some(session_key_owned.clone()),
+            agent
+                .turn_streamed_with_steering_state(
+                    &content_owned,
+                    event_tx,
+                    Some(cancel_token.clone()),
+                    Some(&mut steering_rx),
+                )
+                .instrument(span),
         )
         .await
     };
@@ -767,15 +847,7 @@ async fn process_chat_message(
     // and we relay them over WebSocket. Track streamed chunks so we
     // can reconstruct partial content on cancellation.
     //
-    // WHY incremental persistence: If the process crashes during streaming,
-    // the assistant's response is lost — only the user message survives.
-    // We append a placeholder assistant message on the first chunk, then
-    // update_last periodically (every 500ms) so partial content survives.
-    // The final response overwrites this via update_last on completion.
     let mut accumulated_text = String::new();
-    let mut partial_saved = false;
-    let mut last_partial_save = std::time::Instant::now();
-    let partial_save_interval = std::time::Duration::from_millis(500);
 
     // Aggregate token usage across all LLM calls in this turn.
     // The agent emits TurnEvent::Usage once per LLM call when the provider
@@ -839,14 +911,20 @@ async fn process_chat_message(
                         let _ = sender.send(Message::Text(frame.to_string().into())).await;
                     }
                 }
-                event_opt = event_rx.recv() => {
+                    event_opt = event_rx.recv() => {
                     let Some(event) = event_opt else { break };
                     let ws_msg = match event {
                         TurnEvent::Usage {
                             input_tokens,
+                            cached_input_tokens: _,
                             output_tokens,
                             cost_usd: _,
                         } => {
+                            // `input_tokens` per TokenUsage contract is
+                            // the *total* prompt size (uncached + cached).
+                            // `cached_input_tokens` is a subset and must
+                            // NOT be added — that would double-count
+                            // cache reads.
                             if let Some(it) = input_tokens {
                                 total_input_tokens = Some(total_input_tokens.unwrap_or(0) + it);
                             }
@@ -857,23 +935,6 @@ async fn process_chat_message(
                         }
                         TurnEvent::Chunk { ref delta } => {
                             accumulated_text.push_str(delta);
-                            // Incremental persistence: save partial content so it
-                            // survives a crash. First chunk appends, subsequent
-                            // chunks update in-place.
-                            if last_partial_save.elapsed() >= partial_save_interval {
-                                if let Some(ref backend) = state.session_backend {
-                                    let partial = zeroclaw_providers::ChatMessage::assistant(
-                                        &accumulated_text,
-                                    );
-                                    if partial_saved {
-                                        let _ = backend.update_last(session_key, &partial);
-                                    } else {
-                                        let _ = backend.append(session_key, &partial);
-                                        partial_saved = true;
-                                    }
-                                }
-                                last_partial_save = std::time::Instant::now();
-                            }
                             serde_json::json!({ "type": "chunk", "content": delta })
                         }
                         TurnEvent::Thinking { delta } => {
@@ -922,6 +983,37 @@ async fn process_chat_message(
                         continue;
                     };
                     if parsed["type"].as_str() != Some("approval_response") {
+                        if parsed["type"].as_str() == Some("message") {
+                            let content = parsed["content"].as_str().unwrap_or("").to_string();
+                            if content.is_empty() {
+                                let err = serde_json::json!({
+                                    "type": "error",
+                                    "message": "Message content cannot be empty",
+                                    "code": "EMPTY_CONTENT"
+                                });
+                                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                            } else {
+                                match steering_tx.try_send(content) {
+                                    Ok(()) => {}
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                        let err = serde_json::json!({
+                                            "type": "error",
+                                            "message": "Steering queue is full for the running turn",
+                                            "code": "STEERING_QUEUE_FULL"
+                                        });
+                                        let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                    }
+                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                        let err = serde_json::json!({
+                                            "type": "error",
+                                            "message": "Running turn is no longer accepting steering messages",
+                                            "code": "STEERING_CLOSED"
+                                        });
+                                        let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                    }
+                                }
+                            }
+                        }
                         // Mid-turn traffic other than approval_response: yield so
                         // we never spin tightly on ignored frames while approval
                         // events are waiting on other branches.
@@ -963,25 +1055,38 @@ async fn process_chat_message(
     // Check if this turn was cancelled. `turn_streamed` propagates
     // `ToolLoopCancelled` through anyhow, so we detect it here.
     let was_cancelled = match &result {
-        Err(e) => zeroclaw_runtime::agent::loop_::is_tool_loop_cancelled(e),
+        Err(e) => zeroclaw_runtime::agent::loop_::is_tool_loop_cancelled(&e.error),
         Ok(_) => false,
     };
 
     if was_cancelled {
-        // Store partial content with interruption marker so the
-        // conversation stays coherent for subsequent turns.
-        let truncated = if accumulated_text.is_empty() {
-            "[interrupted by user]".to_string()
-        } else {
-            format!("{accumulated_text}\n\n[interrupted by user]")
-        };
-
         if let Some(ref backend) = state.session_backend {
-            let assistant_msg = zeroclaw_providers::ChatMessage::assistant(&truncated);
-            if partial_saved {
-                let _ = backend.update_last(session_key, &assistant_msg);
-            } else {
-                let _ = backend.append(session_key, &assistant_msg);
+            match &result {
+                Err(error) if !error.new_messages.is_empty() => {
+                    persist_conversation_messages(
+                        backend.as_ref(),
+                        session_key,
+                        &error.new_messages,
+                    );
+                    if !has_assistant_chat_message(&error.new_messages) {
+                        let truncated = if accumulated_text.is_empty() {
+                            "[interrupted by user]".to_string()
+                        } else {
+                            format!("{accumulated_text}\n\n[interrupted by user]")
+                        };
+                        let assistant_msg = zeroclaw_providers::ChatMessage::assistant(&truncated);
+                        let _ = backend.append(session_key, &assistant_msg);
+                    }
+                }
+                _ => {
+                    let truncated = if accumulated_text.is_empty() {
+                        "[interrupted by user]".to_string()
+                    } else {
+                        format!("{accumulated_text}\n\n[interrupted by user]")
+                    };
+                    let assistant_msg = zeroclaw_providers::ChatMessage::assistant(&truncated);
+                    let _ = backend.append(session_key, &assistant_msg);
+                }
             }
         }
 
@@ -1022,16 +1127,9 @@ async fn process_chat_message(
     }
 
     match result {
-        Ok((response, _)) => {
-            // Persist final assistant response. If we saved partial content
-            // during streaming, update it in-place; otherwise append fresh.
+        Ok(outcome) => {
             if let Some(ref backend) = state.session_backend {
-                let assistant_msg = zeroclaw_providers::ChatMessage::assistant(&response);
-                if partial_saved {
-                    let _ = backend.update_last(session_key, &assistant_msg);
-                } else {
-                    let _ = backend.append(session_key, &assistant_msg);
-                }
+                persist_conversation_messages(backend.as_ref(), session_key, &outcome.new_messages);
             }
 
             // Fire-and-forget memory consolidation so facts from WS sessions
@@ -1042,8 +1140,8 @@ async fn process_chat_message(
                 let model = state.model.clone();
                 let temperature = state.temperature;
                 let user_msg = content.to_string();
-                let assistant_resp = response.clone();
-                tokio::spawn(async move {
+                let assistant_resp = outcome.response.clone();
+                zeroclaw_spawn::spawn!(async move {
                     if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
                         model_provider.as_ref(),
                         &model,
@@ -1067,11 +1165,6 @@ async fn process_chat_message(
                 });
             }
 
-            // Send chunk_reset so the client clears any accumulated draft
-            // before the authoritative done message.
-            let reset = serde_json::json!({ "type": "chunk_reset" });
-            let _ = sender.send(Message::Text(reset.to_string().into())).await;
-
             // Compute cost from accumulated tokens + configured pricing,
             // then write the cost record so /api/cost and costs.jsonl reflect
             // this turn. Done before the done frame so cost_usd can ride along.
@@ -1092,7 +1185,7 @@ async fn process_chat_message(
 
             let done = serde_json::json!({
                 "type": "done",
-                "full_response": response,
+                "full_response": outcome.response,
                 "input_tokens": total_input_tokens,
                 "output_tokens": total_output_tokens,
                 "tokens_used": total_tokens,
@@ -1135,6 +1228,12 @@ async fn process_chat_message(
             );
         }
         Err(e) => {
+            if let Some(ref backend) = state.session_backend
+                && !e.new_messages.is_empty()
+            {
+                persist_conversation_messages(backend.as_ref(), session_key, &e.new_messages);
+            }
+
             // Set session state to error
             if let Some(ref backend) = state.session_backend {
                 let _ = backend.set_session_state(session_key, "error", Some(&turn_id));
@@ -1144,10 +1243,10 @@ async fn process_chat_message(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e.error)})),
                 "Agent turn failed"
             );
-            let sanitized = zeroclaw_providers::sanitize_api_error(&e.to_string());
+            let sanitized = zeroclaw_providers::sanitize_api_error(&e.error.to_string());
             let error_code = if sanitized.to_lowercase().contains("api key")
                 || sanitized.to_lowercase().contains("authentication")
                 || sanitized.to_lowercase().contains("unauthorized")
@@ -1428,8 +1527,8 @@ mod tests {
             "missing Fluent key fallback leaked into WS error message: {message:?}"
         );
         assert!(
-            message.to_lowercase().contains("onboarding"),
-            "WS onboarding message must explain the setup gap: {message:?}"
+            message.to_lowercase().contains("quickstart"),
+            "WS setup-gap message must explain the setup gap: {message:?}"
         );
     }
 
@@ -1506,6 +1605,25 @@ mod tests {
         assert!(
             clone_for_turn.is_cancelled(),
             "cloned token (held by turn_fut via agent.turn_streamed) must observe cancellation"
+        );
+    }
+
+    #[test]
+    fn session_queue_errors_map_to_explicit_websocket_codes() {
+        use crate::session_queue::SessionQueueError;
+
+        assert_eq!(
+            session_queue_ws_error_code(&SessionQueueError::QueueFull {
+                session_id: "gw_test".into(),
+                depth: 2,
+            }),
+            "SESSION_QUEUE_FULL"
+        );
+        assert_eq!(
+            session_queue_ws_error_code(&SessionQueueError::Timeout {
+                session_id: "gw_test".into(),
+            }),
+            "SESSION_QUEUE_TIMEOUT"
         );
     }
 }

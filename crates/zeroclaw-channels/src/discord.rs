@@ -16,6 +16,7 @@ use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
 use zeroclaw_api::media::MediaAttachment;
+use zeroclaw_runtime::i18n;
 
 /// Discord channel — connects via Gateway WebSocket for real-time messages
 pub struct DiscordChannel {
@@ -68,8 +69,41 @@ pub struct DiscordChannel {
     /// inbound message from a channel via `GET /channels/{id}`. Thread type
     /// is stable for the channel's lifetime so the cache lives as long as
     /// the channel instance.
-    thread_channels: Arc<AsyncMutex<HashMap<String, bool>>>,
+    ///
+    /// Value is `Some(parent_id)` when the channel is a thread, `None`
+    /// when it is a regular (non-thread) channel.
+    thread_channels: Arc<AsyncMutex<HashMap<String, Option<String>>>>,
+    /// Ephemeral Discord gateway session state for Resume across reconnects.
+    gateway_session: Mutex<DiscordGatewaySession>,
 }
+
+#[derive(Clone, Debug, Default)]
+struct DiscordGatewaySession {
+    session_id: Option<String>,
+    resume_gateway_url: Option<String>,
+    sequence: Option<i64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DiscordListenerFatalError {
+    message: String,
+}
+
+impl DiscordListenerFatalError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for DiscordListenerFatalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DiscordListenerFatalError {}
 
 impl DiscordChannel {
     pub fn new(
@@ -104,6 +138,7 @@ impl DiscordChannel {
             pending_approvals: Arc::new(AsyncMutex::new(HashMap::new())),
             approval_timeout_secs: 300,
             thread_channels: Arc::new(AsyncMutex::new(HashMap::new())),
+            gateway_session: Mutex::new(DiscordGatewaySession::default()),
         }
     }
 
@@ -174,6 +209,16 @@ impl DiscordChannel {
         self
     }
 
+    fn fatal_listener_error(message: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(DiscordListenerFatalError::new(message))
+    }
+
+    fn validate_gateway_preflight_response(
+        response: reqwest::Response,
+    ) -> anyhow::Result<reqwest::Response> {
+        Ok(response.error_for_status()?)
+    }
+
     pub fn with_archive_memory(mut self, mem: std::sync::Arc<dyn zeroclaw_memory::Memory>) -> Self {
         self.archive_memory = Some(mem);
         self
@@ -201,22 +246,23 @@ impl DiscordChannel {
     }
 
     /// Resolve whether `channel_id` is a Discord thread (ANNOUNCEMENT,
-    /// PUBLIC, or PRIVATE thread) via `GET /channels/{id}`. Results are
-    /// cached for the channel instance's lifetime: thread-ness is stable
-    /// for a given channel ID, so one lookup per ID per process. Failures
-    /// (network, 429, missing `type` field) fall through to `false` so a
-    /// transient API hiccup never blocks inbound delivery.
-    async fn is_thread_channel(&self, client: &reqwest::Client, channel_id: &str) -> bool {
+    /// PUBLIC, or PRIVATE thread) via `GET /channels/{id}`. Returns
+    /// `Some(parent_id)` when the channel is a thread, `None` otherwise.
+    /// Results are cached for the channel instance's lifetime: thread-ness
+    /// is stable for a given channel ID, so one lookup per ID per process.
+    /// Failures (network, 429, missing fields) return `None` without
+    /// caching so the next message retries.
+    async fn thread_parent(&self, client: &reqwest::Client, channel_id: &str) -> Option<String> {
         {
             let cache = self.thread_channels.lock().await;
-            if let Some(&value) = cache.get(channel_id) {
-                return value;
+            if let Some(value) = cache.get(channel_id) {
+                return value.clone();
             }
         }
 
         // Only a successful API response is cached. A transient network blip
         // or 429 must not poison the cache for the channel's lifetime; the
-        // next message should retry the lookup. Failure paths return `false`
+        // next message should retry the lookup. Failure paths return `None`
         // (the safe default) without writing to the cache. The whole request
         // is wrapped in an explicit timeout so a hung Discord API call can
         // never stall the listener; the shared channel HTTP client may not
@@ -251,14 +297,20 @@ impl DiscordChannel {
                 );
                 anyhow::Error::msg(format!("body parse failed: {e}"))
             })?;
-            Ok::<bool, anyhow::Error>(
-                body.get("type")
-                    .and_then(serde_json::Value::as_u64)
-                    .map(is_thread_channel_type)
-                    .unwrap_or(false),
-            )
+            let is_thread = body
+                .get("type")
+                .and_then(serde_json::Value::as_u64)
+                .map(is_thread_channel_type)
+                .unwrap_or(false);
+            Ok::<Option<String>, anyhow::Error>(if is_thread {
+                body.get("parent_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            } else {
+                None
+            })
         };
-        let is_thread = match tokio::time::timeout(THREAD_LOOKUP_TIMEOUT, lookup).await {
+        let result = match tokio::time::timeout(THREAD_LOOKUP_TIMEOUT, lookup).await {
             Ok(Ok(value)) => value,
             Ok(Err(e)) => {
                 ::zeroclaw_log::record!(
@@ -269,19 +321,19 @@ impl DiscordChannel {
                         ),
                     "channel lookup failed"
                 );
-                return false;
+                return None;
             }
             Err(_) => {
                 ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel_id": channel_id, "timeout_secs": THREAD_LOOKUP_TIMEOUT.as_secs()})), "channel lookup timed out");
-                return false;
+                return None;
             }
         };
 
         self.thread_channels
             .lock()
             .await
-            .insert(channel_id.to_string(), is_thread);
-        is_thread
+            .insert(channel_id.to_string(), result.clone());
+        result
     }
 
     /// Apply the trust-boundary / delivery-failure emoji reactions to the
@@ -323,6 +375,30 @@ const fn is_thread_channel_type(channel_type: u64) -> bool {
 /// channel is a thread. Discord normally responds in under 200 ms; this
 /// is a safety bound so a hung request cannot stall the listener.
 const THREAD_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Pure channel-filter decision: does `msg_channel` pass the allowlist?
+///
+/// A channel passes when:
+/// 1. `channel_filter` is empty (accept all), OR
+/// 2. `msg_channel` is directly in `channel_filter`, OR
+/// 3. `thread_parent_id` is `Some(parent)` and `parent` is in `channel_filter`
+///    (thread whose parent forum/channel is allowed).
+fn channel_passes_filter(
+    channel_filter: &[String],
+    msg_channel: &str,
+    thread_parent_id: Option<&str>,
+) -> bool {
+    if channel_filter.is_empty() {
+        return true;
+    }
+    if channel_filter.iter().any(|c| c == msg_channel) {
+        return true;
+    }
+    if let Some(parent) = thread_parent_id {
+        return channel_filter.iter().any(|c| c == parent);
+    }
+    false
+}
 
 /// Process Discord message attachments in a single pass.
 ///
@@ -826,11 +902,7 @@ fn validate_marker_target(
 fn classify_outgoing_attachments(
     attachments: &[DiscordAttachment],
     workspace_dir: Option<&Path>,
-) -> (
-    Vec<PathBuf>,
-    Vec<String>,
-    Vec<(String, DiscordMarkerFailure)>,
-) {
+) -> (Vec<PathBuf>, Vec<String>, Vec<DiscordMarkerFailure>) {
     let mut local_files = Vec::new();
     let mut remote_urls = Vec::new();
     let mut failures = Vec::new();
@@ -845,7 +917,7 @@ fn classify_outgoing_attachments(
                     DiscordMarkerFailure::NotFound => "not found",
                 };
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"kind": attachment.kind.marker_name(), "target": attachment.target, "reason": kind_label, "error": format!("{}", e)})), "dropping unresolved outbound attachment marker");
-                failures.push((attachment.target.clone(), e.kind()));
+                failures.push(e.kind());
             }
         }
     }
@@ -853,23 +925,23 @@ fn classify_outgoing_attachments(
     (local_files, remote_urls, failures)
 }
 
-/// Build the Matrix-style "(note: I couldn't deliver ...)" tail appended
-/// to the bot's reply when at least one marker was dropped. Returns
-/// `None` when the failure list is empty so callers can keep the body
-/// untouched.
-fn delivery_failure_note(failures: &[(String, DiscordMarkerFailure)]) -> Option<String> {
+/// Build the count-only delivery failure tail appended to the bot's reply
+/// when at least one marker was dropped. Returns `None` when the failure
+/// list is empty so callers can keep the body untouched.
+fn delivery_failure_note(failures: &[DiscordMarkerFailure]) -> Option<String> {
     if failures.is_empty() {
         return None;
     }
-    let targets: Vec<&str> = failures.iter().map(|(t, _)| t.as_str()).collect();
-    Some(if targets.len() == 1 {
-        format!("(note: I couldn't deliver the file at {}.)", targets[0])
+    let count = failures.len().to_string();
+    let key = if failures.len() == 1 {
+        "channel-discord-delivery-failure-note-one"
     } else {
-        format!(
-            "(note: I couldn't deliver these files: {}.)",
-            targets.join(", ")
-        )
-    })
+        "channel-discord-delivery-failure-note-many"
+    };
+    Some(i18n::get_required_cli_string_with_args(
+        key,
+        &[("count", count.as_str())],
+    ))
 }
 
 /// Compose the final reply body with the delivery-failure note appended.
@@ -887,17 +959,17 @@ fn compose_body_with_failure_note(content: &str, note: Option<&str>) -> String {
 /// kinds of marker failures occurred. 🚫 signals a trust-boundary refusal,
 /// ⚠️ signals a post-validation delivery failure. Both can fire on the
 /// same message when a batch mixes refusals and not-found targets.
-fn decide_failure_reactions(failures: &[(String, DiscordMarkerFailure)]) -> Vec<&'static str> {
+fn decide_failure_reactions(failures: &[DiscordMarkerFailure]) -> Vec<&'static str> {
     let mut out = Vec::new();
     if failures
         .iter()
-        .any(|(_, k)| matches!(k, DiscordMarkerFailure::Refused))
+        .any(|k| matches!(k, DiscordMarkerFailure::Refused))
     {
         out.push("🚫");
     }
     if failures
         .iter()
-        .any(|(_, k)| matches!(k, DiscordMarkerFailure::NotFound))
+        .any(|k| matches!(k, DiscordMarkerFailure::NotFound))
     {
         out.push("⚠️");
     }
@@ -1359,6 +1431,14 @@ fn base64_decode(input: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+fn is_fatal_gateway_close_code(code: u16) -> bool {
+    matches!(code, 4004 | 4010 | 4011 | 4012 | 4013 | 4014)
+}
+
+fn requires_new_session_close_code(code: u16) -> bool {
+    matches!(code, 4007 | 4009)
+}
+
 impl ::zeroclaw_api::attribution::Attributable for DiscordChannel {
     fn role(&self) -> ::zeroclaw_api::attribution::Role {
         ::zeroclaw_api::attribution::Role::Channel(
@@ -1482,26 +1562,51 @@ impl Channel for DiscordChannel {
     #[allow(clippy::too_many_lines)]
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let bot_user_id = Self::bot_user_id_from_token(&self.bot_token).unwrap_or_default();
+        let mut had_ready = false;
 
         // Get Gateway URL
-        let gw_resp: serde_json::Value = self
+        let gw_resp = self
             .http_client()
             .get("https://discord.com/api/v10/gateway/bot")
             .header("Authorization", format!("Bot {}", self.bot_token))
             .send()
-            .await?
-            .json()
             .await?;
+        let gw_resp = Self::validate_gateway_preflight_response(gw_resp)?;
+        let gw_resp: serde_json::Value = gw_resp.json().await?;
 
-        let gw_url = gw_resp
+        if let Some(remaining) = gw_resp
+            .get("session_start_limit")
+            .and_then(|v| v.get("remaining"))
+            .and_then(serde_json::Value::as_u64)
+            && remaining == 0
+        {
+            return Err(Self::fatal_listener_error(
+                "discord gateway identify blocked: session_start_limit.remaining is 0",
+            ));
+        }
+
+        let fresh_gateway_url = gw_resp
             .get("url")
             .and_then(|u| u.as_str())
-            .unwrap_or("wss://gateway.discord.gg");
+            .ok_or_else(|| Self::fatal_listener_error("discord gateway preflight missing url"))?
+            .to_string();
+        let session_snapshot = self.gateway_session.lock().clone();
+        let can_resume =
+            session_snapshot.session_id.is_some() && session_snapshot.sequence.is_some();
+        let gw_url = if can_resume {
+            session_snapshot
+                .resume_gateway_url
+                .clone()
+                .unwrap_or_else(|| fresh_gateway_url.clone())
+        } else {
+            fresh_gateway_url.clone()
+        };
 
         let ws_url = format!("{gw_url}/?v=10&encoding=json");
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"resume": can_resume, "gateway_url": gw_url})),
             "connecting to gateway..."
         );
 
@@ -1531,38 +1636,52 @@ impl Channel for DiscordChannel {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(41250);
 
-        // Send Identify (opcode 2)
-        let identify = json!({
-            "op": 2,
-            "d": {
-                "token": self.bot_token,
-                "intents": 37377, // GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT | DIRECT_MESSAGES
-                "properties": {
-                    "os": "linux",
-                    "browser": "zeroclaw",
-                    "device": "zeroclaw"
+        let mut sequence = session_snapshot.sequence.unwrap_or(-1);
+
+        if can_resume {
+            let resume = json!({
+                "op": 6,
+                "d": {
+                    "token": self.bot_token,
+                    "session_id": session_snapshot.session_id,
+                    "seq": session_snapshot.sequence,
                 }
-            }
-        });
-        write
-            .send(Message::Text(identify.to_string().into()))
-            .await?;
-
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "connected and identified"
-        );
-
-        // Track the last sequence number for heartbeats and resume.
-        // Only accessed in the select! loop below, so a plain i64 suffices.
-        let mut sequence: i64 = -1;
+            });
+            write.send(Message::Text(resume.to_string().into())).await?;
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"sequence": sequence})),
+                "sent Discord Resume"
+            );
+        } else {
+            let identify = json!({
+                "op": 2,
+                "d": {
+                    "token": self.bot_token,
+                    "intents": 37377,
+                    "properties": {
+                        "os": "linux",
+                        "browser": "zeroclaw",
+                        "device": "zeroclaw"
+                    }
+                }
+            });
+            write
+                .send(Message::Text(identify.to_string().into()))
+                .await?;
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "sent Discord Identify"
+            );
+        }
 
         // Spawn heartbeat timer — sends a tick signal, actual heartbeat
         // is assembled in the select! loop where `sequence` lives.
         let (hb_tx, mut hb_rx) = tokio::sync::mpsc::channel::<()>(1);
         let hb_interval = heartbeat_interval;
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(hb_interval));
             loop {
                 interval.tick().await;
@@ -1626,9 +1745,31 @@ impl Channel for DiscordChannel {
                             }
                             continue;
                         }
-                        Some(Ok(Message::Close(_))) | None => break,
+                        Some(Ok(Message::Close(frame))) => {
+                            if let Some(frame) = frame {
+                                let code = u16::from(frame.code);
+                                let reason = frame.reason.to_string();
+                                if requires_new_session_close_code(code) {
+                                    let mut session = self.gateway_session.lock();
+                                    session.session_id = None;
+                                    session.resume_gateway_url = None;
+                                    session.sequence = None;
+                                }
+                                if is_fatal_gateway_close_code(code) {
+                                    return Err(Self::fatal_listener_error(format!(
+                                        "discord gateway closed with fatal code {code}: {reason}"
+                                    )));
+                                }
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"code": code, "reason": reason, "had_ready": had_ready, "sequence": sequence})), "discord gateway closed; reconnecting");
+                            }
+                            break;
+                        }
+                        None => {
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"had_ready": had_ready, "sequence": sequence})), "discord gateway stream ended; reconnecting");
+                            break;
+                        }
                         Some(Err(e)) => {
-                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "websocket read error, reconnecting");
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", e), "had_ready": had_ready, "sequence": sequence})), "websocket read error, reconnecting");
                             break;
                         }
                         _ => continue,
@@ -1648,9 +1789,53 @@ impl Channel for DiscordChannel {
                     // Track sequence number from all dispatch events
                     if let Some(s) = event.get("s").and_then(serde_json::Value::as_i64) {
                         sequence = s;
+                        self.gateway_session.lock().sequence = Some(s);
                     }
 
                     let op = event.get("op").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                    let event_type = event.get("t").and_then(|t| t.as_str()).unwrap_or("");
+
+                    match event_type {
+                        "READY" => {
+                            had_ready = true;
+                            let session_id = event
+                                .get("d")
+                                .and_then(|d| d.get("session_id"))
+                                .and_then(serde_json::Value::as_str)
+                                .map(ToString::to_string);
+                            let resume_gateway_url = event
+                                .get("d")
+                                .and_then(|d| d.get("resume_gateway_url"))
+                                .and_then(serde_json::Value::as_str)
+                                .map(ToString::to_string);
+                            {
+                                let mut session = self.gateway_session.lock();
+                                session.session_id = session_id.clone();
+                                session.resume_gateway_url = resume_gateway_url;
+                                session.sequence = if sequence >= 0 { Some(sequence) } else { None };
+                            }
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                                    ::serde_json::json!({"sequence": sequence, "session_id_present": session_id.is_some()})
+                                ),
+                                "discord READY received"
+                            );
+                            continue;
+                        }
+                        "RESUMED" => {
+                            had_ready = true;
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                                    ::serde_json::json!({"sequence": sequence})
+                                ),
+                                "discord RESUMED received"
+                            );
+                            continue;
+                        }
+                        _ => {}
+                    }
 
                     match op {
                         // Op 1: Server requests an immediate heartbeat
@@ -1664,19 +1849,25 @@ impl Channel for DiscordChannel {
                         }
                         // Op 7: Reconnect
                         7 => {
-                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "received Reconnect (op 7), closing for restart");
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"had_ready": had_ready, "sequence": sequence})), "received Reconnect (op 7), closing for restart");
                             break;
                         }
                         // Op 9: Invalid Session
                         9 => {
-                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "received Invalid Session (op 9), closing for restart");
+                            let resumable = event.get("d").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                            if !resumable {
+                                let mut session = self.gateway_session.lock();
+                                session.session_id = None;
+                                session.resume_gateway_url = None;
+                                session.sequence = None;
+                            }
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"resumable": resumable, "had_ready": had_ready, "sequence": sequence})), "received Invalid Session (op 9), closing for restart");
                             break;
                         }
                         _ => {}
                     }
 
                     // Only handle MESSAGE_CREATE (opcode 0, type "MESSAGE_CREATE")
-                    let event_type = event.get("t").and_then(|t| t.as_str()).unwrap_or("");
                     if event_type != "MESSAGE_CREATE" {
                         continue;
                     }
@@ -1714,12 +1905,26 @@ impl Channel for DiscordChannel {
                     }
 
                     // Channel allowlist. Empty = watch every channel.
+                    // Thread messages carry the thread's own channel_id, not the
+                    // parent's. When the direct match fails, look up the thread's
+                    // parent_id and accept if *that* is in the allowlist.
                     if !channel_filter.is_empty() {
                         let msg_channel = d
                             .get("channel_id")
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("");
-                        if !channel_filter.iter().any(|c| c == msg_channel) {
+                        let parent_id = if !msg_channel.is_empty()
+                            && !channel_filter.iter().any(|c| c == msg_channel)
+                        {
+                            self.thread_parent(&self.http_client(), msg_channel).await
+                        } else {
+                            None
+                        };
+                        if !channel_passes_filter(
+                            &channel_filter,
+                            msg_channel,
+                            parent_id.as_deref(),
+                        ) {
                             continue;
                         }
                     }
@@ -1849,7 +2054,7 @@ impl Channel for DiscordChannel {
                         let reaction_channel_id = channel_id.clone();
                         let reaction_message_id = message_id.to_string();
                         let reaction_emoji = random_discord_ack_reaction().to_string();
-                        tokio::spawn(async move {
+                        zeroclaw_spawn::spawn!(async move {
                             if let Err(err) = reaction_channel
                                 .add_reaction(
                                     &reaction_channel_id,
@@ -1877,7 +2082,8 @@ impl Channel for DiscordChannel {
                     // is worse.
                     let thread_ts = if channel_id.is_empty() {
                         None
-                    } else if self.is_thread_channel(&client, &channel_id).await {
+                    } else if self.thread_parent(&client, &channel_id).await.is_some()
+                    {
                         Some(channel_id.clone())
                     } else {
                         None
@@ -1905,6 +2111,7 @@ impl Channel for DiscordChannel {
                         interruption_scope_id: thread_ts.clone(),
                         thread_ts,
                         attachments: media_attachments,
+                        subject: None,
                     };
 
                     if tx.send(channel_msg).await.is_err() {
@@ -1940,7 +2147,7 @@ impl Channel for DiscordChannel {
         let token = self.bot_token.clone();
         let channel_id = recipient.to_string();
 
-        let handle = tokio::spawn(async move {
+        let handle = zeroclaw_spawn::spawn!(async move {
             let url = format!("https://discord.com/api/v10/channels/{channel_id}/typing");
             loop {
                 let _ = client
@@ -2457,6 +2664,29 @@ mod tests {
     }
 
     #[test]
+    fn gateway_preflight_429_remains_retryable_http_error() {
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(reqwest::StatusCode::TOO_MANY_REQUESTS)
+                .header(reqwest::header::RETRY_AFTER, "1")
+                .body(reqwest::Body::from(""))
+                .expect("test response should build"),
+        );
+
+        let error = DiscordChannel::validate_gateway_preflight_response(response)
+            .expect_err("429 should remain an HTTP error");
+        assert!(error.downcast_ref::<reqwest::Error>().is_some());
+        assert!(
+            error.downcast_ref::<DiscordListenerFatalError>().is_none(),
+            "gateway preflight 429 must not be wrapped as fatal"
+        );
+        assert!(
+            !zeroclaw_providers::reliable::is_non_retryable(&error),
+            "gateway preflight 429 should stay on the supervisor retry path"
+        );
+    }
+
+    #[test]
     fn empty_allowlist_denies_everyone() {
         let listen_to_bots = false;
         let mention_only = false;
@@ -2575,6 +2805,25 @@ mod tests {
     fn base64_decode_empty_string() {
         let decoded = base64_decode("");
         assert_eq!(decoded, Some(String::new()));
+    }
+
+    #[test]
+    fn fatal_gateway_close_codes_match_expected_discord_auth_and_intent_errors() {
+        for code in [4004_u16, 4010, 4011, 4012, 4013, 4014] {
+            assert!(
+                is_fatal_gateway_close_code(code),
+                "code {code} should be fatal"
+            );
+        }
+        assert!(!is_fatal_gateway_close_code(4007));
+        assert!(!is_fatal_gateway_close_code(4009));
+    }
+
+    #[test]
+    fn new_session_close_codes_match_invalidated_gateway_sessions() {
+        assert!(requires_new_session_close_code(4007));
+        assert!(requires_new_session_close_code(4009));
+        assert!(!requires_new_session_close_code(4004));
     }
 
     #[test]
@@ -3191,6 +3440,40 @@ mod tests {
     }
 
     #[test]
+    fn channel_filter_empty_accepts_everything() {
+        let filter: Vec<String> = vec![];
+        assert!(channel_passes_filter(&filter, "12345", None));
+        assert!(channel_passes_filter(&filter, "99999", Some("12345")));
+        assert!(channel_passes_filter(&filter, "", None));
+    }
+
+    #[test]
+    fn channel_filter_direct_match() {
+        let filter = vec!["111".to_string(), "222".to_string()];
+        assert!(channel_passes_filter(&filter, "111", None));
+        assert!(channel_passes_filter(&filter, "222", None));
+        assert!(!channel_passes_filter(&filter, "333", None));
+    }
+
+    #[test]
+    fn channel_filter_thread_parent_fallback() {
+        let filter = vec!["111".to_string()];
+        // Thread whose parent is in the allowlist — accepted.
+        assert!(channel_passes_filter(&filter, "999", Some("111")));
+        // Thread whose parent is NOT in the allowlist — rejected.
+        assert!(!channel_passes_filter(&filter, "999", Some("888")));
+        // Non-thread channel not in the allowlist — rejected.
+        assert!(!channel_passes_filter(&filter, "999", None));
+    }
+
+    #[test]
+    fn channel_filter_direct_match_skips_parent_check() {
+        let filter = vec!["111".to_string()];
+        // Direct match with a parent_id present — parent is irrelevant.
+        assert!(channel_passes_filter(&filter, "111", Some("999")));
+    }
+
+    #[test]
     fn parse_attachment_markers_extracts_supported_markers() {
         let input = "Report\n[IMAGE:https://example.com/a.png]\n[DOCUMENT:/tmp/a.pdf]";
         let (cleaned, attachments) = parse_attachment_markers(input);
@@ -3255,7 +3538,7 @@ mod tests {
         assert!(locals.is_empty());
         assert!(remotes.is_empty());
         assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].1, DiscordMarkerFailure::NotFound);
+        assert_eq!(failures[0], DiscordMarkerFailure::NotFound);
     }
 
     #[test]
@@ -3278,7 +3561,7 @@ mod tests {
         );
         assert!(remotes.is_empty());
         assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].1, DiscordMarkerFailure::Refused);
+        assert_eq!(failures[0], DiscordMarkerFailure::Refused);
     }
 
     #[test]
@@ -3294,7 +3577,7 @@ mod tests {
         assert!(locals.is_empty(), "relative paths must be refused");
         assert!(remotes.is_empty());
         assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].1, DiscordMarkerFailure::Refused);
+        assert_eq!(failures[0], DiscordMarkerFailure::Refused);
     }
 
     #[test]
@@ -3320,7 +3603,7 @@ mod tests {
         assert!(locals.is_empty());
         assert!(remotes.is_empty());
         assert_eq!(failures.len(), 3);
-        for (_, kind) in &failures {
+        for kind in &failures {
             assert_eq!(*kind, DiscordMarkerFailure::Refused);
         }
     }
@@ -3339,7 +3622,7 @@ mod tests {
         );
         assert!(remotes.is_empty());
         assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].1, DiscordMarkerFailure::Refused);
+        assert_eq!(failures[0], DiscordMarkerFailure::Refused);
     }
 
     #[test]
@@ -3377,28 +3660,43 @@ mod tests {
 
     #[test]
     fn delivery_failure_note_singular_for_one_failure() {
-        let note = delivery_failure_note(&[(
-            "/workspace/missing.png".to_string(),
-            DiscordMarkerFailure::NotFound,
-        )])
-        .expect("one failure should produce a note");
-        assert_eq!(
-            note,
-            "(note: I couldn't deliver the file at /workspace/missing.png.)"
+        let note = delivery_failure_note(&[DiscordMarkerFailure::NotFound])
+            .expect("one failure should produce a note");
+        assert_eq!(note, "(note: I couldn't deliver 1 file.)");
+        assert!(
+            !note.contains("/workspace/missing.png"),
+            "user-facing failure note must not echo local marker targets"
         );
     }
 
     #[test]
-    fn delivery_failure_note_plural_lists_targets_in_order() {
+    fn delivery_failure_note_plural_redacts_targets() {
         let note = delivery_failure_note(&[
-            ("a.png".to_string(), DiscordMarkerFailure::Refused),
-            ("b.pdf".to_string(), DiscordMarkerFailure::NotFound),
-            ("c.mp4".to_string(), DiscordMarkerFailure::Refused),
+            DiscordMarkerFailure::Refused,
+            DiscordMarkerFailure::NotFound,
+            DiscordMarkerFailure::Refused,
         ])
         .expect("multiple failures should produce a note");
-        assert_eq!(
-            note,
-            "(note: I couldn't deliver these files: a.png, b.pdf, c.mp4.)"
+        assert_eq!(note, "(note: I couldn't deliver 3 files.)");
+        assert!(
+            !note.contains("a.png") && !note.contains("b.pdf") && !note.contains("c.mp4"),
+            "user-facing failure note must not echo failed marker targets"
+        );
+    }
+
+    #[test]
+    fn composed_delivery_failure_note_redacts_parsed_marker_target() {
+        let content = "Done\n[IMAGE: /workspace/missing.png]";
+        let (cleaned_content, parsed_attachments) = parse_attachment_markers(content);
+        let (_locals, _remotes, failures) =
+            classify_outgoing_attachments(&parsed_attachments, None);
+        let note = delivery_failure_note(&failures);
+        let composed = compose_body_with_failure_note(&cleaned_content, note.as_deref());
+
+        assert_eq!(composed, "Done\n\n(note: I couldn't deliver 1 file.)");
+        assert!(
+            !composed.contains("/workspace/missing.png"),
+            "composed outbound body must not echo failed marker targets"
         );
     }
 
@@ -3434,23 +3732,23 @@ mod tests {
     #[test]
     fn decide_failure_reactions_emits_refused_only() {
         let r = decide_failure_reactions(&[
-            ("a".to_string(), DiscordMarkerFailure::Refused),
-            ("b".to_string(), DiscordMarkerFailure::Refused),
+            DiscordMarkerFailure::Refused,
+            DiscordMarkerFailure::Refused,
         ]);
         assert_eq!(r, vec!["🚫"]);
     }
 
     #[test]
     fn decide_failure_reactions_emits_not_found_only() {
-        let r = decide_failure_reactions(&[("a".to_string(), DiscordMarkerFailure::NotFound)]);
+        let r = decide_failure_reactions(&[DiscordMarkerFailure::NotFound]);
         assert_eq!(r, vec!["\u{26A0}\u{FE0F}"]);
     }
 
     #[test]
     fn decide_failure_reactions_emits_both_when_mixed() {
         let r = decide_failure_reactions(&[
-            ("a".to_string(), DiscordMarkerFailure::Refused),
-            ("b".to_string(), DiscordMarkerFailure::NotFound),
+            DiscordMarkerFailure::Refused,
+            DiscordMarkerFailure::NotFound,
         ]);
         assert_eq!(r, vec!["🚫", "\u{26A0}\u{FE0F}"]);
     }

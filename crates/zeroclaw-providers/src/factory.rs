@@ -150,6 +150,23 @@ pub fn apply_compat_options(
     Box::new(p)
 }
 
+pub(crate) fn build_kimi_code_compat(
+    alias: &str,
+    key: Option<&str>,
+    base_url: &str,
+) -> OpenAiCompatibleModelProvider {
+    OpenAiCompatibleModelProvider::new_with_user_agent_and_vision(
+        alias,
+        "Kimi Code",
+        base_url,
+        key,
+        AuthStyle::Bearer,
+        "KimiCLI/0.77",
+        true,
+    )
+    .with_models_dev_key("moonshotai")
+}
+
 /// Dispatch family construction by routing `(family, alias)` to the typed
 /// slot's `FamilyProviderFactory` impl. Generated from
 /// `for_each_model_provider_slot!` so the family list lives in exactly one
@@ -176,6 +193,13 @@ pub fn dispatch_family_factory(
     macro_rules! emit_dispatch {
         ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
             match family {
+                "openai-compatible" | "openai_compatible" => {
+                    let default_cfg = zeroclaw_config::schema::ModelProviderConfig::default();
+                    let cfg = config
+                        .and_then(|c| c.providers.models.find("openai", alias))
+                        .unwrap_or(&default_cfg);
+                    cfg.create_provider(alias, key, api_url, opts)
+                }
                 $(
                     $type_str => {
                         let default_cfg: $cfg_ty;
@@ -229,15 +253,16 @@ use zeroclaw_config::schema::{
     HunyuanModelProviderConfig, HyperbolicModelProviderConfig, KiloCliModelProviderConfig,
     LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
     LmstudioModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
-    MoonshotModelProviderConfig, NebiusModelProviderConfig, NovitaModelProviderConfig,
-    NscaleModelProviderConfig, NvidiaModelProviderConfig, OllamaModelProviderConfig,
-    OpenAIModelProviderConfig, OpenRouterModelProviderConfig, OpencodeModelProviderConfig,
-    OsaurusModelProviderConfig, OvhModelProviderConfig, PerplexityModelProviderConfig,
-    QianfanModelProviderConfig, QwenModelProviderConfig, RekaModelProviderConfig,
-    SambanovaModelProviderConfig, SglangModelProviderConfig, SiliconflowModelProviderConfig,
-    StepfunModelProviderConfig, SyntheticModelProviderConfig, TelnyxModelProviderConfig,
-    TogetherModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
-    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    MoonshotEndpoint, MoonshotModelProviderConfig, NebiusModelProviderConfig,
+    NovitaModelProviderConfig, NscaleModelProviderConfig, NvidiaModelProviderConfig,
+    OllamaModelProviderConfig, OpenAIModelProviderConfig, OpenRouterModelProviderConfig,
+    OpencodeModelProviderConfig, OsaurusModelProviderConfig, OvhModelProviderConfig,
+    PerplexityModelProviderConfig, QianfanModelProviderConfig, QwenModelProviderConfig,
+    RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
+    SiliconflowModelProviderConfig, StepfunModelProviderConfig, SyntheticModelProviderConfig,
+    TelnyxModelProviderConfig, TogetherModelProviderConfig, VeniceModelProviderConfig,
+    VercelModelProviderConfig, VllmModelProviderConfig, XaiModelProviderConfig,
+    YiModelProviderConfig, ZaiModelProviderConfig,
 };
 
 // ── Pure-compat families ───────────────────────────────────────────────
@@ -334,7 +359,7 @@ impl CompatFamilySpec for AstraiModelProviderConfig {
 }
 impl CompatFamilySpec for SiliconflowModelProviderConfig {
     const DISPLAY: &'static str = "SiliconFlow";
-    const DEFAULT_URL: &'static str = "https://api.siliconflow.cn/v1";
+    const DEFAULT_URL: &'static str = "https://api.siliconflow.com/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("siliconflow");
 }
@@ -464,6 +489,20 @@ impl CompatFamilySpec for MoonshotModelProviderConfig {
     const DEFAULT_URL: &'static str = crate::MOONSHOT_INTL_BASE_URL;
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("moonshotai");
+
+    fn build_compat(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        api_url: Option<&str>,
+    ) -> OpenAiCompatibleModelProvider {
+        let base_url = api_url.unwrap_or(Self::DEFAULT_URL);
+        if self.endpoint == MoonshotEndpoint::Code || base_url == crate::moonshot_code_base_url() {
+            return build_kimi_code_compat(alias, key, base_url);
+        }
+
+        self.build_compat_base(alias, key, api_url)
+    }
 }
 
 // ── Compat families with build_compat overrides ────────────────────────
@@ -669,21 +708,73 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        // Codex variant routing: the `requires_openai_auth` flag on the
-        // shared base flips OpenAI to its Codex-protocol cousin. Lives on
-        // the typed alias — operators set it via the schema-mirror grammar
-        // alongside any other OpenAI alias field.
+        // Codex variant routing: OAuth subscription auth → Codex responses protocol.
         if self.base.requires_openai_auth {
             return Ok(Box::new(
                 crate::openai_codex::OpenAiCodexModelProvider::new(alias, opts, key)?,
             ));
         }
+        // Responses wire protocol with standard API key — full streaming tool calls.
+        if self.base.wire_api == Some(zeroclaw_config::schema::WireApi::Responses) {
+            let mut p = crate::openai::OpenAiResponsesModelProvider::new(alias, api_url, key);
+            if let Some(mt) = opts.provider_max_tokens {
+                p = p.with_max_tokens(Some(mt));
+            }
+            if let Some(ref effort) = opts.reasoning_effort {
+                p = p.with_reasoning_effort(Some(effort.clone()));
+            }
+            return Ok(Box::new(p));
+        }
+        // Default: chat_completions wire with standard API key.
         let mut p = crate::openai::OpenAiModelProvider::with_base_url(alias, api_url, key);
         if let Some(mt) = opts.provider_max_tokens {
             p = p.with_max_tokens(Some(mt));
         }
         Ok(Box::new(p))
     }
+}
+
+fn normalize_ollama_compat_base_url(api_url: Option<&str>) -> String {
+    let raw = api_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("http://localhost:11434/v1");
+
+    let Ok(mut url) = reqwest::Url::parse(raw) else {
+        return raw.trim_end_matches('/').to_string();
+    };
+
+    let path = url.path().trim_end_matches('/');
+    if path.is_empty() || matches!(path, "/" | "/api" | "/api/chat") {
+        url.set_path("/v1");
+        return url.to_string().trim_end_matches('/').to_string();
+    }
+
+    raw.trim_end_matches('/').to_string()
+}
+
+fn build_ollama_compat_provider(
+    alias: &str,
+    key: Option<&str>,
+    api_url: Option<&str>,
+    opts: &ModelProviderRuntimeOptions,
+) -> OpenAiCompatibleModelProvider {
+    let base_url = normalize_ollama_compat_base_url(api_url);
+    let ollama_key = key.map(str::trim).filter(|value| !value.is_empty());
+    let mut p = OpenAiCompatibleModelProvider::new_with_vision(
+        alias,
+        "Ollama",
+        &base_url,
+        ollama_key,
+        AuthStyle::Bearer,
+        true,
+    )
+    .with_local_model_tool_sanitize()
+    .with_unauthenticated_model_listing();
+    if opts.merge_system_into_user {
+        p = p.with_merge_system_into_user();
+    }
+    p
 }
 
 impl FamilyProviderFactory for OllamaModelProviderConfig {
@@ -694,24 +785,10 @@ impl FamilyProviderFactory for OllamaModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let base_url = api_url.unwrap_or("http://localhost:11434/v1");
-        let ollama_key = key
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("ollama");
-        let mut p = OpenAiCompatibleModelProvider::new_with_vision(
-            alias,
-            "Ollama",
-            base_url,
-            Some(ollama_key),
-            AuthStyle::Bearer,
-            true,
-        )
-        .with_local_model_tool_sanitize();
-        if opts.merge_system_into_user {
-            p = p.with_merge_system_into_user();
-        }
-        Ok(apply_compat_options(p, opts))
+        Ok(apply_compat_options(
+            build_ollama_compat_provider(alias, key, api_url, opts),
+            opts,
+        ))
     }
 }
 
@@ -1110,5 +1187,205 @@ impl FamilyProviderFactory for CustomModelProviderConfig {
             p = p.with_merge_system_into_user();
         }
         Ok(apply_compat_options(p, opts))
+    }
+}
+
+impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
+    fn create_provider(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        api_url: Option<&str>,
+        opts: &ModelProviderRuntimeOptions,
+    ) -> Result<Box<dyn ModelProvider>> {
+        let base_url = api_url.ok_or_else(|| {
+            anyhow::Error::msg(
+                "OpenAI-compatible model_provider requires `uri`: set \
+                 `[model_providers.<family>.<alias>] uri = \"https://your-api.com\"` in config.toml.",
+            )
+        })?;
+        let mut p = OpenAiCompatibleModelProvider::new_with_vision(
+            alias,
+            "OpenAI Compatible",
+            base_url,
+            key,
+            AuthStyle::Bearer,
+            true,
+        );
+        if opts.merge_system_into_user {
+            p = p.with_merge_system_into_user();
+        }
+        Ok(apply_compat_options(p, opts))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeroclaw_config::schema::ModelProviderConfig;
+
+    #[test]
+    fn openai_factory_routes_to_codex_when_requires_openai_auth_true() {
+        let cfg = OpenAIModelProviderConfig {
+            base: ModelProviderConfig {
+                requires_openai_auth: true,
+                ..Default::default()
+            },
+        };
+        let provider = cfg
+            .create_provider("test", None, None, &ModelProviderRuntimeOptions::default())
+            .unwrap();
+        // OpenAiCodexModelProvider reports native_tool_calling; standard OpenAiModelProvider does not
+        assert!(provider.capabilities().native_tool_calling);
+    }
+
+    #[test]
+    fn openai_factory_routes_to_standard_when_requires_openai_auth_false() {
+        let cfg = OpenAIModelProviderConfig {
+            base: ModelProviderConfig {
+                requires_openai_auth: false,
+                ..Default::default()
+            },
+        };
+        let provider = cfg
+            .create_provider("test", None, None, &ModelProviderRuntimeOptions::default())
+            .unwrap();
+        assert!(!provider.capabilities().native_tool_calling);
+    }
+
+    #[tokio::test]
+    async fn zai_and_glm_factory_path_honors_api_url_override() {
+        use axum::{Json, Router, extract::State, http::Uri, routing::post};
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+
+        type Capture = Arc<Mutex<Vec<String>>>;
+
+        async fn capture_chat_request(
+            State(capture): State<Capture>,
+            uri: Uri,
+            Json(_body): Json<Value>,
+        ) -> Json<Value> {
+            capture
+                .lock()
+                .expect("capture lock poisoned")
+                .push(uri.path().to_string());
+            Json(json!({
+                "choices": [{"message": {"content": "ok"}}]
+            }))
+        }
+
+        let capture: Capture = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new()
+            .route(
+                "/zai/api/paas/v4/chat/completions",
+                post(capture_chat_request),
+            )
+            .route(
+                "/glm/api/paas/v4/chat/completions",
+                post(capture_chat_request),
+            )
+            .with_state(capture.clone());
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let base_url = format!("http://{addr}");
+        let zai_url = format!("{base_url}/zai/api/paas/v4");
+        let zai = ZaiModelProviderConfig::default()
+            .create_provider(
+                "cn",
+                Some("id.secret"),
+                Some(&zai_url),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .expect("zai provider should build");
+        assert_eq!(
+            zai.chat_with_system(None, "hello", "glm-5-turbo", Some(0.7))
+                .await
+                .expect("zai chat should use overridden URL"),
+            "ok"
+        );
+
+        let glm_url = format!("{base_url}/glm/api/paas/v4");
+        let glm = GlmModelProviderConfig::default()
+            .create_provider(
+                "global",
+                Some("id.secret"),
+                Some(&glm_url),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .expect("glm provider should build");
+        assert!(glm.capabilities().vision);
+        assert_eq!(
+            glm.chat_with_system(None, "hello", "glm-4.5", Some(0.7))
+                .await
+                .expect("glm chat should use overridden URL"),
+            "ok"
+        );
+
+        let paths = capture.lock().expect("capture lock poisoned").clone();
+        assert_eq!(
+            paths,
+            vec![
+                "/zai/api/paas/v4/chat/completions".to_string(),
+                "/glm/api/paas/v4/chat/completions".to_string(),
+            ]
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn ollama_factory_uses_no_credential_when_key_absent() {
+        let provider = build_ollama_compat_provider(
+            "default",
+            None,
+            Some("http://192.168.1.100:11434/v1"),
+            &ModelProviderRuntimeOptions::default(),
+        );
+
+        assert_eq!(provider.name, "Ollama");
+        assert_eq!(provider.base_url, "http://192.168.1.100:11434/v1");
+        assert!(provider.credential.is_none());
+    }
+
+    #[test]
+    fn ollama_factory_normalizes_host_root_to_openai_compat_base() {
+        let provider = build_ollama_compat_provider(
+            "default",
+            None,
+            Some("http://192.168.1.100:11434"),
+            &ModelProviderRuntimeOptions::default(),
+        );
+
+        assert_eq!(provider.base_url, "http://192.168.1.100:11434/v1");
+    }
+
+    #[test]
+    fn ollama_factory_normalizes_legacy_api_path_to_openai_compat_base() {
+        let provider = build_ollama_compat_provider(
+            "default",
+            None,
+            Some("https://ollama.com/api"),
+            &ModelProviderRuntimeOptions::default(),
+        );
+
+        assert_eq!(provider.base_url, "https://ollama.com/v1");
+    }
+
+    #[test]
+    fn ollama_factory_preserves_typed_api_key_for_official_cloud() {
+        let provider = build_ollama_compat_provider(
+            "default",
+            Some("  ollama-key  "),
+            Some("https://ollama.com/v1"),
+            &ModelProviderRuntimeOptions::default(),
+        );
+
+        assert_eq!(provider.credential.as_deref(), Some("ollama-key"));
     }
 }

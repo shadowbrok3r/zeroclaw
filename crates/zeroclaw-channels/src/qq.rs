@@ -1143,7 +1143,7 @@ impl Channel for QQChannel {
         let effective_interval = hb_interval.saturating_add(grace_ms);
 
         let (hb_tx, mut hb_rx) = tokio::sync::mpsc::channel::<()>(1);
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             let mut interval =
                 tokio::time::interval(std::time::Duration::from_millis(effective_interval));
             loop {
@@ -1320,6 +1320,7 @@ impl Channel for QQChannel {
                                 thread_ts: None,
                                 interruption_scope_id: None,
                     attachments: vec![],
+                                subject: None,
                             };
 
                             if tx.send(channel_msg).await.is_err() {
@@ -1362,6 +1363,7 @@ impl Channel for QQChannel {
                                 thread_ts: None,
                                 interruption_scope_id: None,
                     attachments: vec![],
+                                subject: None,
                             };
 
                             if tx.send(channel_msg).await.is_err() {

@@ -16,6 +16,7 @@ use zeroclaw_config::schema::{
     AliasedAgentConfig, Config, DelegateToolConfig, ModelProviderConfig, RiskProfileConfig,
     RuntimeProfileConfig, SkillBundleConfig,
 };
+use zeroclaw_log::Instrument as _;
 use zeroclaw_memory::Memory;
 use zeroclaw_providers::{self, ChatMessage, ModelProvider};
 
@@ -104,6 +105,10 @@ pub struct DelegateTool {
     /// unset (legacy unit-test constructors), DelegateTool falls back
     /// to using `self.security` for the spawned inner DelegateTool.
     root_config: Option<Arc<Config>>,
+    /// Alias of the agent that owns this DelegateTool. Excluded from the
+    /// advertised roster so an agent is never offered itself as a
+    /// delegation target. Empty when unset (legacy unit-test constructors).
+    caller_alias: String,
 }
 
 impl DelegateTool {
@@ -143,6 +148,7 @@ impl DelegateTool {
             runtime_profiles: Arc::new(HashMap::new()),
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
+            caller_alias: String::new(),
         }
     }
 
@@ -188,6 +194,7 @@ impl DelegateTool {
             runtime_profiles: Arc::new(HashMap::new()),
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
+            caller_alias: String::new(),
         }
     }
 
@@ -289,6 +296,14 @@ impl DelegateTool {
         self
     }
 
+    /// Set the owning agent's alias so it can be excluded from the
+    /// advertised delegation roster (an agent must never delegate to
+    /// itself).
+    pub fn with_caller_alias(mut self, alias: impl Into<String>) -> Self {
+        self.caller_alias = alias.into();
+        self
+    }
+
     /// Build a `SecurityPolicy` for the delegated target agent
     /// validated as **mutually equivalent** to the caller's policy
     /// (neither escalates nor narrows), with the caller's action /
@@ -337,55 +352,41 @@ impl DelegateTool {
                 "could not resolve security policy for delegate target {target_alias:?}: {e}"
             ))
         })?;
-        target_policy
-            .ensure_no_escalation_beyond(&self.security)
-            .map_err(|violation| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "target_agent": target_alias,
-                            "violation": violation.to_string(),
-                        })),
-                    "delegate refused: target policy escalates beyond caller"
-                );
-                anyhow::Error::msg(format!(
-                    "delegate target {target_alias:?} policy escalates beyond caller: {violation}"
-                ))
-            })?;
-        // Refuse strict narrowing. `DelegateTool::execute_agentic`
-        // reuses the caller's `parent_tools` registry (every tool
-        // there holds the caller's `Arc<SecurityPolicy>` from
-        // registration time); a narrower target policy would not
-        // reach those tools, so the target would silently inherit
-        // the caller's broader allowlist. Catching the narrowing
-        // here turns a silent over-grant into a loud refusal.
-        // Operators with truly narrowed sub-agents should use
-        // `spawn_subagent`, which re-enters `agent::run` with the
-        // validated child policy and rebuilds the tool registry
-        // under it.
-        self.security
-            .ensure_no_escalation_beyond(&target_policy)
-            .map_err(|violation| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "target_agent": target_alias,
-                            "violation": violation.to_string(),
-                        })),
-                    "delegate refused: target policy narrows caller's (use spawn_subagent for narrowed runs)"
-                );
-                anyhow::Error::msg(format!(
-                    "delegate target {target_alias:?} policy narrows the caller's ({violation}); \
-                     DelegateTool reuses the caller's tool registry, so narrowing is not enforced \
-                     by the spawned tool calls. Either align caller and target risk_profile / \
-                     workspace.access so the policies are equivalent, or use `spawn_subagent` for \
-                     a narrowed run."
-                ))
-            })?;
+        if !self.security.delegation_policy.permits() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "target_agent": target_alias,
+                        "caller_risk_profile": self.security.risk_profile_name,
+                    })),
+                "delegate refused: caller delegation_policy forbids delegation"
+            );
+            return Err(anyhow::Error::msg(format!(
+                "delegation is forbidden by the caller's delegation_policy; set \
+                 [risk_profiles.{}].delegation_policy mode = \"allow\"",
+                self.security.risk_profile_name
+            )));
+        }
+        if self.security.risk_profile_name != target_policy.risk_profile_name {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "target_agent": target_alias,
+                        "caller_risk_profile": self.security.risk_profile_name,
+                        "target_risk_profile": target_policy.risk_profile_name,
+                    })),
+                "delegate refused: target risk profile differs from caller"
+            );
+            return Err(anyhow::Error::msg(format!(
+                "delegate target {target_alias:?} uses risk profile \
+                 {:?}, but delegation requires the same risk profile as the caller ({:?})",
+                target_policy.risk_profile_name, self.security.risk_profile_name
+            )));
+        }
         target_policy.tracker = self.security.tracker.clone();
         Ok(Arc::new(target_policy))
     }
@@ -523,7 +524,20 @@ impl Tool for DelegateTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        let agent_names: Vec<&str> = self.agents.keys().map(|s: &String| s.as_str()).collect();
+        let delegation_permitted = self.security.delegation_policy.permits();
+        let caller_profile = self.security.risk_profile_name.as_str();
+        // Advertise only agents the caller can actually reach: delegation must
+        // be permitted, the target shares the caller's risk profile, and the
+        // delegator never lists itself.
+        let mut agent_names: Vec<&str> = self
+            .agents
+            .iter()
+            .filter(|_| delegation_permitted)
+            .filter(|(name, _)| name.as_str() != self.caller_alias.as_str())
+            .filter(|(_, cfg)| cfg.risk_profile.trim() == caller_profile)
+            .map(|(name, _)| name.as_str())
+            .collect();
+        agent_names.sort_unstable();
         json!({
             "type": "object",
             "additionalProperties": false,
@@ -793,6 +807,7 @@ impl DelegateTool {
             &model,
             &[],
             &self.workspace_dir,
+            false,
         );
         let system_prompt_ref = enriched_system_prompt.as_deref();
 
@@ -956,6 +971,7 @@ impl DelegateTool {
         let runtime_profiles = Arc::clone(&self.runtime_profiles);
         let skill_bundles = Arc::clone(&self.skill_bundles);
         let root_config = self.root_config.clone();
+        let caller_alias = self.caller_alias.clone();
         // Capture the parent loop's session-key task-local so the
         // detached background task scopes its tool calls under the
         // same key — channel tools (sessions_send, etc.) need the
@@ -963,8 +979,9 @@ impl DelegateTool {
         // wrap, the spawned task would lose the parent's task-local
         // and channel-scoped tool calls would land unattributed.
         let parent_session_key = current_tool_loop_session_key();
+        let __zc_delegate_alias = agent_name_owned.clone();
 
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(
             scope_delegate_session_key(parent_session_key, async move {
                 let inner = DelegateTool {
                     agents,
@@ -983,6 +1000,7 @@ impl DelegateTool {
                     runtime_profiles,
                     skill_bundles,
                     root_config,
+                    caller_alias,
                 };
 
                 let args_inner = json!({
@@ -1043,8 +1061,10 @@ impl DelegateTool {
                     let _ = tokio::fs::write(&result_path, &bytes).await;
                 }
             })
-            .await;
-        });
+            .instrument(::zeroclaw_log::attribution_span!(
+                &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
+            ))
+        );
 
         Ok(ToolResult {
             success: true,
@@ -1141,7 +1161,7 @@ impl DelegateTool {
         }
 
         // Capture the current receipt scope so each spawned sub-agent task
-        // re-enters it. `tokio::spawn` does not propagate task-locals, so
+        // re-enters it. Spawned tasks do not propagate task-locals, so
         // without this `execute_sync`'s `try_with` would resolve to `None`
         // inside the spawn and the parallel agents would run unsigned even
         // when the parent turn has receipts enabled. The collector is `Arc`'d
@@ -1178,38 +1198,47 @@ impl DelegateTool {
             let skill_bundles = Arc::clone(&self.skill_bundles);
             let receipt_scope = parent_receipt_scope.clone();
             let root_config = self.root_config.clone();
+            let caller_alias = self.caller_alias.clone();
             let session_key = parent_session_key.clone();
+            let __zc_delegate_alias = agent_name.clone();
 
-            handles.push(tokio::spawn(async move {
-                let inner = DelegateTool {
-                    agents,
-                    security,
-                    global_credential,
-                    provider_runtime_options,
-                    depth,
-                    parent_tools,
-                    multimodal_config,
-                    delegate_config,
-                    workspace_dir,
-                    cancellation_token,
-                    memory: None,
-                    providers_models,
-                    risk_profiles,
-                    runtime_profiles,
-                    skill_bundles,
-                    root_config,
-                };
-                let agent_name_for_return = agent_name.clone();
-                let result = scope_delegate_session_key(session_key, async move {
-                    crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
-                        .scope(receipt_scope, async move {
-                            Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone)).await
-                        })
-                        .await
-                })
-                .await;
-                (agent_name_for_return, result)
-            }));
+            handles.push(zeroclaw_spawn::spawn!(
+                async move {
+                    let inner = DelegateTool {
+                        agents,
+                        security,
+                        global_credential,
+                        provider_runtime_options,
+                        depth,
+                        parent_tools,
+                        multimodal_config,
+                        delegate_config,
+                        workspace_dir,
+                        cancellation_token,
+                        memory: None,
+                        providers_models,
+                        risk_profiles,
+                        runtime_profiles,
+                        skill_bundles,
+                        root_config,
+                        caller_alias,
+                    };
+                    let agent_name_for_return = agent_name.clone();
+                    let result = scope_delegate_session_key(session_key, async move {
+                        crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
+                            .scope(receipt_scope, async move {
+                                Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone))
+                                    .await
+                            })
+                            .await
+                    })
+                    .await;
+                    (agent_name_for_return, result)
+                }
+                .instrument(::zeroclaw_log::attribution_span!(
+                    &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
+                ))
+            ));
         }
 
         // Collect all results
@@ -1439,6 +1468,7 @@ impl DelegateTool {
         model_name: &str,
         sub_tools: &[Box<dyn Tool>],
         workspace_dir: &Path,
+        sends_native_tool_specs: bool,
     ) -> Option<String> {
         // Resolve skill bundle directories. With one or more configured
         // bundles, load + concat skills from each. With none, fall back to
@@ -1458,7 +1488,15 @@ impl DelegateTool {
 
         // Determine shell policy instructions when the `shell` tool is in the
         // effective tool list.
-        let has_shell = sub_tools.iter().any(|t| t.name() == "shell");
+        let empty_tools: &[Box<dyn Tool>] = &[];
+        let expose_text_tools =
+            sends_native_tool_specs || !agent_config.resolved.strict_tool_parsing;
+        let prompt_tools = if expose_text_tools {
+            sub_tools
+        } else {
+            empty_tools
+        };
+        let has_shell = prompt_tools.iter().any(|t| t.name() == "shell");
         let shell_policy = if has_shell {
             "## Shell Policy\n\n\
              - Prefer non-destructive commands. Use `trash` over `rm` where possible.\n\
@@ -1475,12 +1513,12 @@ impl DelegateTool {
             workspace_dir,
             agent_workspace_dir: workspace_dir,
             model_name,
-            tools: sub_tools,
+            tools: prompt_tools,
             skills: &skills,
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
-            sends_native_tool_specs: false,
+            sends_native_tool_specs: sends_native_tool_specs && !prompt_tools.is_empty(),
 
             security_summary: None,
             autonomy_level: crate::security::AutonomyLevel::default(),
@@ -1592,6 +1630,7 @@ impl DelegateTool {
             model,
             &sub_tools,
             &self.workspace_dir,
+            model_provider.supports_native_tools(),
         );
 
         let mut history = Vec::new();
@@ -1640,13 +1679,18 @@ impl DelegateTool {
                 None,
                 None,
                 &zeroclaw_config::schema::PacingConfig::default(),
+                agent_config.resolved.strict_tool_parsing,
+                agent_config.resolved.parallel_tools,
                 0,    // max_tool_result_chars: inherit from parent config in future
                 0,    // context_token_budget: 0 = disabled for subagents
                 None, // shared_budget: TODO thread from parent in future
                 None, // channel: delegate subagents don't support approval
                 receipt_generator,
                 collected_receipts,
-            ),
+            )
+            .instrument(::zeroclaw_log::attribution_span!(
+                &crate::agent::AgentAttribution(agent_name)
+            )),
         )
         .await;
 
@@ -1751,6 +1795,15 @@ mod tests {
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy::default())
+    }
+
+    fn security_allowing() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            delegation_policy: zeroclaw_config::autonomy::DelegationPolicy {
+                mode: zeroclaw_config::autonomy::DelegationMode::Allow,
+            },
+            ..SecurityPolicy::default()
+        })
     }
 
     fn sample_agents() -> HashMap<String, AliasedAgentConfig> {
@@ -1891,6 +1944,50 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "OneToolThenFinalModelProvider"
+        }
+    }
+
+    struct TextFallbackToolModelProvider;
+
+    #[async_trait]
+    impl ModelProvider for TextFallbackToolModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some(
+                    r#"<tool_call>{"name":"echo_tool","arguments":{"value":"ignored"}}</tool_call>"#
+                        .to_string(),
+                ),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for TextFallbackToolModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "TextFallbackToolModelProvider"
         }
     }
 
@@ -2052,12 +2149,112 @@ mod tests {
 
     #[test]
     fn schema_lists_agent_names() {
-        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let tool = DelegateTool::new(sample_agents(), None, security_allowing());
         let schema = tool.parameters_schema();
         let desc = schema["properties"]["agent"]["description"]
             .as_str()
             .unwrap();
         assert!(desc.contains("researcher") || desc.contains("coder"));
+    }
+
+    #[test]
+    fn schema_roster_filtered_by_delegation_policy() {
+        // When delegation is permitted, every configured agent (minus the
+        // caller) is advertised — reachability is gated by shared risk
+        // profile at delegation time, not by a per-agent roster allow-list.
+        let tool = DelegateTool::new(sample_agents(), None, security_allowing());
+        let schema = tool.parameters_schema();
+        let desc = schema["properties"]["agent"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(desc.contains("researcher"));
+        assert!(desc.contains("coder"));
+
+        // When delegation is forbidden, the roster is empty.
+        let forbidden =
+            DelegateTool::new(sample_agents(), None, Arc::new(SecurityPolicy::default()));
+        let forbidden_schema = forbidden.parameters_schema();
+        let forbidden_desc = forbidden_schema["properties"]["agent"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(!forbidden_desc.contains("researcher"));
+        assert!(!forbidden_desc.contains("coder"));
+    }
+
+    #[test]
+    fn schema_roster_lists_only_same_risk_profile_peers() {
+        // Three agents: two on "alpha", one on "beta". Caller is on "alpha".
+        let mut agents = HashMap::new();
+        agents.insert(
+            "alpha_peer".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "alpha".into(),
+                ..Default::default()
+            },
+        );
+        agents.insert(
+            "alpha_self".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "alpha".into(),
+                ..Default::default()
+            },
+        );
+        agents.insert(
+            "beta_outsider".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "beta".into(),
+                ..Default::default()
+            },
+        );
+
+        // Caller on "alpha" with delegation allowed; it owns "alpha_self".
+        let mut policy = SecurityPolicy {
+            delegation_policy: zeroclaw_config::autonomy::DelegationPolicy {
+                mode: zeroclaw_config::autonomy::DelegationMode::Allow,
+            },
+            ..SecurityPolicy::default()
+        };
+        policy.risk_profile_name = "alpha".into();
+        let mut tool = DelegateTool::new(agents, None, Arc::new(policy));
+        tool.caller_alias = "alpha_self".to_string();
+
+        let desc = tool.parameters_schema()["properties"]["agent"]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Same-profile peer is listed.
+        assert!(desc.contains("alpha_peer"), "{desc}");
+        // Delegator excludes itself.
+        assert!(!desc.contains("alpha_self"), "{desc}");
+        // Off-profile agent is excluded.
+        assert!(!desc.contains("beta_outsider"), "{desc}");
+    }
+
+    #[test]
+    fn schema_excludes_caller_alias_from_roster() {
+        // An agent must never be offered itself as a delegation target,
+        // even when the delegation_policy would otherwise permit it.
+        let tool = DelegateTool::new(sample_agents(), None, security_allowing())
+            .with_caller_alias("researcher");
+        let schema = tool.parameters_schema();
+        let desc = schema["properties"]["agent"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(!desc.contains("researcher"));
+        assert!(desc.contains("coder"));
+    }
+
+    #[test]
+    fn schema_empty_roster_when_delegation_forbidden() {
+        // Default policy forbids delegation, so no configured agent
+        // should be advertised.
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let schema = tool.parameters_schema();
+        let desc = schema["properties"]["agent"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(desc.contains("none configured"));
     }
 
     #[tokio::test]
@@ -2386,6 +2583,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_agentic_strict_tool_parsing_uses_target_agent_policy() {
+        let mut config = agentic_agent_config();
+        config.resolved.strict_tool_parsing = true;
+        let prompt_tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec!["echo_tool".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let prompt = tool
+            .build_enriched_system_prompt(
+                "agentic",
+                &config,
+                "model-test",
+                &prompt_tools,
+                Path::new("/tmp"),
+                false,
+            )
+            .expect("prompt should render");
+        assert!(
+            !prompt.contains("## Tools"),
+            "strict delegate prompt should not advertise text tool instructions"
+        );
+        assert!(
+            !prompt.contains("echo_tool"),
+            "strict delegate prompt should hide text-only tool schemas"
+        );
+
+        let model_provider = TextFallbackToolModelProvider;
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &model_provider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(
+            result.output.contains("<tool_call>"),
+            "strict subagent should return fallback-looking text unchanged"
+        );
+        assert!(
+            !result.output.contains("echo:ignored"),
+            "strict subagent must not execute text fallback tool calls"
+        );
+    }
+
+    #[tokio::test]
     async fn execute_agentic_excludes_delegate_even_if_allowlisted() {
         let config = agentic_agent_config();
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
@@ -2519,7 +2770,7 @@ mod tests {
         let seen = TOOL_LOOP_SESSION_KEY
             .scope(Some("channel_session".to_string()), async {
                 let session_key = current_tool_loop_session_key();
-                tokio::spawn(async move {
+                zeroclaw_spawn::spawn!(async move {
                     scope_delegate_session_key(session_key, async {
                         current_tool_loop_session_key()
                     })
@@ -2719,7 +2970,7 @@ mod tests {
     }
 
     #[test]
-    fn enriched_prompt_includes_tools_workspace_datetime() {
+    fn enriched_prompt_includes_tools_workspace_date() {
         let config = AliasedAgentConfig {
             model_provider: "openrouter.test".into(),
             ..Default::default()
@@ -2736,7 +2987,7 @@ mod tests {
             .with_workspace_dir(workspace.clone());
 
         let prompt = tool
-            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace)
+            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace, false)
             .unwrap();
 
         assert!(prompt.contains("## Tools"), "should contain tools section");
@@ -2750,9 +3001,12 @@ mod tests {
             "should contain workspace path"
         );
         assert!(
-            prompt.contains("## CRITICAL CONTEXT: CURRENT DATE & TIME"),
-            "should contain datetime section"
+            prompt.contains("## CRITICAL CONTEXT: CURRENT DATE"),
+            "should contain date section"
         );
+        assert!(!prompt.contains("CURRENT DATE & TIME"));
+        assert!(!prompt.contains("Time:"));
+        assert!(!prompt.contains("ISO 8601:"));
         // Identity files come from the target sub-agent's per-agent
         // workspace dir. The test's install_root is unset, so no
         // identity files exist for the dummy alias — the prompt still
@@ -2804,7 +3058,7 @@ mod tests {
             .with_workspace_dir(workspace.to_path_buf());
 
         let prompt = tool
-            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace)
+            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace, false)
             .unwrap();
 
         assert!(
@@ -2854,7 +3108,7 @@ mod tests {
             .with_workspace_dir(workspace.to_path_buf());
 
         let prompt = tool
-            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace)
+            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace, false)
             .unwrap();
 
         assert!(
@@ -2926,7 +3180,7 @@ mod tests {
             .with_workspace_dir(workspace.clone());
 
         let prompt = tool
-            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace)
+            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace, false)
             .unwrap();
 
         assert!(
@@ -2959,7 +3213,7 @@ mod tests {
             .with_workspace_dir(workspace.clone());
 
         let prompt = tool
-            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace)
+            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace, false)
             .unwrap();
 
         assert!(
@@ -3417,13 +3671,23 @@ mod tests {
         target_alias: &str,
         target_max_actions: u32,
     ) -> Arc<zeroclaw_config::schema::Config> {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{
             AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
         };
         let mut config = Config::default();
-        config
-            .risk_profiles
-            .insert("narrow".to_string(), RiskProfileConfig::default());
+        // The caller delegates from the `narrow` profile, so that profile must
+        // authorize the target alias; without it the delegation_policy gate
+        // rejects before the escalation/narrowing checks under test are reached.
+        config.risk_profiles.insert(
+            "narrow".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
         config
             .risk_profiles
             .insert("wide".to_string(), RiskProfileConfig::default());
@@ -3464,7 +3728,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delegate_rejects_target_whose_policy_escalates_caller() {
+    async fn delegate_rejects_target_on_a_different_risk_profile() {
+        // caller(narrow) is authorized to delegate to target, but target
+        // resolves onto the wider profile. Delegation requires caller and
+        // target to share a risk profile, so the boundary must refuse.
         let config = config_with_two_agents("caller", 5, "target", 50);
         let caller_policy =
             Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
@@ -3477,11 +3744,11 @@ mod tests {
 
         let err = tool
             .policy_for_target("target")
-            .expect_err("escalating target must be rejected at delegate boundary");
+            .expect_err("cross-profile target must be rejected at delegate boundary");
         let chain = format!("{err:#}");
         assert!(
-            chain.contains("escalates beyond caller"),
-            "expected escalation error, got: {chain}"
+            chain.contains("requires the same risk profile as the caller"),
+            "expected same-profile rejection, got: {chain}"
         );
     }
 
@@ -3527,16 +3794,21 @@ mod tests {
         );
     }
 
-    /// Build a config where `caller` has a strictly broader policy
-    /// than `target`. The caller-only command is the narrowing axis
-    /// the validator should catch.
+    /// Build a config where `caller` (`broad` profile) is authorized to
+    /// delegate to `target`, but `target` sits on a different (`narrow`)
+    /// profile. Delegation requires caller and target to share a risk
+    /// profile, so this exercises the same-profile rejection gate.
     fn config_with_narrowed_target() -> Arc<zeroclaw_config::schema::Config> {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
         let mut config = Config::default();
         config.risk_profiles.insert(
             "broad".to_string(),
             RiskProfileConfig {
                 allowed_commands: vec!["git".into(), "cargo".into()],
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
                 ..RiskProfileConfig::default()
             },
         );
@@ -3567,12 +3839,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delegate_rejects_target_whose_policy_narrows_caller() {
+    async fn delegate_rejects_target_on_a_different_risk_profile_even_when_authorized() {
         // DelegateTool's spawned agentic loop reuses the caller's
-        // parent_tools registry — a narrower target would silently
-        // inherit the caller's broader allowlist. The validator
-        // must catch the narrowing at the delegate boundary and
-        // refuse to dispatch.
+        // parent_tools registry, so a target on a different profile would
+        // silently inherit the caller's allowlist. Even with the caller
+        // authorized to delegate to the target, the same-profile gate must
+        // catch the profile mismatch and refuse to dispatch.
         let config = config_with_narrowed_target();
         let caller_policy =
             Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
@@ -3585,15 +3857,11 @@ mod tests {
 
         let err = tool
             .policy_for_target("target")
-            .expect_err("narrowing target must be rejected at delegate boundary");
+            .expect_err("cross-profile target must be rejected at delegate boundary");
         let chain = format!("{err:#}");
         assert!(
-            chain.contains("narrows the caller"),
-            "expected narrowing error, got: {chain}"
-        );
-        assert!(
-            chain.contains("spawn_subagent"),
-            "error must point operators at spawn_subagent for narrowed runs, got: {chain}"
+            chain.contains("requires the same risk profile as the caller"),
+            "expected same-profile rejection, got: {chain}"
         );
     }
 }

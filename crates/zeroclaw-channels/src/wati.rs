@@ -139,7 +139,7 @@ impl WatiChannel {
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({"normalized_phone": normalized_phone})),
-                "ignoring message from unauthorized sender: . Add to channels.wati.allowed_numbers in config.toml, or run `zeroclaw onboard --channels-only` to configure interactively."
+                "ignoring message from unauthorized sender: . Add to channels.wati.allowed_numbers in config.toml, or run `zeroclaw onboard channels` to configure interactively."
             );
             return None;
         }
@@ -260,6 +260,7 @@ impl WatiChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         });
 
         messages
@@ -441,6 +442,7 @@ impl WatiChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         });
 
         messages

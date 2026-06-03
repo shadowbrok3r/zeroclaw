@@ -764,7 +764,7 @@ impl Channel for MattermostChannel {
             None => (recipient.to_string(), None),
         };
 
-        let handle = tokio::spawn(async move {
+        let handle = zeroclaw_spawn::spawn!(async move {
             let url = format!("{base_url}/api/v4/users/me/typing");
             loop {
                 let mut body = serde_json::json!({ "channel_id": channel_id });
@@ -993,6 +993,7 @@ impl MattermostChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         })
     }
 }
