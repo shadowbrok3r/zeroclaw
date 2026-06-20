@@ -14,12 +14,14 @@ use zip::ZipArchive;
 
 pub mod audit;
 pub mod bundle;
+pub mod cache;
 pub mod constants;
 pub mod creator;
 pub mod document;
 pub mod frontmatter;
 pub mod improver;
 pub mod reference;
+pub mod review;
 pub mod scaffold;
 pub mod service;
 mod suggestions;
@@ -30,7 +32,9 @@ pub use document::{DocumentParseError, SkillDocument};
 pub use frontmatter::SkillFrontmatter;
 pub use reference::{SkillRef, SkillRefError};
 pub use scaffold::{ScaffoldError, ScaffoldOptions};
-pub use service::{RemoveMode, ServiceError, SkillSummary, SkillsService};
+pub use service::{
+    EffectiveSkill, RemoveMode, ServiceError, SkillOrigin, SkillSummary, SkillsService,
+};
 pub(crate) use suggestions::render_missing_skill_install_suggestion;
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
@@ -65,8 +69,50 @@ pub struct Skill {
     pub tools: Vec<SkillTool>,
     #[serde(default)]
     pub prompts: Vec<String>,
+    /// Typed slash-command options a `slash`-tagged skill exposes (e.g. on
+    /// Discord). Empty for skills that take no structured input — slash channels
+    /// then fall back to a single free-text option. See [`SkillSlashOption`].
+    #[serde(default)]
+    pub slash_options: Vec<SkillSlashOption>,
     #[serde(skip)]
     pub location: Option<PathBuf>,
+}
+
+/// A typed option a `slash`-tagged skill exposes on its slash command. Shaped
+/// after the Discord Application Command Option model but channel-agnostic; a
+/// slash-capable channel maps `kind` to its wire option type. Declared in
+/// SKILL.toml under `[[skill.slash_options]]`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkillSlashOption {
+    pub name: String,
+    pub description: String,
+    /// `string` | `integer` | `number` | `boolean` | `user` | `channel` |
+    /// `role` | `mentionable`. Unknown values are dropped by the channel.
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub required: bool,
+    /// Predefined choices (string/integer/number options only). The `value` is
+    /// kept as text and coerced to the option's type by the channel.
+    #[serde(default)]
+    pub choices: Vec<SkillSlashChoice>,
+    /// Inclusive bounds for integer/number options.
+    #[serde(default)]
+    pub min: Option<f64>,
+    #[serde(default)]
+    pub max: Option<f64>,
+    /// Length bounds for string options.
+    #[serde(default)]
+    pub min_length: Option<u32>,
+    #[serde(default)]
+    pub max_length: Option<u32>,
+}
+
+/// A predefined choice for a typed slash option.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkillSlashChoice {
+    pub name: String,
+    pub value: String,
 }
 
 impl ::zeroclaw_api::attribution::Attributable for Skill {
@@ -103,6 +149,12 @@ pub struct SkillTool {
     /// action). Accepts the legacy key `default_args` for compatibility.
     #[serde(default, alias = "default_args")]
     pub locked_args: HashMap<String, String>,
+    /// For `kind = "shell"` / `kind = "script"`: maximum execution time in
+    /// seconds before the command is killed. Unset falls back to the built-in
+    /// `SKILL_SHELL_TIMEOUT_SECS` (60s) default; long-running skills (e.g. a
+    /// build pipeline) raise it via `timeout_secs` in SKILL.toml.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// Skill manifest parsed from SKILL.toml
@@ -135,6 +187,8 @@ struct SkillMeta {
     tags: Vec<String>,
     #[serde(default)]
     prompts: Vec<String>,
+    #[serde(default)]
+    slash_options: Vec<SkillSlashOption>,
 }
 
 /// Provenance metadata emitted by the SkillForge integrator (see
@@ -185,6 +239,11 @@ struct SkillMarkdownMeta {
     version: Option<String>,
     author: Option<String>,
     tags: Vec<String>,
+    /// Typed slash-command options from the nested `slash_options:` frontmatter
+    /// block. Parsed by the shared helper in `document` (not the flat scanner)
+    /// so a SKILL.md skill can drive native Discord slash commands — parity with
+    /// SKILL.toml's `[[skill.slash_options]]`.
+    slash_options: Vec<SkillSlashOption>,
 }
 
 fn default_version() -> String {
@@ -512,6 +571,12 @@ fn load_workspace_skills(workspace_dir: &Path, allow_scripts: bool) -> Vec<Skill
 }
 
 pub fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
+    cache::cached_load(skills_dir, allow_scripts, "workspace", || {
+        load_skills_from_directory_uncached(skills_dir, allow_scripts)
+    })
+}
+
+fn load_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
     if !skills_dir.exists() {
         return Vec::new();
     }
@@ -605,6 +670,12 @@ fn finalize_open_skill(mut skill: Skill) -> Skill {
 }
 
 fn load_open_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
+    cache::cached_load(skills_dir, allow_scripts, "open-skills", || {
+        load_open_skills_from_directory_uncached(skills_dir, allow_scripts)
+    })
+}
+
+fn load_open_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
     if !skills_dir.exists() {
         return Vec::new();
     }
@@ -999,6 +1070,7 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         tags: manifest.skill.tags,
         tools: manifest.tools,
         prompts,
+        slash_options: manifest.skill.slash_options,
         location: Some(path.to_path_buf()),
     })
 }
@@ -1025,6 +1097,7 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         tags: parsed.meta.tags,
         tools: Vec::new(),
         prompts: vec![parsed.body],
+        slash_options: parsed.meta.slash_options,
         location: Some(path.to_path_buf()),
     })
 }
@@ -1064,6 +1137,7 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         tags: parsed.meta.tags,
         tools: Vec::new(),
         prompts: vec![parsed.body],
+        slash_options: parsed.meta.slash_options,
         location: Some(path.to_path_buf()),
     }))
 }
@@ -1170,6 +1244,10 @@ fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
     if let Some(ref key) = collecting_multiline {
         flush_multiline(key, &multiline_parts, &mut meta);
     }
+    // The one nested field. Parsed by the shared helper so the loader and the
+    // service (`SkillDocument`) read `slash_options` identically — no second
+    // nested parser to drift.
+    meta.slash_options = document::parse_slash_options(s);
     meta
 }
 
@@ -1234,9 +1312,21 @@ fn resolve_skill_location(skill: &Skill, workspace_dir: &Path) -> PathBuf {
 fn render_skill_location(skill: &Skill, workspace_dir: &Path, prefer_relative: bool) -> String {
     let location = resolve_skill_location(skill, workspace_dir);
     if prefer_relative && let Ok(relative) = location.strip_prefix(workspace_dir) {
-        return relative.display().to_string();
+        return display_skill_location(relative);
     }
-    location.display().to_string()
+    display_skill_location(&location)
+}
+
+fn display_skill_location(path: &Path) -> String {
+    let rendered = path.display().to_string();
+    #[cfg(target_os = "windows")]
+    {
+        rendered.replace('\\', "/")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        rendered
+    }
 }
 
 /// Build the "Available Skills" system prompt section with full skill instructions.
@@ -1331,7 +1421,10 @@ pub fn skills_to_prompt_with_mode(
                         &mut prompt,
                         8,
                         "name",
-                        &format!("{}__{}", skill.name, tool.name),
+                        // Must match the registered tool spec's name exactly
+                        // (same sanitizer), or the model is told to call a name
+                        // that no tool exposes (#6678).
+                        &crate::tools::skill_tool::composed_tool_name(&skill.name, &tool.name),
                     );
                     write_xml_text_element(&mut prompt, 8, "description", &tool.description);
                     let _ = writeln!(prompt, "      </tool>");
@@ -1434,15 +1527,30 @@ pub fn skills_to_tools_with_context(
     security: std::sync::Arc<crate::security::SecurityPolicy>,
     unfiltered_registry: &[std::sync::Arc<dyn zeroclaw_api::tool::Tool>],
 ) -> Vec<Box<dyn zeroclaw_api::tool::Tool>> {
+    skills_to_tools_with_context_and_runtime(
+        skills,
+        security,
+        unfiltered_registry,
+        std::sync::Arc::new(crate::platform::NativeRuntime::new()),
+    )
+}
+
+pub fn skills_to_tools_with_context_and_runtime(
+    skills: &[Skill],
+    security: std::sync::Arc<crate::security::SecurityPolicy>,
+    unfiltered_registry: &[std::sync::Arc<dyn zeroclaw_api::tool::Tool>],
+    runtime: std::sync::Arc<dyn crate::platform::RuntimeAdapter>,
+) -> Vec<Box<dyn zeroclaw_api::tool::Tool>> {
     let mut tools: Vec<Box<dyn zeroclaw_api::tool::Tool>> = Vec::new();
     for skill in skills {
         for tool in &skill.tools {
             match tool.kind.as_str() {
                 "shell" | "script" => {
-                    let inner = crate::skills::skill_tool::SkillShellTool::new(
+                    let inner = crate::skills::skill_tool::SkillShellTool::new_with_runtime(
                         &skill.name,
                         tool,
                         security.clone(),
+                        runtime.clone(),
                     );
                     tools.push(Box::new(zeroclaw_tools::wrappers::RateLimitedTool::new(
                         inner,
@@ -2167,19 +2275,15 @@ pub fn load_plugin_skills_from_config(config: &zeroclaw_config::schema::Config) 
         return Vec::new();
     }
 
-    let plugins_dir = expand_plugins_dir(&config.plugins.plugins_dir);
-    let parent = match plugins_dir.parent() {
-        Some(p) => p.to_path_buf(),
-        None => return Vec::new(),
-    };
+    let plugins_dir = config.plugins.resolved_plugins_dir();
 
     let signature_mode = zeroclaw_plugins::host::PluginHost::parse_signature_mode(
         &config.plugins.security.signature_mode,
     );
     let trusted_keys = config.plugins.security.trusted_publisher_keys.clone();
 
-    let host = match zeroclaw_plugins::host::PluginHost::with_security(
-        &parent,
+    let host = match zeroclaw_plugins::host::PluginHost::from_plugins_dir_with_security(
+        &plugins_dir,
         signature_mode,
         trusted_keys,
     ) {
@@ -2204,16 +2308,6 @@ pub fn load_plugin_skills_from_config(config: &zeroclaw_config::schema::Config) 
         }
     }
     skills
-}
-
-#[cfg(feature = "plugins-wasm")]
-fn expand_plugins_dir(plugins_dir: &str) -> PathBuf {
-    if let Some(rest) = plugins_dir.strip_prefix("~/")
-        && let Some(dirs) = UserDirs::new()
-    {
-        return dirs.home_dir().join(rest);
-    }
-    PathBuf::from(plugins_dir)
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -2472,6 +2566,119 @@ prompts = ["If asked about XYZZY, respond YES"]
             skill.prompts,
             vec!["If asked about XYZZY, respond YES".to_string()]
         );
+    }
+
+    #[test]
+    fn typed_slash_options_are_parsed_from_the_skill_table() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(
+            tmp.path(),
+            r#"
+[skill]
+name = "search"
+description = "Search the web"
+version = "0.1.0"
+tags = ["slash"]
+
+[[skill.slash_options]]
+name = "query"
+description = "The search query"
+type = "string"
+required = true
+max_length = 200
+
+[[skill.slash_options]]
+name = "sort"
+description = "Sort order"
+type = "string"
+choices = [
+    { name = "Newest", value = "new" },
+    { name = "Oldest", value = "old" },
+]
+"#,
+        );
+        let skill = load_skill_toml(&path).unwrap();
+        assert_eq!(skill.slash_options.len(), 2);
+
+        let query = &skill.slash_options[0];
+        assert_eq!(query.name, "query");
+        assert_eq!(query.kind, "string");
+        assert!(query.required);
+        assert_eq!(query.max_length, Some(200));
+
+        let sort = &skill.slash_options[1];
+        assert_eq!(sort.name, "sort");
+        assert!(!sort.required);
+        assert_eq!(sort.choices.len(), 2);
+        assert_eq!(sort.choices[0].name, "Newest");
+        assert_eq!(sort.choices[0].value, "new");
+    }
+
+    #[test]
+    fn skills_without_slash_options_default_to_empty() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(
+            tmp.path(),
+            r#"
+[skill]
+name = "probe"
+description = "test"
+version = "0.1.0"
+"#,
+        );
+        let skill = load_skill_toml(&path).unwrap();
+        assert!(skill.slash_options.is_empty());
+    }
+
+    #[test]
+    fn load_skill_md_parses_slash_options_from_frontmatter() {
+        let tmp = TempDir::new().unwrap();
+        let md = r#"---
+name: draft
+description: Draft content to a spec.
+tags: [slash]
+slash_options:
+  - name: format
+    description: Output format.
+    type: string
+    required: true
+    choices: [{name: Email, value: email}, {name: Tweet, value: tweet}]
+  - name: words
+    type: integer
+    min: 10
+    max: 2000
+---
+# Draft
+
+Write it.
+"#;
+        let path = tmp.path().join("SKILL.md");
+        std::fs::write(&path, md).unwrap();
+        let skill = load_skill_md(&path, tmp.path()).unwrap();
+
+        // Parity with SKILL.toml: the runtime Skill carries typed options.
+        assert_eq!(skill.slash_options.len(), 2);
+        assert_eq!(skill.slash_options[0].name, "format");
+        assert!(skill.slash_options[0].required);
+        assert_eq!(skill.slash_options[0].choices.len(), 2);
+        assert_eq!(skill.slash_options[1].kind, "integer");
+        assert_eq!(skill.slash_options[1].min, Some(10.0));
+        assert_eq!(skill.slash_options[1].max, Some(2000.0));
+        assert!(skill.tags.contains(&"slash".to_string()));
+
+        // The options block lives in frontmatter, so the prompt (body) is clean.
+        assert_eq!(skill.prompts.len(), 1);
+        assert!(skill.prompts[0].contains("Write it."));
+        assert!(!skill.prompts[0].contains("slash_options"));
+    }
+
+    #[test]
+    fn load_skill_md_without_slash_options_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("SKILL.md");
+        std::fs::write(&path, "---\nname: plain\ndescription: d\n---\n# Plain\n").unwrap();
+        let skill = load_skill_md(&path, tmp.path()).unwrap();
+        assert!(skill.slash_options.is_empty());
     }
 
     #[test]
@@ -2824,6 +3031,62 @@ description = "fine"
         assert!(
             !names.contains(&"bad-open"),
             "bad open-skill must be skipped, not silently accepted; got: {names:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod prompt_callable_name_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn tool(name: &str, kind: &str) -> SkillTool {
+        SkillTool {
+            name: name.to_string(),
+            description: "desc".to_string(),
+            kind: kind.to_string(),
+            command: "echo hi".to_string(),
+            args: HashMap::new(),
+            target: None,
+            locked_args: HashMap::new(),
+            timeout_secs: None,
+        }
+    }
+
+    /// The skills prompt must advertise the exact same callable name the tool
+    /// spec registers (both via `composed_tool_name`). A plugin-namespaced skill
+    /// with a dotted tool name would otherwise render a raw `skill__tool` the
+    /// model cannot invoke, which is the prompt half of #6678.
+    #[test]
+    fn prompt_callable_name_matches_registered_tool_name() {
+        let skill = Skill {
+            name: "pr-review-toolkit:code-reviewer".to_string(),
+            description: "review".to_string(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![tool("run.lint", "shell")],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            location: None,
+        };
+
+        let prompt = skills_to_prompt_with_mode(
+            std::slice::from_ref(&skill),
+            Path::new("/tmp"),
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+        );
+
+        let registered =
+            crate::tools::skill_tool::composed_tool_name(&skill.name, &skill.tools[0].name);
+        assert!(
+            prompt.contains(&format!("<name>{registered}</name>")),
+            "prompt is missing the sanitized callable name `{registered}`:\n{prompt}",
+        );
+        // The raw, provider-invalid composed name must never reach the prompt.
+        assert!(
+            !prompt.contains("pr-review-toolkit:code-reviewer__run.lint"),
+            "prompt advertised the raw, unsanitized composed name:\n{prompt}",
         );
     }
 }
