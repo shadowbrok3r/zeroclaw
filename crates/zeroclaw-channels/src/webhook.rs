@@ -273,6 +273,15 @@ impl Channel for WebhookChannel {
         "webhook"
     }
 
+    /// Webhook is a programmatic event ingress — each POST is intentional and
+    /// addressed to the agent, not group-chat chatter. Treat its messages as
+    /// direct so they bypass the reply-intent precheck and always run a full
+    /// turn; otherwise event posts can be classified `NO_REPLY` and the agent
+    /// never executes the intended action (e.g. a push notification).
+    fn is_direct_message(&self, _msg: &zeroclaw_api::channel::ChannelMessage) -> bool {
+        true
+    }
+
     async fn send(&self, message: &SendMessage) -> Result<()> {
         let Some(ref send_url) = self.send_url else {
             ::zeroclaw_log::record!(
