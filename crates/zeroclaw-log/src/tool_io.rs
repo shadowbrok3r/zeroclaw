@@ -1,14 +1,6 @@
 //! Tool input/output capture: leak-scan + truncation + denylist.
-//!
-//! The actual `LeakDetector` lives in `zeroclaw-runtime::security` (it
-//! depends on regex tables that themselves depend on other runtime types).
-//! This crate is upstream of runtime, so we can't reach the detector
-//! directly. Instead, callers in runtime invoke
-//! [`capture_tool_input`] / [`capture_tool_output`] with the post-scan
-//! string (the runtime side runs `LeakDetector::scan` first and passes
-//! the redacted output here for truncation + size-flagging).
 
-use crate::config::{ResolvedPolicy, ToolIoPolicy};
+use crate::config::{LlmRequestPayloadPolicy, ResolvedPolicy, ToolIoPolicy};
 
 /// Result of a tool-io capture pass. The string in `text` is what should
 /// land in the `attributes.tool_input` (or `tool_output`) field. Metadata
@@ -19,16 +11,6 @@ pub struct ToolIoCapture {
     pub text: String,
     pub original_bytes: usize,
     pub truncated: bool,
-}
-
-impl ToolIoCapture {
-    fn empty() -> Self {
-        Self {
-            text: String::new(),
-            original_bytes: 0,
-            truncated: false,
-        }
-    }
 }
 
 /// Capture redacted tool input.
@@ -76,39 +58,50 @@ fn capture_with_policy(
             original_bytes,
             truncated: false,
         }),
-        ToolIoPolicy::Redacted => {
-            let cap = policy.tool_io_truncate_bytes;
-            if original_bytes <= cap {
-                Some(ToolIoCapture {
-                    text: redacted.to_string(),
-                    original_bytes,
-                    truncated: false,
-                })
-            } else {
-                // Truncate on a char boundary, not a byte. Simpler: take
-                // the first `cap` chars (lossy but safe).
-                let mut acc = String::with_capacity(cap);
-                for ch in redacted.chars() {
-                    if acc.len() + ch.len_utf8() > cap {
-                        break;
-                    }
-                    acc.push(ch);
-                }
-                Some(ToolIoCapture {
-                    text: acc,
-                    original_bytes,
-                    truncated: true,
-                })
-            }
-        }
+        ToolIoPolicy::Redacted => Some(truncate_to_cap(redacted, policy.tool_io_truncate_bytes)),
     }
 }
 
-#[allow(dead_code)]
-fn empty_unused_marker() {
-    // Suppress unused-import false positives for `ToolIoCapture::empty`
-    // (kept around for future "explicit empty capture" call sites).
-    let _ = ToolIoCapture::empty();
+#[must_use]
+pub fn capture_llm_request(
+    policy: LlmRequestPayloadPolicy,
+    truncate_bytes: usize,
+    redacted: &str,
+) -> Option<ToolIoCapture> {
+    match policy {
+        LlmRequestPayloadPolicy::Off => None,
+        LlmRequestPayloadPolicy::Full => Some(ToolIoCapture {
+            text: redacted.to_string(),
+            original_bytes: redacted.len(),
+            truncated: false,
+        }),
+        LlmRequestPayloadPolicy::Redacted => Some(truncate_to_cap(redacted, truncate_bytes)),
+    }
+}
+
+/// Truncate `redacted` to at most `cap` bytes on a char boundary, flagging
+/// whether truncation occurred and the original byte length.
+fn truncate_to_cap(redacted: &str, cap: usize) -> ToolIoCapture {
+    let original_bytes = redacted.len();
+    if original_bytes <= cap {
+        return ToolIoCapture {
+            text: redacted.to_string(),
+            original_bytes,
+            truncated: false,
+        };
+    }
+    let mut acc = String::with_capacity(cap);
+    for ch in redacted.chars() {
+        if acc.len() + ch.len_utf8() > cap {
+            break;
+        }
+        acc.push(ch);
+    }
+    ToolIoCapture {
+        text: acc,
+        original_bytes,
+        truncated: true,
+    }
 }
 
 #[cfg(test)]
@@ -154,5 +147,70 @@ mod tests {
         let cap = capture_tool_output(&p, "shell", "hello world").unwrap();
         assert_eq!(cap.text, "hello world");
         assert!(!cap.truncated);
+    }
+
+    #[test]
+    fn llm_request_off_is_default_and_returns_none() {
+        // Default config resolves to Off => no capture.
+        let default = ResolvedPolicy::from_config(&LogConfig::default(), std::path::Path::new("/"));
+        assert_eq!(default.llm_request_payload, LlmRequestPayloadPolicy::Off);
+        assert!(capture_llm_request(LlmRequestPayloadPolicy::Off, 8192, "system prompt").is_none());
+    }
+
+    #[test]
+    fn llm_request_redacted_truncates_at_cap() {
+        let cap = capture_llm_request(LlmRequestPayloadPolicy::Redacted, 4, "hello world").unwrap();
+        assert_eq!(cap.text, "hell");
+        assert_eq!(cap.original_bytes, 11);
+        assert!(cap.truncated);
+    }
+
+    #[test]
+    fn llm_request_redacted_truncation_respects_utf8_char_boundaries() {
+        let cap = capture_llm_request(LlmRequestPayloadPolicy::Redacted, 3, "éé").unwrap();
+        assert_eq!(cap.text, "é");
+        assert_eq!(cap.original_bytes, 4);
+        assert!(cap.truncated);
+        assert!(cap.text.len() <= 3);
+    }
+
+    #[test]
+    fn llm_request_full_keeps_everything() {
+        let cap = capture_llm_request(LlmRequestPayloadPolicy::Full, 4, "hello world").unwrap();
+        assert_eq!(cap.text, "hello world");
+        assert!(!cap.truncated);
+    }
+
+    #[test]
+    fn redacted_keeps_input_at_or_under_cap() {
+        let p = make_policy("redacted", 8, vec![]);
+        // Under cap.
+        let c = capture_tool_input(&p, "shell", "hello").unwrap();
+        assert_eq!(c.text, "hello");
+        assert_eq!(c.original_bytes, 5);
+        assert!(!c.truncated);
+        // Exactly at cap is kept (the check is ).
+        let c = capture_tool_input(&p, "shell", "12345678").unwrap();
+        assert_eq!(c.text, "12345678");
+        assert!(!c.truncated);
+    }
+
+    #[test]
+    fn redacted_truncation_respects_utf8_char_boundaries() {
+        // 'é' is 2 bytes (U+00E9). With cap=3, "éé" (4 bytes) must truncate to
+        // the first whole char rather than splitting one mid-byte.
+        let p = make_policy("redacted", 3, vec![]);
+        let c = capture_tool_input(&p, "shell", "éé").unwrap();
+        assert_eq!(c.text, "é");
+        assert!(c.truncated);
+        assert_eq!(c.original_bytes, 4);
+        // Kept text stays within the byte cap and remains valid UTF-8.
+        assert!(c.text.len() <= 3);
+    }
+
+    #[test]
+    fn capture_tool_output_uses_the_same_policy_path() {
+        let p = make_policy("off", 8192, vec![]);
+        assert!(capture_tool_output(&p, "shell", "x").is_none());
     }
 }

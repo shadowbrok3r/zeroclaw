@@ -1,11 +1,4 @@
 //! AWS Bedrock model_provider using the Converse API.
-//!
-//! Authentication: supports three methods:
-//! - **Bearer token**: set `BEDROCK_API_KEY` env var (takes precedence).
-//! - **SigV4 signing**: AWS AKSK (Access Key ID + Secret Access Key)
-//!   via environment variables, `credential_process` in `~/.aws/config`,
-//!   or EC2 IMDSv2. SigV4 signing is implemented manually using hmac/sha2
-//!   crates — no AWS SDK dependency.
 
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -16,8 +9,10 @@ use hmac::{Hmac, Mac};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use zeroclaw_api::tool::ToolSpec;
+#[cfg(windows)]
+use zeroclaw_config::platform::native::windows_std_cmd_shell_command;
 
 /// Hostname prefix for the Bedrock Runtime endpoint.
 const ENDPOINT_PREFIX: &str = "bedrock-runtime";
@@ -132,19 +127,16 @@ impl AwsCredentials {
             anyhow::Error::msg(format!("No credential_process in [{profile}]"))
         })?;
 
-        let output = std::process::Command::new("sh")
-            .args(["-c", &cmd])
-            .output()
-            .map_err(|e| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "bedrock: failed to spawn credential_process"
-                );
-                anyhow::Error::msg(format!("Failed to run credential_process: {e}"))
-            })?;
+        let output = run_credential_process_command(&cmd).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "bedrock: failed to spawn credential_process"
+            );
+            anyhow::Error::msg(format!("Failed to run credential_process: {e}"))
+        })?;
         anyhow::ensure!(
             output.status.success(),
             "credential_process exited with {}: {}",
@@ -350,6 +342,16 @@ impl AwsCredentials {
     }
 }
 
+#[cfg(windows)]
+fn run_credential_process_command(cmd: &str) -> std::io::Result<std::process::Output> {
+    windows_std_cmd_shell_command(cmd).output()
+}
+
+#[cfg(not(windows))]
+fn run_credential_process_command(cmd: &str) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("sh").args(["-c", cmd]).output()
+}
+
 fn env_required(name: &str) -> anyhow::Result<String> {
     std::env::var(name)
         .ok()
@@ -399,7 +401,6 @@ fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> 
 }
 
 /// Build the SigV4 `Authorization` header value.
-///
 /// `headers` must be sorted by lowercase header name.
 fn build_authorization_header(
     credentials: &AwsCredentials,
@@ -480,12 +481,6 @@ struct ConverseMessage {
     content: Vec<ContentBlock>,
 }
 
-/// Content blocks use Bedrock's union style:
-/// `{"text": "..."}`, `{"toolUse": {...}}`, `{"toolResult": {...}}`, `{"cachePoint": {...}}`.
-///
-/// Note: `text` is a simple string value, not a nested object. `toolUse` and `toolResult`
-/// are nested objects. We use `#[serde(untagged)]` with manual struct wrappers to
-/// match this mixed format.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 enum ContentBlock {
@@ -615,26 +610,10 @@ struct InferenceConfig {
     temperature: Option<f64>,
 }
 
-/// Whether a Bedrock model accepts the fixed-budget native-thinking shape
-/// (`additionalModelRequestFields.thinking = {"type": "enabled", "budget_tokens": N}`).
-/// AWS's Opus 4.7 model card states the model only supports adaptive thinking
-/// and rejects fixed budgets with a 400; until adaptive thinking is implemented,
-/// those models stay on prompt-based reasoning.
-/// AWS docs:
-/// <https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-4-7.html>
 fn bedrock_model_supports_native_thinking(model: &str) -> bool {
     !model.contains("claude-opus-4-7")
 }
 
-/// Whether a Bedrock model accepts `cachePoint` blocks for prompt caching.
-///
-/// Only Anthropic Claude and Amazon Nova models support prompt caching on
-/// Bedrock; other families (Qwen, Llama, Mistral, DeepSeek, …) reject a request
-/// that contains a `cachePoint` with a 400: "You invoked an unsupported model or
-/// your request did not allow prompt caching". Caching is purely an
-/// optimization, so we allowlist the known-supported families and skip
-/// `cachePoint` insertion everywhere else rather than risk that error.
-/// AWS docs: <https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html>
 fn bedrock_model_supports_prompt_caching(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
     model.contains("claude") || model.contains("nova")
@@ -662,7 +641,9 @@ struct ToolSpecDef {
 
 #[derive(Debug, Serialize)]
 struct InputSchema {
-    json: serde_json::Value,
+    /// `Arc`-shared with the tool registry's stored schema — serialized
+    /// transparently, never deep-cloned per request
+    json: Arc<serde_json::Value>,
 }
 
 // ── Converse API Types (Response) ───────────────────────────────
@@ -701,12 +682,6 @@ struct ConverseOutputMessage {
     content: Vec<ResponseContentBlock>,
 }
 
-/// Response content blocks from the Converse API.
-///
-/// Uses `#[serde(untagged)]` to match Bedrock's union format where `text` is a
-/// simple string value and `toolUse` is a nested object. `reasoningContent`
-/// carries extended thinking output. Unknown block types (e.g. `guardContent`)
-/// are captured as `Other` to prevent deserialization failures.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum ResponseContentBlock {
@@ -756,60 +731,118 @@ pub struct BedrockModelProvider {
     cred_cache: Mutex<Option<AwsCredentials>>,
 }
 
-impl BedrockModelProvider {
-    pub fn new(alias: &str) -> Self {
-        // Bearer token takes precedence over SigV4 credentials.
-        if let Some(token) = env_optional("BEDROCK_API_KEY") {
-            return Self {
-                alias: alias.to_string(),
-                auth: Some(BedrockAuth::BearerToken(token)),
-                max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
-                cred_cache: Mutex::new(None),
-            };
-        }
-        Self {
-            alias: alias.to_string(),
-            auth: AwsCredentials::from_env()
-                .or_else(|_| AwsCredentials::from_credential_process())
-                .ok()
-                .map(BedrockAuth::SigV4),
-            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
-            cred_cache: Mutex::new(None),
-        }
-    }
+/// Typed builder for [`BedrockModelProvider`].
+///
+/// `alias` is the only positional argument. Whether the built provider
+/// probes ambient AWS credentials (`BEDROCK_API_KEY` env, then
+/// `AwsCredentials::from_env`, then `AwsCredentials::from_credential_process`)
+/// depends on whether [`Self::bearer_token`] was called: setting an
+/// explicit token bypasses every probe, and specifically avoids
+/// spawning the `credential_process` command from `~/.aws/config`.
+/// Leaving it unset lets `build()` walk the standard AWS resolution
+/// chain — the shape long-standing callers rely on when they wire
+/// Bedrock through the AWS environment.
+#[must_use]
+pub struct BedrockBuilder {
+    alias: String,
+    bearer_token: Option<String>,
+    max_tokens: Option<u32>,
+}
 
-    pub async fn new_async(alias: &str) -> Self {
-        // Bearer token takes precedence over SigV4 credentials.
-        if let Some(token) = env_optional("BEDROCK_API_KEY") {
-            return Self {
-                alias: alias.to_string(),
-                auth: Some(BedrockAuth::BearerToken(token)),
-                max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
-                cred_cache: Mutex::new(None),
-            };
-        }
-        let auth = AwsCredentials::resolve().await.ok().map(BedrockAuth::SigV4);
-        Self {
-            alias: alias.to_string(),
-            auth,
-            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
-            cred_cache: Mutex::new(None),
-        }
-    }
-
-    /// Create a model_provider using a Bearer token for authentication.
-    pub fn with_bearer_token(alias: &str, token: &str) -> Self {
-        Self {
-            alias: alias.to_string(),
-            auth: Some(BedrockAuth::BearerToken(token.to_string())),
-            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
-            cred_cache: Mutex::new(None),
-        }
-    }
-    /// Override the maximum output tokens for API requests.
-    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
-        self.max_tokens = max_tokens;
+impl BedrockBuilder {
+    /// Set an explicit Bearer token. When set, [`Self::build`] uses it
+    /// directly and skips every AWS credential probe (including the
+    /// `credential_process` command that would otherwise spawn a shell).
+    pub fn bearer_token(mut self, token: &str) -> Self {
+        self.bearer_token = Some(token.to_string());
         self
+    }
+
+    /// Override the maximum output tokens for API requests. Defaults to
+    /// [`zeroclaw_api::model_provider::BASELINE_MAX_TOKENS`] when unset.
+    pub fn max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = Some(max_tokens);
+        self
+    }
+
+    /// Finalize the provider synchronously.
+    ///
+    /// If `bearer_token` was set, uses it as-is with no ambient probe.
+    /// Otherwise walks the standard chain (`BEDROCK_API_KEY` env →
+    /// `AwsCredentials::from_env` → `AwsCredentials::from_credential_process`),
+    /// which can spawn the `credential_process` command from
+    /// `~/.aws/config`. Use [`Self::build_async`] if you need the
+    /// IMDS-aware resolver (which requires an async context).
+    pub fn build(self) -> BedrockModelProvider {
+        let auth = if let Some(token) = self.bearer_token {
+            Some(BedrockAuth::BearerToken(token))
+        } else {
+            resolve_ambient_auth_blocking()
+        };
+        BedrockModelProvider {
+            alias: self.alias,
+            auth,
+            max_tokens: self
+                .max_tokens
+                .unwrap_or(zeroclaw_api::model_provider::BASELINE_MAX_TOKENS),
+            cred_cache: Mutex::new(None),
+        }
+    }
+
+    /// Finalize the provider through the async credential resolver
+    /// (which additionally probes EC2 IMDSv2). Same bearer-token
+    /// short-circuit as [`Self::build`].
+    pub async fn build_async(self) -> BedrockModelProvider {
+        let auth = if let Some(token) = self.bearer_token {
+            Some(BedrockAuth::BearerToken(token))
+        } else {
+            resolve_ambient_auth_async().await
+        };
+        BedrockModelProvider {
+            alias: self.alias,
+            auth,
+            max_tokens: self
+                .max_tokens
+                .unwrap_or(zeroclaw_api::model_provider::BASELINE_MAX_TOKENS),
+            cred_cache: Mutex::new(None),
+        }
+    }
+}
+
+/// Walk the standard ambient AWS credential chain synchronously:
+/// `BEDROCK_API_KEY` env → `AwsCredentials::from_env` →
+/// `AwsCredentials::from_credential_process`. The last step can spawn
+/// the `credential_process` command from `~/.aws/config`.
+fn resolve_ambient_auth_blocking() -> Option<BedrockAuth> {
+    if let Some(token) = env_optional("BEDROCK_API_KEY") {
+        return Some(BedrockAuth::BearerToken(token));
+    }
+    AwsCredentials::from_env()
+        .or_else(|_| AwsCredentials::from_credential_process())
+        .ok()
+        .map(BedrockAuth::SigV4)
+}
+
+/// Async counterpart of [`resolve_ambient_auth_blocking`] that also
+/// probes EC2 IMDSv2 via [`AwsCredentials::resolve`].
+async fn resolve_ambient_auth_async() -> Option<BedrockAuth> {
+    if let Some(token) = env_optional("BEDROCK_API_KEY") {
+        return Some(BedrockAuth::BearerToken(token));
+    }
+    AwsCredentials::resolve().await.ok().map(BedrockAuth::SigV4)
+}
+
+impl BedrockModelProvider {
+    /// Entry point. Only `alias` is required; use
+    /// [`BedrockBuilder::bearer_token`] to pin an explicit token
+    /// (skipping every ambient probe) or call [`BedrockBuilder::build`]
+    /// with no token to walk the AWS credential chain.
+    pub fn builder(alias: &str) -> BedrockBuilder {
+        BedrockBuilder {
+            alias: alias.to_string(),
+            bearer_token: None,
+            max_tokens: None,
+        }
     }
 
     fn http_client(&self) -> Client {
@@ -1016,13 +1049,6 @@ impl BedrockModelProvider {
         (system, converse_messages)
     }
 
-    /// Remove empty text ContentBlocks from converse messages.
-    ///
-    /// Bedrock rejects requests where a ContentBlock has a blank `text` field
-    /// with: "The text field in the ContentBlock object is blank". This can
-    /// occur when a daemon restart interrupts a streaming response, leaving a
-    /// partially-persisted message with empty content, or when bot/attachment-
-    /// only messages produce empty text blocks.
     fn sanitize_empty_content_blocks(messages: &mut [ConverseMessage]) {
         for msg in messages.iter_mut() {
             msg.content.retain(|block| match block {
@@ -1033,6 +1059,46 @@ impl BedrockModelProvider {
                 msg.content.push(ContentBlock::Text(TextBlock {
                     text: "(empty)".to_string(),
                 }));
+            }
+        }
+    }
+
+    fn strip_orphaned_tool_uses(messages: &mut [ConverseMessage]) {
+        use std::collections::HashSet;
+
+        let answered_ids: HashSet<String> = messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult(w) => Some(w.tool_result.tool_use_id.clone()),
+                _ => None,
+            })
+            .collect();
+
+        for msg in messages.iter_mut() {
+            if msg.role != "assistant" {
+                continue;
+            }
+            let before = msg.content.len();
+            msg.content.retain(|block| match block {
+                ContentBlock::ToolUse(w) => answered_ids.contains(&w.tool_use.tool_use_id),
+                _ => true,
+            });
+            let removed = before - msg.content.len();
+            if removed > 0 {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({ "removed": removed })),
+                    "bedrock: converter stripped orphaned toolUse block(s) from an assistant \
+                     message — upstream history pruning likely missed a case"
+                );
+                if msg.content.is_empty() {
+                    msg.content.push(ContentBlock::Text(TextBlock {
+                        text: "(tool call omitted — no matching result)".to_string(),
+                    }));
+                }
             }
         }
     }
@@ -1048,11 +1114,6 @@ impl BedrockModelProvider {
             .map(String::from)
     }
 
-    /// Find the first unmatched tool_use_id from the last assistant message.
-    ///
-    /// When a tool result can't be parsed at all (not even the ID), we fall
-    /// back to matching it against the preceding assistant turn's toolUse
-    /// blocks that don't yet have a corresponding toolResult.
     fn last_pending_tool_use_id(converse_messages: &[ConverseMessage]) -> Option<String> {
         let last_assistant = converse_messages
             .iter()
@@ -1282,7 +1343,7 @@ impl BedrockModelProvider {
                     name: tool.name.clone(),
                     description: tool.description.clone(),
                     input_schema: InputSchema {
-                        json: tool.parameters.clone(),
+                        json: Arc::clone(&tool.parameters),
                     },
                 },
             })
@@ -1563,9 +1624,15 @@ impl ModelProvider for BedrockModelProvider {
         // Strip empty text ContentBlocks that would cause Bedrock 400 errors.
         Self::sanitize_empty_content_blocks(&mut converse_messages);
 
+        // Strip orphaned toolUse blocks (no matching toolResult) that would
+        // otherwise trigger "Expected toolResult blocks at messages.N.content
+        // for the following Ids: tooluse_*". The runtime history pruner is the
+        // primary defence; this is the converter-side backstop.
+        Self::strip_orphaned_tool_uses(&mut converse_messages);
+
         // Prompt caching (cachePoint) is only accepted by Claude/Nova models;
         // sending it to e.g. Qwen or Llama returns a 400. Gate all cachePoint
-        // insertion on model support (see issue #7312).
+        // insertion on model support.
         let supports_caching = bedrock_model_supports_prompt_caching(model);
 
         // Apply cachePoint to system if large.
@@ -1830,7 +1897,7 @@ mod tests {
     #[test]
     fn creates_without_credentials() {
         // ModelProvider should construct even without env vars.
-        let _provider = BedrockModelProvider::new("test");
+        let _provider = BedrockModelProvider::builder("test").build();
     }
 
     #[tokio::test]
@@ -1865,10 +1932,58 @@ mod tests {
 
     #[test]
     fn creates_with_bearer_token() {
-        let model_provider = BedrockModelProvider::with_bearer_token("test", "test-api-key");
+        let model_provider = BedrockModelProvider::builder("test")
+            .bearer_token("test-api-key")
+            .build();
         assert!(model_provider.auth.is_some());
         assert!(
             matches!(model_provider.auth, Some(BedrockAuth::BearerToken(ref t)) if t == "test-api-key")
+        );
+    }
+
+    /// Regression for the factory-side explicit-API-key path.
+    ///
+    /// The pre-refactor code used `BedrockModelProvider::with_bearer_token(alias, api_key)`,
+    /// which directly constructed a bearer-token provider and skipped
+    /// every ambient AWS credential probe. An earlier iteration of this
+    /// refactor routed the same path through `new(alias).with_bearer_token(...)`,
+    /// which meant `new(alias)` would still walk `BEDROCK_API_KEY` env → SigV4
+    /// env → `credential_process` (spawning a shell command from
+    /// `~/.aws/config`) before the bearer-token override took effect —
+    /// an observable security-boundary regression.
+    ///
+    /// This test proves the current builder-based explicit-key path
+    /// bypasses every ambient probe: with the AWS config file pointed at
+    /// `/dev/null` (so any `credential_process` walk would either err out
+    /// or, if the parser were ever changed, spawn `/dev/null` as a
+    /// command) and with `BEDROCK_API_KEY` deliberately set to a
+    /// distractor value, the resulting `auth` must be exactly the
+    /// caller-supplied bearer token.
+    #[test]
+    fn bearer_token_builder_skips_ambient_credential_probe() {
+        let _env_lock = env_lock();
+        // A stale ambient bearer would beat the explicit one if the
+        // builder probed env before applying the caller's token.
+        let _bedrock_env = EnvGuard::set("BEDROCK_API_KEY", Some("distractor-ambient-token"));
+        // Point the AWS config file at /dev/null so any accidental
+        // credential_process walk fails loudly instead of silently
+        // reading from the developer's real ~/.aws/config.
+        let _aws_config = EnvGuard::set("AWS_CONFIG_FILE", Some("/dev/null"));
+        // Also clear the SigV4 env vars so from_env cannot silently
+        // succeed and mask an unintended probe.
+        let _ak = EnvGuard::set("AWS_ACCESS_KEY_ID", None);
+        let _sk = EnvGuard::set("AWS_SECRET_ACCESS_KEY", None);
+
+        let model_provider = BedrockModelProvider::builder("test")
+            .bearer_token("explicit-caller-token")
+            .build();
+
+        assert!(
+            matches!(
+                model_provider.auth,
+                Some(BedrockAuth::BearerToken(ref t)) if t == "explicit-caller-token"
+            ),
+            "explicit bearer_token() must skip BEDROCK_API_KEY probe and win over any ambient value"
         );
     }
 
@@ -1880,7 +1995,7 @@ mod tests {
         let _ak_guard = EnvGuard::set("AWS_ACCESS_KEY_ID", None);
         let _sk_guard = EnvGuard::set("AWS_SECRET_ACCESS_KEY", None);
 
-        let model_provider = BedrockModelProvider::new("test");
+        let model_provider = BedrockModelProvider::builder("test").build();
         assert!(matches!(
             model_provider.auth,
             Some(BedrockAuth::BearerToken(ref t)) if t == "env-bearer-token"
@@ -1894,7 +2009,7 @@ mod tests {
         let _ak_guard = EnvGuard::set("AWS_ACCESS_KEY_ID", Some("AKIAEXAMPLE"));
         let _sk_guard = EnvGuard::set("AWS_SECRET_ACCESS_KEY", Some("secret"));
 
-        let model_provider = BedrockModelProvider::new("test");
+        let model_provider = BedrockModelProvider::builder("test").build();
         // Bearer token should take priority over SigV4 credentials.
         assert!(matches!(
             model_provider.auth,
@@ -1991,6 +2106,55 @@ mod tests {
     }
 
     #[test]
+    fn strip_orphaned_tool_uses_removes_unanswered_tool_use() {
+        // Belt-and-suspenders: if an orphaned tool_use slips past the runtime
+        // history pruner, the Bedrock converter must strip it so AWS doesn't
+        // reject with "Expected toolResult blocks at messages.N.content".
+        let tool_call_json = r#"{"content": "Let me check", "tool_calls": [{"id": "call_ORPHAN", "name": "shell", "arguments": "{\"command\":\"ls\"}"}]}"#;
+        let messages = vec![ChatMessage::assistant(tool_call_json)];
+        let (_, mut msgs) = BedrockModelProvider::convert_messages(&messages);
+        // Pre-condition: the converter produced an (orphaned) ToolUse block.
+        assert!(
+            msgs[0]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse(_)))
+        );
+
+        BedrockModelProvider::strip_orphaned_tool_uses(&mut msgs);
+
+        assert_eq!(msgs[0].role, "assistant");
+        assert!(
+            !msgs[0]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse(_))),
+            "orphaned ToolUse must be stripped"
+        );
+        // Content must not be empty (Bedrock rejects blank content).
+        assert!(!msgs[0].content.is_empty());
+    }
+
+    #[test]
+    fn strip_orphaned_tool_uses_retains_answered_tool_use() {
+        let tool_call_json = r#"{"content": "Let me check", "tool_calls": [{"id": "call_OK", "name": "shell", "arguments": "{\"command\":\"ls\"}"}]}"#;
+        let tool_result_json = r#"{"content":"ls output","tool_call_id":"call_OK"}"#;
+        let messages = vec![
+            ChatMessage::assistant(tool_call_json),
+            ChatMessage::tool(tool_result_json),
+        ];
+        let (_, mut msgs) = BedrockModelProvider::convert_messages(&messages);
+        BedrockModelProvider::strip_orphaned_tool_uses(&mut msgs);
+        assert!(
+            msgs[0]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse(_))),
+            "a tool_use with a matching tool_result must be retained"
+        );
+    }
+
+    #[test]
     fn convert_messages_plain_assistant_text() {
         let messages = vec![ChatMessage::assistant("Just text")];
         let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
@@ -2045,11 +2209,11 @@ mod tests {
 
     #[test]
     fn convert_tools_to_converse_formats_correctly() {
-        let tools = vec![ToolSpec {
-            name: "shell".to_string(),
-            description: "Run commands".to_string(),
-            parameters: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
-        }];
+        let tools = vec![ToolSpec::new(
+            "shell",
+            "Run commands",
+            serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+        )];
         let config = BedrockModelProvider::convert_tools_to_converse(Some(&tools));
         assert!(config.is_some());
         let config = config.unwrap();
@@ -2131,7 +2295,7 @@ mod tests {
 
     #[test]
     fn prompt_caching_unsupported_for_other_families() {
-        // Regression for #7312: Qwen (and other non-Claude/Nova families) reject
+        // Qwen (and other non-Claude/Nova families) reject
         // cachePoint blocks, so caching must be disabled for them.
         for model in [
             "qwen.qwen3-coder-next",
@@ -2580,20 +2744,20 @@ credential_process=some-command
 
     #[test]
     fn from_credential_process_parses_json_output() {
-        // Verify config parsing + JSON shape by using `echo` as the command.
-        let config = "\
-[default]
-credential_process=echo '{\"Version\":1,\"AccessKeyId\":\"AKIA\",\"SecretAccessKey\":\"secret\",\"SessionToken\":\"tok\"}'
-region=ap-southeast-1
-";
-        let (cmd, region) = AwsCredentials::parse_aws_config(config, "default").unwrap();
-        assert!(cmd.starts_with("echo"));
+        let credential_json =
+            r#"{"Version":1,"AccessKeyId":"AKIA","SecretAccessKey":"secret","SessionToken":"tok"}"#;
+        #[cfg(windows)]
+        let credential_command = format!("echo {credential_json}");
+        #[cfg(not(windows))]
+        let credential_command = format!("printf '%s\\n' '{credential_json}'");
+        let config =
+            format!("[default]\ncredential_process={credential_command}\nregion=ap-southeast-1\n");
+
+        let (cmd, region) = AwsCredentials::parse_aws_config(&config, "default").unwrap();
+        assert_eq!(cmd, credential_command);
         assert_eq!(region.as_deref(), Some("ap-southeast-1"));
 
-        let output = std::process::Command::new("sh")
-            .args(["-c", &cmd])
-            .output()
-            .unwrap();
+        let output = run_credential_process_command(&cmd).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(json["AccessKeyId"].as_str(), Some("AKIA"));
         assert_eq!(json["SecretAccessKey"].as_str(), Some("secret"));

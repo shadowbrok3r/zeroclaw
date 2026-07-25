@@ -17,9 +17,16 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Search, X, Wrench, Terminal } from 'lucide-react';
-import type { ToolSpec, CliTool } from '@/types/api';
-import { getTools, getCliTools } from '@/lib/api';
+import {
+  loadToolCatalogResult,
+  peekToolCatalog,
+  type CatalogEntry as ToolCatalogEntry,
+  type CatalogLoadWarning,
+} from '@/lib/toolCatalog';
 import { t } from '@/lib/i18n';
+import { ToolCatalogWarningPanel } from './ToolCatalogWarningPanel';
+
+export { loadToolCatalog as loadCatalog, type CatalogEntry } from '@/lib/toolCatalog';
 
 export interface ToolPickerProps {
   /** Currently-selected tool names. Order is preserved on toggle. */
@@ -30,52 +37,10 @@ export interface ToolPickerProps {
   disabled?: boolean;
   /** DOM id for the search input so a `<label htmlFor>` can target it. */
   id?: string;
-}
-
-/** A flattened, group-tagged catalog entry. */
-interface CatalogEntry {
-  name: string;
-  description: string;
-  group: 'agent' | 'cli';
-}
-
-// Process-wide cache so re-mounting the picker (e.g. reopening the Cron
-// modal, or switching config sections) doesn't re-hit the network. The
-// catalog is effectively static for the daemon's lifetime.
-let catalogCache: CatalogEntry[] | null = null;
-let catalogPromise: Promise<CatalogEntry[]> | null = null;
-
-function cliDescription(tool: CliTool): string {
-  // CliTool has no `description`; synthesize a short one from category/path
-  // so the row still says something useful.
-  const parts = [tool.category, tool.version ? `v${tool.version}` : null, tool.path]
-    .filter(Boolean)
-    .join(' · ');
-  return parts || tool.path;
-}
-
-function loadCatalog(): Promise<CatalogEntry[]> {
-  if (catalogCache) return Promise.resolve(catalogCache);
-  if (catalogPromise) return catalogPromise;
-  catalogPromise = Promise.all([getTools(), getCliTools()])
-    .then(([tools, cliTools]) => {
-      const agent: CatalogEntry[] = tools.map((tnt: ToolSpec) => ({
-        name: tnt.name,
-        description: tnt.description,
-        group: 'agent' as const,
-      }));
-      const cli: CatalogEntry[] = cliTools.map((c: CliTool) => ({
-        name: c.name,
-        description: cliDescription(c),
-        group: 'cli' as const,
-      }));
-      catalogCache = [...agent, ...cli];
-      return catalogCache;
-    })
-    .finally(() => {
-      catalogPromise = null;
-    });
-  return catalogPromise;
+  /** Scope the agent-tools catalog to this agent (its built-ins plus its
+   * `mcp_bundles` MCP tools) via `/api/tools?agent=`. Omit for the gateway's
+   * default-agent listing. CLI tools are always included (not agent-scoped). */
+  agent?: string;
 }
 
 function truncate(text: string, max = 110): string {
@@ -88,42 +53,57 @@ export default function ToolPicker({
   onChange,
   disabled = false,
   id,
+  agent,
 }: ToolPickerProps) {
-  const [catalog, setCatalog] = useState<CatalogEntry[] | null>(catalogCache);
-  const [loading, setLoading] = useState(catalogCache === null);
+  const cacheKey = agent ?? '';
+  const [catalog, setCatalog] = useState<ToolCatalogEntry[] | null>(
+    () => peekToolCatalog(cacheKey),
+  );
+  const [loading, setLoading] = useState(() => peekToolCatalog(cacheKey) === null);
   const [error, setError] = useState<string | null>(null);
+  const [warnings, setWarnings] = useState<CatalogLoadWarning[]>([]);
+  const [reloadSeq, setReloadSeq] = useState(0);
   const [search, setSearch] = useState('');
 
+  // Reload when the bound agent changes so the catalog reflects that agent's
+  // scoped tools (cached per agent, so switching back is instant).
   useEffect(() => {
-    if (catalogCache) {
-      setCatalog(catalogCache);
+    const cached = reloadSeq === 0 ? peekToolCatalog(cacheKey) : null;
+    if (cached) {
+      setCatalog(cached);
       setLoading(false);
+      setError(null);
+      setWarnings([]);
       return;
     }
     let cancelled = false;
     setLoading(true);
     setError(null);
-    loadCatalog()
-      .then((entries) => {
+    setWarnings([]);
+    setCatalog(null);
+    loadToolCatalogResult(agent)
+      .then((result) => {
         if (!cancelled) {
-          setCatalog(entries);
+          setCatalog(result.entries);
+          setWarnings(result.warnings);
           setLoading(false);
         }
       })
       .catch((err: unknown) => {
         if (!cancelled) {
           setError(err instanceof Error ? err.message : t('tool_picker.load_failed'));
+          setWarnings([]);
           setLoading(false);
         }
       });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [agent, cacheKey, reloadSeq]);
 
   // Fast membership lookups for the catalog and the current selection.
   const byName = useMemo(() => {
-    const map = new Map<string, CatalogEntry>();
+    const map = new Map<string, ToolCatalogEntry>();
     for (const e of catalog ?? []) map.set(e.name, e);
     return map;
   }, [catalog]);
@@ -147,6 +127,28 @@ export default function ToolPicker({
     onChange(value.filter((n) => n !== name));
   };
 
+  const retryCatalogLoad = () => {
+    setReloadSeq((seq) => seq + 1);
+  };
+
+  // Bulk toggle for a group's currently-displayed entries. If every displayed
+  // entry is already selected, deselect them all; otherwise add the missing
+  // ones. Operates on the filtered list so it honors an active search, and
+  // matches the count shown in the group header.
+  const toggleAll = (entries: ToolCatalogEntry[]) => {
+    if (disabled || entries.length === 0) return;
+    const names = entries.map((e) => e.name);
+    const allSelected = names.every((n) => selectedSet.has(n));
+    if (allSelected) {
+      const drop = new Set(names);
+      onChange(value.filter((n) => !drop.has(n)));
+    } else {
+      const next = [...value];
+      for (const n of names) if (!next.includes(n)) next.push(n);
+      onChange(next);
+    }
+  };
+
   // Search filter over name + description (case-insensitive).
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -167,6 +169,11 @@ export default function ToolPicker({
     () => filtered.filter((e) => e.group === 'cli'),
     [filtered],
   );
+
+  const agentAllSelected =
+    agentEntries.length > 0 && agentEntries.every((e) => selectedSet.has(e.name));
+  const cliAllSelected =
+    cliEntries.length > 0 && cliEntries.every((e) => selectedSet.has(e.name));
 
   // Selected names that aren't in the catalog (unknown / removed tools).
   // Surface them as chips so nothing is silently dropped on save.
@@ -287,6 +294,60 @@ export default function ToolPicker({
           className="w-full h-9 pl-9 pr-3 text-sm rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30 disabled:opacity-50 disabled:cursor-not-allowed"
         />
       </div>
+
+      {/* Per-group bulk-select toolbar. Rendered OUTSIDE the role="listbox"
+          below so the controls are valid ARIA (a listbox may only contain
+          option/group descendants) and reachable in the natural Tab order with
+          native button Enter/Space activation. Each button acts on its group's
+          currently-displayed (filtered) entries and flips Select all/Deselect
+          all to match. Hidden when the picker is disabled or the group is empty. */}
+      {!loading && error === null && !disabled &&
+        (agentEntries.length > 0 || cliEntries.length > 0) && (
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-0.5">
+            {agentEntries.length > 0 && (
+              <button
+                type="button"
+                onClick={() => toggleAll(agentEntries)}
+                aria-label={`${
+                  agentAllSelected
+                    ? t('tool_picker.deselect_all_aria_prefix')
+                    : t('tool_picker.select_all_aria_prefix')
+                }${t('tool_picker.group_agent')}`}
+                className="text-[10px] font-medium text-pc-accent hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]/40 rounded cursor-pointer"
+              >
+                {agentAllSelected
+                  ? t('tool_picker.deselect_all')
+                  : t('tool_picker.select_all')}{' '}
+                {t('tool_picker.group_agent')}
+              </button>
+            )}
+            {cliEntries.length > 0 && (
+              <button
+                type="button"
+                onClick={() => toggleAll(cliEntries)}
+                aria-label={`${
+                  cliAllSelected
+                    ? t('tool_picker.deselect_all_aria_prefix')
+                    : t('tool_picker.select_all_aria_prefix')
+                }${t('tool_picker.group_cli')}`}
+                className="text-[10px] font-medium text-pc-accent hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]/40 rounded cursor-pointer"
+              >
+                {cliAllSelected
+                  ? t('tool_picker.deselect_all')
+                  : t('tool_picker.select_all')}{' '}
+                {t('tool_picker.group_cli')}
+              </button>
+            )}
+          </div>
+        )}
+
+      {warnings.length > 0 && (
+        <ToolCatalogWarningPanel
+          warnings={warnings}
+          onRetry={retryCatalogLoad}
+          retryDisabled={loading}
+        />
+      )}
 
       {/* Catalog list */}
       {loading ? (

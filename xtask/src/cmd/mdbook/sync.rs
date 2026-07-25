@@ -20,6 +20,8 @@ pub fn run(
     require_tool("msgattrib", "apt install gettext / brew install gettext")?;
     require_tool("msgcat", "apt install gettext / brew install gettext")?;
 
+    ensure_po_submodule(&root)?;
+
     let book = book_dir(&root);
     let po_dir = po_dir(&root);
     let pot = pot_file(&root);
@@ -28,13 +30,16 @@ pub fn run(
 
     // Step 1: extract English msgids
     println!("==> Extracting English msgids → {}", pot.display());
-    crate::cmd::mdbook::build::inject_lang_switcher_locales(&book, &locale_entries())?;
-    run_cmd(
-        Command::new(mdbook_program()?)
-            .args(["build", "-d", "po-extract"])
-            .env("MDBOOK_OUTPUT__XGETTEXT__POT_FILE", "messages.pot")
-            .current_dir(&book),
-    )?;
+    crate::cmd::mdbook::build::prepare_generated_book_inputs(&root, &locale_entries())?;
+    let mut extract = Command::new(mdbook_program()?);
+    extract
+        .args(["build", "-d", "po-extract"])
+        .env("MDBOOK_OUTPUT__XGETTEXT__POT_FILE", "messages.pot")
+        .current_dir(&book);
+    if let Some((key, value)) = peer_groups_preprocessor_env() {
+        extract.env(key, value);
+    }
+    run_cmd(&mut extract)?;
 
     let extracted = book.join("po-extract/xgettext/messages.pot");
     if extracted.exists() {

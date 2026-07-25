@@ -1,33 +1,49 @@
 //! Local IPC transport for the RPC layer.
-//!
-//! On Unix this binds a `SOCK_STREAM` AF_UNIX socket at
-//! `<config.data_dir>/daemon.sock`; on Windows it creates a per-user named
-//! pipe whose name is derived from the data_dir so each `--data-dir` gets
-//! its own endpoint. `$ZEROCLAW_SOCKET` overrides the endpoint path on
-//! both platforms.
 
 use super::context::RpcContext;
 use super::dispatch::RpcDispatcher;
 use super::transport::RpcTransport;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::Config;
 
 use platform::LocalStream;
 
-/// Resolve the local-IPC endpoint path.
-///
-/// Returns `$ZEROCLAW_SOCKET` when set, otherwise a per-`data_dir`
-/// platform-native endpoint:
-/// - Unix: `<data_dir>/daemon.sock` (filesystem path)
-/// - Windows: `\\.\pipe\zeroclaw-<hash>` where `<hash>` is derived from
-///   `data_dir` so each data directory gets its own pipe
+const MAX_FRAME_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Backoff after a transient `accept()` error so the serve loop does not
+/// hot-spin while the condition (e.g. fd exhaustion) clears.
+const ACCEPT_ERROR_BACKOFF_MS: u64 = 50;
+
+/// File-descriptor exhaustion errno values, stable across the Unix targets
+/// we support (Linux, macOS, BSD).
+#[cfg(unix)]
+const EMFILE: i32 = 24; // too many open files (this process)
+#[cfg(unix)]
+const ENFILE: i32 = 23; // too many open files (system-wide)
+
+fn is_recoverable_accept_error(e: &std::io::Error) -> bool {
+    if matches!(
+        e.kind(),
+        ErrorKind::ConnectionAborted | ErrorKind::Interrupted | ErrorKind::WouldBlock
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    if matches!(e.raw_os_error(), Some(EMFILE) | Some(ENFILE)) {
+        return true;
+    }
+    false
+}
+
 pub fn socket_path(config: &Config) -> PathBuf {
     if let Ok(p) = std::env::var("ZEROCLAW_SOCKET") {
         return PathBuf::from(p);
@@ -81,10 +97,16 @@ impl RpcTransport for LocalTransport {
     }
 
     async fn next_frame(&mut self) -> Option<String> {
-        let mut line = String::new();
-        match self.reader.read_line(&mut line).await {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut limited = (&mut self.reader).take(MAX_FRAME_BYTES + 1);
+        match limited.read_until(b'\n', &mut buf).await {
             Ok(0) => None,
-            Ok(_) => Some(line),
+            Ok(_) => {
+                if buf.len() as u64 > MAX_FRAME_BYTES {
+                    return None;
+                }
+                Some(String::from_utf8_lossy(&buf).into_owned())
+            }
             Err(_) => None,
         }
     }
@@ -97,7 +119,6 @@ impl RpcTransport for LocalTransport {
 // ── Listener ─────────────────────────────────────────────────────
 
 /// Run the local IPC RPC listener as a daemon subsystem.
-///
 /// `client_count` is incremented on connect, decremented on disconnect.
 /// The daemon uses it for `--ephemeral` shutdown logic.
 pub async fn run_local_listener(
@@ -138,13 +159,21 @@ pub async fn run_local_listener(
                 let stream = match accept {
                     Ok(v) => v,
                     Err(e) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                            &format!("local IPC accept error: {e}")
-                        );
-                        continue;
+                        if e.downcast_ref::<std::io::Error>().is_some_and(is_recoverable_accept_error) {
+                            // Transient (e.g. EMFILE under fd pressure):
+                            // the listener is still valid. Back off briefly
+                            // to avoid hot-spinning, then keep serving
+                            // rather than killing the daemon
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                &format!("local IPC accept() transient error: {e}")
+                            );
+                            tokio::time::sleep(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS)).await;
+                            continue;
+                        }
+                        return Err(e).context("local IPC accept error");
                     }
                 };
 
@@ -400,6 +429,7 @@ mod tests {
             tui_id: None,
             tui_sig: None,
             env: Default::default(),
+            client_capabilities: None,
         };
         writer
             .write_all(rpc_request(Method::Initialize, &params, 1).as_bytes())
@@ -446,6 +476,7 @@ mod tests {
             tui_id: None,
             tui_sig: None,
             env: Default::default(),
+            client_capabilities: None,
         };
         writer
             .write_all(rpc_request(Method::Initialize, &init_params, 1).as_bytes())
@@ -690,6 +721,7 @@ mod tests {
             tui_id: None,
             tui_sig: None,
             env: Default::default(),
+            client_capabilities: None,
         };
         write_half
             .write_all(rpc_request(Method::Initialize, &init_params, 1).as_bytes())
@@ -708,5 +740,33 @@ mod tests {
         drop(reader);
         drop(client);
         let _ = handle.await;
+    }
+}
+
+#[cfg(test)]
+mod accept_error_tests {
+    use super::is_recoverable_accept_error;
+    use std::io::{Error, ErrorKind};
+
+    #[cfg(unix)]
+    #[test]
+    fn fd_exhaustion_accept_errors_are_recoverable() {
+        // EMFILE/ENFILE must not terminate the daemon.
+        assert!(is_recoverable_accept_error(&Error::from_raw_os_error(24))); // EMFILE
+        assert!(is_recoverable_accept_error(&Error::from_raw_os_error(23))); // ENFILE
+    }
+
+    #[test]
+    fn transient_kinds_recover_but_fatal_propagates() {
+        assert!(is_recoverable_accept_error(&Error::from(
+            ErrorKind::ConnectionAborted
+        )));
+        assert!(is_recoverable_accept_error(&Error::from(
+            ErrorKind::Interrupted
+        )));
+        // A non-transient error is not swallowed (loop will propagate it).
+        assert!(!is_recoverable_accept_error(&Error::from(
+            ErrorKind::InvalidInput
+        )));
     }
 }

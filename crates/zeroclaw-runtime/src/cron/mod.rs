@@ -14,9 +14,10 @@ pub use schedule::{
 };
 #[allow(unused_imports)]
 pub use store::{
-    add_agent_job, all_overdue_jobs, due_jobs, get_job, list_jobs, list_jobs_by_agent, list_runs,
-    record_last_run, record_last_run_with_status, record_run, remove_job, remove_jobs_by_agent,
-    rename_jobs_by_agent, reschedule_after_run, reschedule_after_run_with_status, skip_missed_run,
+    add_agent_job, all_overdue_jobs, claim_job, clear_stale_locks, due_jobs, get_job, list_jobs,
+    list_jobs_by_agent, list_runs, record_last_run, record_last_run_with_status, record_run,
+    release_job, remove_job, remove_jobs_by_agent, rename_jobs_by_agent, reschedule_after_run,
+    reschedule_after_run_with_status, resolve_job_id_or_name, skip_missed_run,
     sync_declarative_jobs, update_job,
 };
 pub use types::{
@@ -38,6 +39,9 @@ pub(crate) const CRON_DELIVERY_SCHEMA_CHANNELS: &[&str] = &[
     "lark",
     "feishu",
     "dingtalk",
+    "wechat",
+    "signal",
+    "email",
 ];
 
 /// Validate a shell command against an agent's security policy
@@ -55,7 +59,6 @@ pub fn validate_shell_command(
 }
 
 /// Validate a shell command using an existing `SecurityPolicy` instance.
-///
 /// Preferred when the caller already holds a `SecurityPolicy` (e.g. scheduler).
 pub fn validate_shell_command_with_security(
     security: &SecurityPolicy,
@@ -89,12 +92,6 @@ pub fn validate_delivery_config(delivery: Option<&DeliveryConfig>) -> Result<()>
         bail!("unsupported delivery mode: {}", delivery.mode);
     }
 
-    // Shape-only validation. Whether the named channel resolves to a
-    // configured `[channels.<type>.<alias>]` entry at the moment of add
-    // is checked separately and surfaced as a non-fatal warning, not a
-    // hard error — a cron job may be authored before its channel is
-    // provisioned, and the scheduler logs loudly on fire if the channel
-    // never materialises (see `process_due_jobs`).
     let channel = delivery.channel.as_deref().map(str::trim);
     if channel.filter(|value| !value.is_empty()).is_none() {
         bail!("delivery.channel is required for announce mode");
@@ -112,12 +109,6 @@ pub fn validate_delivery_config(delivery: Option<&DeliveryConfig>) -> Result<()>
     Ok(())
 }
 
-/// Create a validated shell job, enforcing security policy before persistence.
-///
-/// `agent_alias` names the agent under whose risk profile the command
-/// will be validated and executed. All entrypoints that create shell
-/// cron jobs should route through this function to guarantee consistent
-/// policy enforcement.
 pub fn add_shell_job_with_approval(
     config: &Config,
     agent_alias: &str,
@@ -133,7 +124,6 @@ pub fn add_shell_job_with_approval(
 }
 
 /// Update a shell job's command with security validation.
-///
 /// Validates the new command (if changed) against the named agent's
 /// risk profile before persisting.
 pub fn update_shell_job_with_approval(
@@ -803,6 +793,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .unwrap();
 
@@ -814,6 +805,7 @@ mod tests {
                 command: None,
                 name: None,
                 allowed_tools: vec!["shell".into()],
+                uses_memory: None,
             },
             &config,
         )

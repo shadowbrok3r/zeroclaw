@@ -1,11 +1,4 @@
 //! Channel Matrix — comprehensive capability coverage tests.
-//!
-//! Validates every channel implementation against the full `Channel` trait
-//! contract, covering: identity semantics, threading, default methods,
-//! capability declarations, cross-channel parity, and edge cases.
-//!
-//! This matrix ensures ZeroClaw channels are fully tested to maintain
-//! competitive feature parity across all supported platforms.
 
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
@@ -144,6 +137,8 @@ impl Channel for MatrixTestChannel {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         })
         .await
         .map_err(|e| anyhow::Error::msg(e.to_string()))
@@ -206,6 +201,7 @@ impl Channel for MatrixTestChannel {
         recipient: &str,
         message_id: &str,
         text: &str,
+        _suppress_voice: bool,
     ) -> anyhow::Result<()> {
         self.events
             .lock()
@@ -421,7 +417,7 @@ async fn draft_full_lifecycle_send_update_finalize() {
     ch.update_draft("user_1", &draft_id, "thinking... partial response")
         .await
         .unwrap();
-    ch.finalize_draft("user_1", &draft_id, "Final complete response")
+    ch.finalize_draft("user_1", &draft_id, "Final complete response", false)
         .await
         .unwrap();
 
@@ -591,10 +587,6 @@ async fn pin_multiple_messages_in_same_channel() {
 // 6. MESSAGE REDACTION SUPPORT
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Tests that MatrixTestChannel correctly records redaction events.
-/// This validates the mock contract, not the trait default or real implementation.
-/// Trait default coverage: `src/channels/traits.rs::default_redact_message_returns_success`
-/// Real implementation coverage: requires live Matrix integration tests (not in this suite).
 #[tokio::test]
 async fn redact_message_lifecycle() {
     let ch = MatrixTestChannel::new("matrix");
@@ -642,6 +634,8 @@ fn channel_message_thread_ts_preserved_on_clone() {
         interruption_scope_id: None,
         attachments: vec![],
         subject: None,
+
+        ..Default::default()
     };
 
     let cloned = msg.clone();
@@ -662,6 +656,8 @@ fn channel_message_none_thread_ts_preserved() {
         interruption_scope_id: None,
         attachments: vec![],
         subject: None,
+
+        ..Default::default()
     };
 
     assert!(msg.clone().thread_ts.is_none());
@@ -698,13 +694,6 @@ fn send_message_with_subject_preserves_thread() {
 // 8. CROSS-CHANNEL IDENTITY SEMANTICS PER PLATFORM
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Simulates the identity mapping for each platform:
-/// - Telegram: sender = chat_id (numeric), reply_target = chat_id
-/// - Discord: sender = user_id, reply_target = channel_id (distinct!)
-/// - Slack: sender = user_id, reply_target = channel_id (distinct!)
-/// - iMessage: sender = phone/email, reply_target = phone/email (same)
-/// - IRC: sender = nick, reply_target = channel_name (distinct!)
-/// - Email: sender = from@, reply_target = from@ (reply goes to sender)
 fn make_platform_message(platform: &str) -> ChannelMessage {
     match platform {
         "telegram" => ChannelMessage {
@@ -719,6 +708,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "discord" => ChannelMessage {
             id: "dc_1".into(),
@@ -732,6 +722,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "slack" => ChannelMessage {
             id: "sl_1".into(),
@@ -745,6 +736,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "imessage" => ChannelMessage {
             id: "im_1".into(),
@@ -758,6 +750,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "irc" => ChannelMessage {
             id: "irc_1".into(),
@@ -771,6 +764,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "email" => ChannelMessage {
             id: "email_1".into(),
@@ -784,6 +778,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "signal" => ChannelMessage {
             id: "sig_1".into(),
@@ -797,6 +792,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "mattermost" => ChannelMessage {
             id: "mm_1".into(),
@@ -810,6 +806,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "whatsapp" => ChannelMessage {
             id: "wa_1".into(),
@@ -823,6 +820,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "nextcloud_talk" => ChannelMessage {
             id: "nc_1".into(),
@@ -836,6 +834,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "wecom" => ChannelMessage {
             id: "wc_1".into(),
@@ -849,6 +848,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "dingtalk" => ChannelMessage {
             id: "dt_1".into(),
@@ -862,6 +862,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "qq" => ChannelMessage {
             id: "qq_1".into(),
@@ -875,6 +876,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "linq" => ChannelMessage {
             id: "lq_1".into(),
@@ -888,6 +890,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "wati" => ChannelMessage {
             id: "wt_1".into(),
@@ -901,6 +904,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "cli" => ChannelMessage {
             id: "cli_1".into(),
@@ -914,6 +918,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         _ => panic!("Unknown platform: {platform}"),
     }
@@ -974,8 +979,6 @@ fn all_platforms_channel_field_matches_platform_name() {
     }
 }
 
-/// Discord, Slack, IRC, Mattermost, DingTalk, QQ, Nextcloud Talk all have
-/// reply_target != sender (channel-based platforms).
 #[test]
 fn channel_platforms_have_distinct_sender_and_reply_target() {
     let channel_based = [
@@ -997,8 +1000,6 @@ fn channel_platforms_have_distinct_sender_and_reply_target() {
     }
 }
 
-/// Telegram, iMessage, Email, Signal, WhatsApp, CLI, Linq, WATI, WeCom
-/// are DM-style: reply_target == sender.
 #[test]
 fn dm_platforms_have_same_sender_and_reply_target() {
     let dm_platforms = [
@@ -1014,7 +1015,6 @@ fn dm_platforms_have_same_sender_and_reply_target() {
     }
 }
 
-/// Slack and Mattermost should have thread_ts populated for threaded replies.
 #[test]
 fn threaded_platforms_have_thread_ts() {
     let threaded = ["slack", "mattermost"];
@@ -1219,6 +1219,8 @@ fn channel_message_zero_timestamp() {
         interruption_scope_id: None,
         attachments: vec![],
         subject: None,
+
+        ..Default::default()
     };
     assert_eq!(msg.timestamp, 0);
 }
@@ -1237,6 +1239,8 @@ fn channel_message_max_timestamp() {
         interruption_scope_id: None,
         attachments: vec![],
         subject: None,
+
+        ..Default::default()
     };
     assert_eq!(msg.timestamp, u64::MAX);
 }
@@ -1321,8 +1325,6 @@ async fn multi_channel_listen_produces_channel_tagged_messages() {
 // 13. CAPABILITY MATRIX DECLARATIONS
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Documents the expected capability matrix for all channels. This test serves
-/// as a living spec — update it when channel capabilities change.
 #[tokio::test]
 async fn capability_matrix_spec() {
     // Channels with draft support (streaming edits)
@@ -1405,7 +1407,7 @@ async fn minimal_channel_all_defaults_succeed() {
             .is_none()
     );
     assert!(ch.update_draft("u", "m", "t").await.is_ok());
-    assert!(ch.finalize_draft("u", "m", "t").await.is_ok());
+    assert!(ch.finalize_draft("u", "m", "t", false).await.is_ok());
     assert!(ch.cancel_draft("u", "m").await.is_ok());
     assert!(ch.add_reaction("c", "m", "\u{1F440}").await.is_ok());
     assert!(ch.remove_reaction("c", "m", "\u{1F440}").await.is_ok());
@@ -1470,6 +1472,7 @@ async fn full_conversation_lifecycle() {
         &incoming.reply_target,
         &draft_id,
         "Here's what I found: complete answer.",
+        false,
     )
     .await
     .unwrap();

@@ -1,3 +1,4 @@
+import { Link } from 'react-router-dom';
 import { t } from '@/lib/i18n';
 import type { AgentSkillEntry, SkillDocument } from '@/lib/api';
 import {
@@ -31,6 +32,9 @@ export const SkillCard = ({ skill, onExpand, isExpanded, skillDetail }: SkillCar
   // Only bundle skills can be expanded for detail / edited; other origins are
   // read-only list entries (#6700 read-only browser).
   const canExpand = skill.editable && !!onExpand;
+  const editHref = skill.editable && skill.bundle
+    ? `/config/skill_bundles/${encodeURIComponent(skill.bundle)}?tab=skills&skill=${encodeURIComponent(skill.name)}`
+    : null;
 
   const header = (
     <div className="flex items-start justify-between gap-2">
@@ -108,12 +112,28 @@ export const SkillCard = ({ skill, onExpand, isExpanded, skillDetail }: SkillCar
         >
           {originLabel(skill)}
         </span>
-        {skill.editable && (
-          <Pencil
-            className="h-3 w-3 shrink-0 ml-auto"
+        {skill.shadowed && skill.shadowed.length > 0 && (
+          <span
+            className="text-[10px] font-semibold px-2 py-0.5 rounded shrink-0"
+            style={{ background: 'rgba(251, 146, 60, 0.15)', color: '#f97316' }}
+            title={skill.shadowed
+              .map((s) => `${s.origin}:${s.name}`)
+              .join(', ')}
+          >
+            {t('skills.shadows')} {skill.shadowed.map((s) => s.origin).join(', ')}
+          </span>
+        )}
+        {editHref && (
+          <Link
+            to={editHref}
+            className="inline-flex items-center gap-1 text-[10px] font-semibold ml-auto"
             style={{ color: 'var(--pc-accent)' }}
-            aria-label={t('skills.editable')}
-          />
+            aria-label={`${t('common.edit')} ${skill.name}`}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <Pencil className="h-3 w-3 shrink-0" />
+            {t('common.edit')}
+          </Link>
         )}
       </div>
 

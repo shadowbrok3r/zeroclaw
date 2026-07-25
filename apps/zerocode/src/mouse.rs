@@ -1,7 +1,7 @@
 //! Reusable mouse interaction helpers for the TUI.
-//!
 //! Pure geometry + timing utilities. No pane-specific logic lives here.
 
+#[cfg(not(test))]
 use std::io::Write;
 use std::time::Instant;
 
@@ -14,13 +14,29 @@ pub(crate) fn in_rect(col: u16, row: u16, rect: Rect) -> bool {
     col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
 }
 
+/// The bottom-left help indicator text shared by every pane footer.
+pub(crate) const HELP_HINT: &str = " ?=help";
+
+/// Returns `true` when `(col, row)` falls on the help hint that panes render
+/// at the bottom-left of `content_area`. The clickable zone spans the hint
+/// width on the area's last row, tolerant of the leading space / border cell.
+pub(crate) fn help_hint_click(col: u16, row: u16, content_area: Rect) -> bool {
+    use unicode_width::UnicodeWidthStr;
+    if content_area.height == 0 {
+        return false;
+    }
+    let row_y = content_area.y + content_area.height - 1;
+    let hint = Rect {
+        x: content_area.x,
+        y: row_y,
+        width: UnicodeWidthStr::width(HELP_HINT) as u16,
+        height: 1,
+    };
+    in_rect(col, row, hint)
+}
+
 // ── List helpers ─────────────────────────────────────────────────
 
-/// Map a mouse click row to the item index in a bordered `List` widget.
-///
-/// Returns `None` if the click lands on a border or outside the item
-/// range. `scroll_offset` is `ListState::offset()` (the index of the
-/// first visible item).
 pub(crate) fn list_click_index(
     mouse_row: u16,
     list_area: Rect,
@@ -58,13 +74,6 @@ pub(crate) fn list_scroll(
 
 // ── Tab bar helpers ──────────────────────────────────────────────
 
-/// Map a click column to the tab index in a tab bar.
-///
-/// Each tab is rendered as a span occupying the label's *display width*
-/// (terminal columns), separated by `sep_width` columns (typically
-/// `" │ "` = 3). Display width — not byte length — is what the terminal
-/// lays out, so CJK (double-width) and combining glyphs hit-test correctly
-/// regardless of the locale's label lengths.
 pub(crate) fn tab_click_index(
     mouse_col: u16,
     mouse_row: u16,
@@ -90,25 +99,20 @@ pub(crate) fn tab_click_index(
     None
 }
 
-/// Map a click column to a mode (F-key number 1–5) in the app mode bar.
-///
-/// The mode bar renders each tab as: `key` + `label` + `" "`.
-/// E.g. `"F1"` + `" Dashboard "` + `" "`. Widths are measured in display
-/// columns so non-Latin labels (e.g. localized mode names) hit-test where
-/// they actually render, not where their byte length would put them.
 pub(crate) fn mode_bar_click(
     mouse_col: u16,
     mouse_row: u16,
     bar_area: Rect,
     labels: &[(&str, &str)],
 ) -> Option<u8> {
-    use unicode_width::UnicodeWidthStr;
     if !in_rect(mouse_col, mouse_row, bar_area) {
         return None;
     }
     let mut x = bar_area.x as usize;
     for (i, (key, label)) in labels.iter().enumerate() {
-        let w = UnicodeWidthStr::width(*key) + UnicodeWidthStr::width(*label) + 1; // +1 for trailing " "
+        let w = crate::display_width::display_width(key)
+            + crate::display_width::display_width(label)
+            + 1; // +1 for trailing " "
         if (mouse_col as usize) >= x && (mouse_col as usize) < x + w {
             return Some((i + 1) as u8);
         }
@@ -163,6 +167,7 @@ impl DoubleClickTracker {
 /// Works in most modern terminals (iTerm2, kitty, alacritty, WezTerm,
 /// foot, tmux with `set-clipboard on`). Terminals that don't support
 /// OSC 52 silently ignore the sequence.
+#[cfg(not(test))]
 pub(crate) fn copy_osc52(text: &str) {
     let encoded = base64_encode(text.as_bytes());
     // OSC 52 ; c ; <base64> ST
@@ -170,6 +175,9 @@ pub(crate) fn copy_osc52(text: &str) {
     let _ = std::io::stdout().write_all(seq.as_bytes());
     let _ = std::io::stdout().flush();
 }
+
+#[cfg(test)]
+pub(crate) fn copy_osc52(_text: &str) {}
 
 /// Minimal base64 encoder. Standard alphabet, with padding.
 pub(crate) fn base64_encode(input: &[u8]) -> String {
@@ -200,7 +208,7 @@ pub(crate) fn base64_encode(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{mode_bar_click, tab_click_index};
+    use super::{help_hint_click, mode_bar_click, tab_click_index};
     use ratatui::layout::Rect;
 
     fn bar(width: u16) -> Rect {
@@ -251,5 +259,20 @@ mod tests {
         assert_eq!(mode_bar_click(8, 0, bar(30), &labels), Some(1));
         assert_eq!(mode_bar_click(9, 0, bar(30), &labels), Some(2));
         assert_eq!(mode_bar_click(15, 0, bar(30), &labels), Some(2));
+    }
+
+    #[test]
+    fn help_hint_click_hits_bottom_left() {
+        let area = Rect {
+            x: 4,
+            y: 2,
+            width: 40,
+            height: 10,
+        };
+        let bottom = area.y + area.height - 1;
+        assert!(help_hint_click(area.x, bottom, area), "left edge");
+        assert!(help_hint_click(area.x + 5, bottom, area), "within hint");
+        assert!(!help_hint_click(area.x + 20, bottom, area), "past hint");
+        assert!(!help_hint_click(area.x, bottom - 1, area), "wrong row");
     }
 }

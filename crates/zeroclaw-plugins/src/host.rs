@@ -3,7 +3,7 @@
 use super::error::PluginError;
 use super::signature::{self, SignatureMode, VerificationResult};
 use super::{PluginCapability, PluginInfo, PluginManifest};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Subdirectory inside a skill-capable plugin that holds individual skills.
@@ -75,13 +75,41 @@ impl PluginHost {
         Ok(host)
     }
 
-    /// Parse the signature mode string from config into a `SignatureMode`.
-    pub fn parse_signature_mode(mode: &str) -> SignatureMode {
+    pub fn parse_signature_mode(mode: &str) -> Option<SignatureMode> {
         match mode.to_lowercase().as_str() {
-            "strict" => SignatureMode::Strict,
-            "permissive" => SignatureMode::Permissive,
-            _ => SignatureMode::Disabled,
+            "strict" => Some(SignatureMode::Strict),
+            "permissive" => Some(SignatureMode::Permissive),
+            "disabled" => Some(SignatureMode::Disabled),
+            _ => None,
         }
+    }
+
+    #[must_use]
+    pub fn resolve_signature_mode(mode: &str) -> SignatureMode {
+        Self::parse_signature_mode(mode).unwrap_or_else(|| {
+            let span = ::zeroclaw_log::__private::tracing::info_span!(
+                target: "zeroclaw_log_internal_attribution",
+                "zeroclaw_attribution",
+                zc_role_family = %::zeroclaw_api::attribution::Role::System.family_str(),
+                zc_role_type = "",
+                zc_attribution_field = %::zeroclaw_api::attribution::Role::System
+                    .attribution_field()
+                    .unwrap_or(""),
+                zc_composite_prefix = "",
+                zc_default_category = %::zeroclaw_api::attribution::Role::System.default_category(),
+                zc_alias = "plugins",
+            );
+            span.in_scope(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({ "signature_mode": mode })),
+                    "Unrecognized plugins.security.signature_mode; failing safe to strict"
+                );
+            });
+            SignatureMode::Strict
+        })
     }
 
     /// Discover plugins in the plugins directory.
@@ -90,6 +118,7 @@ impl PluginHost {
             return Ok(());
         }
 
+        let mut ambiguous_packages = HashSet::new();
         let entries = std::fs::read_dir(&self.plugins_dir)?;
         for entry in entries.flatten() {
             let path = entry.path();
@@ -107,6 +136,27 @@ impl PluginHost {
                     let manifest_toml = std::fs::read_to_string(&manifest_path).unwrap_or_default();
                     match self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest) {
                         Ok(verification) => {
+                            if ambiguous_packages.contains(&manifest.name) {
+                                continue;
+                            }
+                            if self.loaded.remove(&manifest.name).is_some() {
+                                ambiguous_packages.insert(manifest.name.clone());
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Load
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "plugin": manifest.name,
+                                        })
+                                    ),
+                                    "rejecting ambiguous duplicate plugin package"
+                                );
+                                continue;
+                            }
                             let wasm_path = manifest.wasm_path.as_deref().map(|p| path.join(p));
                             self.loaded.insert(
                                 manifest.name.clone(),
@@ -162,8 +212,10 @@ impl PluginHost {
         self.loaded.get(name).map(plugin_info_from_loaded)
     }
 
-    /// Install a plugin from a directory path.
-    pub fn install(&mut self, source: &str) -> Result<(), PluginError> {
+    /// Install a plugin from a directory path. Returns the installed
+    /// plugin's manifest name so callers can key follow-up work (config
+    /// seeding, messaging) off the canonical name rather than the source path.
+    pub fn install(&mut self, source: &str) -> Result<String, PluginError> {
         let source_path = PathBuf::from(source);
         let manifest_path = if source_path.is_dir() {
             source_path.join("manifest.toml")
@@ -233,6 +285,7 @@ impl PluginHost {
             }
         }
 
+        let installed_name = manifest.name.clone();
         self.loaded.insert(
             manifest.name.clone(),
             LoadedPlugin {
@@ -243,7 +296,7 @@ impl PluginHost {
             },
         );
 
-        Ok(())
+        Ok(installed_name)
     }
 
     /// Remove a plugin by name.
@@ -289,6 +342,14 @@ impl PluginHost {
             .collect()
     }
 
+    pub fn channel_plugin_details(&self) -> Vec<(&PluginManifest, &Path)> {
+        self.loaded
+            .values()
+            .filter(|p| p.manifest.capabilities.contains(&PluginCapability::Channel))
+            .filter_map(|p| p.wasm_path.as_deref().map(|wp| (&p.manifest, wp)))
+            .collect()
+    }
+
     /// Get skill-capable plugins.
     pub fn skill_plugins(&self) -> Vec<&PluginManifest> {
         self.loaded
@@ -298,12 +359,6 @@ impl PluginHost {
             .collect()
     }
 
-    /// Get skill-capable plugins paired with the absolute path to their `skills/`
-    /// directory. Plugins without an existing `skills/` subdirectory are skipped.
-    ///
-    /// Callers (typically the runtime skill loader) should pass each `skills_dir`
-    /// to `load_skills_from_directory` and then re-namespace the resulting skill
-    /// names as `plugin:<plugin>/<skill>` to avoid collisions with user skills.
     pub fn skill_plugin_details(&self) -> Vec<(&PluginManifest, PathBuf)> {
         self.loaded
             .values()
@@ -350,6 +405,8 @@ fn validate_manifest_shape(
     manifest: &PluginManifest,
     plugin_dir: &Path,
 ) -> Result<(), PluginError> {
+    crate::instance::validate_package_name(&manifest.name).map_err(PluginError::InvalidManifest)?;
+
     if manifest.capabilities.is_empty() {
         return Err(PluginError::InvalidManifest(format!(
             "plugin '{}' declares no capabilities",
@@ -485,14 +542,6 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), PluginError> {
     Ok(())
 }
 
-/// Move every plugin (a subdirectory containing a `manifest.toml`) from `from`
-/// into `to`, returning the number moved.
-///
-/// Uses `rename`, falling back to a recursive copy + remove when the source and
-/// destination live on different filesystems. An existing `to/<name>` is never
-/// overwritten — that plugin is skipped. A missing or empty `from` is a no-op.
-/// Used by `zeroclaw plugin migrate` to relocate plugins stranded in legacy
-/// install directories into the configured one.
 pub fn migrate_plugins_dir(from: &Path, to: &Path) -> Result<usize, PluginError> {
     let Ok(entries) = std::fs::read_dir(from) else {
         return Ok(0);
@@ -611,7 +660,7 @@ capabilities = ["tool"]
 
     #[test]
     fn install_then_discover_round_trip_uses_same_dir() {
-        // Regression for the install/discovery path divergence (issue #6254):
+        // Regression for the install/discovery path divergence
         // a plugin installed into a resolved plugins dir must be discoverable
         // by a fresh host pointed at the *same* dir.
         let src = tempdir().unwrap();
@@ -850,6 +899,39 @@ capabilities = ["tool"]
     }
 
     #[test]
+    fn manifest_name_must_be_a_canonical_package_slug() {
+        let dir = tempdir().unwrap();
+        let plugin_dir = dir.path().join("plugins").join("unsafe-name");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            "name = \"../escape\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n",
+        )
+        .unwrap();
+
+        let host = PluginHost::new(dir.path()).unwrap();
+        assert!(host.list_plugins().is_empty());
+    }
+
+    #[test]
+    fn duplicate_package_names_are_all_rejected() {
+        let dir = tempdir().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        for directory in ["first", "second"] {
+            let plugin_dir = plugins_dir.join(directory);
+            std::fs::create_dir_all(&plugin_dir).unwrap();
+            std::fs::write(
+                plugin_dir.join("manifest.toml"),
+                "name = \"shared\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n",
+            )
+            .unwrap();
+        }
+
+        let host = PluginHost::new(dir.path()).unwrap();
+        assert!(host.get_plugin("shared").is_none());
+    }
+
+    #[test]
     fn test_skill_plugin_missing_skills_dir_is_rejected() {
         let dir = tempdir().unwrap();
         let plugin_dir = dir.path().join("plugins").join("empty-skills");
@@ -912,5 +994,137 @@ capabilities = ["tool"]
         assert!(host.tool_plugin_details().is_empty());
         assert!(host.channel_plugins().is_empty());
         assert_eq!(host.skill_plugins().len(), 1);
+    }
+
+    fn write_unsigned_tool_plugin(plugins_dir: &Path, name: &str) {
+        let plugin_dir = plugins_dir.join(name);
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            format!(
+                "name = \"{name}\"\nversion = \"0.1.0\"\ncapabilities = [\"tool\"]\nwasm_path = \"plugin.wasm\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
+    }
+
+    fn write_channel_plugin(plugins_dir: &Path, name: &str, with_wasm: bool) {
+        let plugin_dir = plugins_dir.join(name);
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let wasm_line = if with_wasm {
+            "wasm_path = \"plugin.wasm\"\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            format!(
+                "name = \"{name}\"\nversion = \"0.1.0\"\ncapabilities = [\"channel\"]\n{wasm_line}"
+            ),
+        )
+        .unwrap();
+        if with_wasm {
+            std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
+        }
+    }
+
+    #[test]
+    fn channel_plugin_details_yields_only_wasm_backed_channels() {
+        let dir = tempdir().unwrap();
+        let plugins_base = dir.path().join("plugins");
+        write_channel_plugin(&plugins_base, "with-wasm", true);
+        write_channel_plugin(&plugins_base, "no-wasm", false);
+
+        let host = PluginHost::new(dir.path()).unwrap();
+        let details = host.channel_plugin_details();
+        assert_eq!(
+            details.len(),
+            1,
+            "a channel manifest with no wasm_path is not registrable as a live channel"
+        );
+        assert_eq!(details[0].0.name, "with-wasm");
+        assert!(details[0].1.ends_with("plugin.wasm"));
+    }
+
+    #[test]
+    fn from_plugins_dir_with_security_strict_drops_unsigned_plugin() {
+        let dir = tempdir().unwrap();
+        write_unsigned_tool_plugin(dir.path(), "unsigned-tool");
+
+        let host = PluginHost::from_plugins_dir_with_security(
+            dir.path(),
+            SignatureMode::Strict,
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert!(
+            host.list_plugins().is_empty(),
+            "strict mode must reject an unsigned plugin during discovery"
+        );
+    }
+
+    #[test]
+    fn from_plugins_dir_with_security_disabled_loads_unsigned_plugin() {
+        let dir = tempdir().unwrap();
+        write_unsigned_tool_plugin(dir.path(), "unsigned-tool");
+
+        let host = PluginHost::from_plugins_dir_with_security(
+            dir.path(),
+            SignatureMode::Disabled,
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            host.list_plugins().len(),
+            1,
+            "disabled mode must load an unsigned plugin"
+        );
+    }
+
+    #[test]
+    fn from_plugins_dir_with_security_permissive_loads_unsigned_plugin() {
+        let dir = tempdir().unwrap();
+        write_unsigned_tool_plugin(dir.path(), "unsigned-tool");
+
+        let host = PluginHost::from_plugins_dir_with_security(
+            dir.path(),
+            SignatureMode::Permissive,
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            host.list_plugins().len(),
+            1,
+            "permissive mode must load an unsigned plugin (untrusted and invalid signatures also load with a warning in permissive mode, covered in signature.rs)"
+        );
+    }
+
+    #[test]
+    fn parse_signature_mode_maps_config_strings() {
+        assert_eq!(
+            PluginHost::parse_signature_mode("strict"),
+            Some(SignatureMode::Strict)
+        );
+        assert_eq!(
+            PluginHost::parse_signature_mode("permissive"),
+            Some(SignatureMode::Permissive)
+        );
+        assert_eq!(
+            PluginHost::parse_signature_mode("disabled"),
+            Some(SignatureMode::Disabled)
+        );
+        // Case-insensitive: to_lowercase normalizes before matching.
+        assert_eq!(
+            PluginHost::parse_signature_mode("STRICT"),
+            Some(SignatureMode::Strict)
+        );
+        // Unrecognized values return None so the caller fails safe instead of
+        // silently degrading to the weakest posture on a config typo.
+        assert_eq!(PluginHost::parse_signature_mode("nonsense"), None);
+        assert_eq!(PluginHost::parse_signature_mode("sttict"), None);
     }
 }

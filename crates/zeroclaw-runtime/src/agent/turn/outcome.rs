@@ -21,13 +21,6 @@ pub fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
     err.chain().any(|source| source.is::<ToolLoopCancelled>())
 }
 
-/// A provider stream failed *after* caller-visible output (text chunks,
-/// thinking, pre-executed tool events) was already forwarded on `event_tx`.
-///
-/// Carries the text accumulated before the failure so the loop can persist
-/// the visible partial. Unlike a pre-output stream failure, this must NOT
-/// trigger the non-streaming fallback: a retry would duplicate already
-/// delivered output on append-only consumers (WS/RPC/ACP).
 #[derive(Debug)]
 pub(crate) struct StreamInterruptedAfterOutput {
     pub(crate) partial_text: String,
@@ -42,16 +35,6 @@ impl std::fmt::Display for StreamInterruptedAfterOutput {
 
 impl std::error::Error for StreamInterruptedAfterOutput {}
 
-/// The user cancelled mid-stream *after* caller-visible text was already
-/// forwarded on `event_tx`.
-///
-/// Carries the forwarded text so the loop can persist the visible partial
-/// with the `[interrupted by user]` marker — the pre-consolidation streaming
-/// engine committed the watched partial on cancel, and losing it makes the
-/// transcript disagree with what the user saw stream. Chains to
-/// [`ToolLoopCancelled`] via `source()`, so [`is_tool_loop_cancelled`] (and
-/// every caller built on it: the no-fallback rule, the fixed observer
-/// message, the wrappers' cancel arms) recognizes it unchanged.
 #[derive(Debug)]
 pub(crate) struct StreamCancelledAfterOutput {
     pub(crate) partial_text: String,
@@ -102,4 +85,48 @@ pub fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, String)
         .filter_map(|source| source.downcast_ref::<ModelSwitchRequested>())
         .map(|e| (e.model_provider.clone(), e.model.clone()))
         .next()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_loop_cancelled_display() {
+        let err = ToolLoopCancelled;
+        assert_eq!(err.to_string(), "tool loop cancelled");
+    }
+
+    #[test]
+    fn is_tool_loop_cancelled_direct() {
+        let err = anyhow::Error::new(ToolLoopCancelled);
+        assert!(is_tool_loop_cancelled(&err));
+    }
+
+    #[test]
+    fn is_tool_loop_cancelled_unrelated_error_returns_false() {
+        let err = anyhow::Error::msg("some other error");
+        assert!(!is_tool_loop_cancelled(&err));
+    }
+
+    #[test]
+    fn stream_cancelled_after_output_display() {
+        let e = StreamCancelledAfterOutput::new("partial text".to_string());
+        assert_eq!(e.to_string(), "tool loop cancelled after streamed output");
+        assert_eq!(e.partial_text, "partial text");
+    }
+
+    #[test]
+    fn stream_cancelled_after_output_source_chains_to_tool_loop_cancelled() {
+        use std::error::Error;
+        let e = StreamCancelledAfterOutput::new(String::new());
+        let source = e.source().expect("must have source");
+        assert!(source.is::<ToolLoopCancelled>());
+    }
+
+    #[test]
+    fn is_tool_loop_cancelled_recognizes_stream_cancelled_after_output() {
+        let e = anyhow::Error::new(StreamCancelledAfterOutput::new("txt".to_string()));
+        assert!(is_tool_loop_cancelled(&e));
+    }
 }

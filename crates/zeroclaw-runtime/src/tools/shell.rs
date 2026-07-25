@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::platform::is_android;
-use zeroclaw_api::tool::{Tool, ToolResult, with_ephemeral_workspace_warning};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
@@ -93,13 +93,6 @@ pub struct ShellTool {
     /// real shell environment (PATH, credentials, etc.) reach subprocesses
     /// even though the daemon itself may have a stripped-down env.
     tui_env: Option<HashMap<String, String>>,
-    /// Whether workspace writes performed by the command persist on the host.
-    /// `false` when the runtime uses an ephemeral sandbox (e.g. Docker without
-    /// a workspace volume mount), in which case files written via shell succeed
-    /// inside the container but are invisible on the host and discarded at
-    /// session end. The shell tool can't tell a read from a write, so rather
-    /// than refusing (like `file_write`) it attaches a loud warning to every
-    /// executed command's result. See issue #4627.
     persistent_writes: bool,
 }
 
@@ -132,12 +125,6 @@ impl ShellTool {
         }
     }
 
-    /// Mark whether the active runtime persists workspace writes to the host.
-    ///
-    /// Pass `false` for an ephemeral runtime (Docker tmpfs / no volume mount)
-    /// to attach a loud ephemeral-workspace warning to every executed command,
-    /// so silent data loss is visible (issue #4627). Defaults to `true`,
-    /// preserving existing behaviour on native runtimes and in tests.
     pub fn with_persistent_writes(mut self, persistent: bool) -> Self {
         self.persistent_writes = persistent;
         self
@@ -150,7 +137,6 @@ impl ShellTool {
     }
 
     /// Overlay the TUI client's environment on top of the safe-env snapshot.
-    ///
     /// Pass `Some(env)` to enable forwarding; `None` is a no-op (same as not
     /// calling this method at all).
     pub fn with_tui_env(mut self, env: Option<HashMap<String, String>>) -> Self {
@@ -159,15 +145,6 @@ impl ShellTool {
     }
 }
 
-/// Decode raw process output bytes to a UTF-8 String.
-///
-/// On Windows, cmd.exe emits bytes in the active console output code page
-/// (e.g. CP936/GBK on Simplified Chinese systems). We query the code page at
-/// runtime and transcode via `encoding_rs` so non-ASCII characters survive
-/// intact instead of being replaced by U+FFFD.
-///
-/// On all other platforms the shell runs under the user's locale (usually
-/// UTF-8 already), so `from_utf8_lossy` is sufficient.
 #[cfg(target_os = "windows")]
 fn decode_output(bytes: &[u8]) -> String {
     use windows::Win32::Globalization::GetACP;
@@ -311,7 +288,7 @@ impl Tool for ShellTool {
             Err(reason) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(reason),
                 });
             }
@@ -328,14 +305,14 @@ impl Tool for ShellTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to build runtime command: {e}")),
                 });
             }
         };
 
         // Apply sandbox wrapping before execution.
-        // The Sandbox trait operates on std::process::Command, so use as_std_mut()
+        // The Sandbox trait operates on std::process::Command, so use as_std_mut
         // to get a mutable reference to the underlying command.
         self.sandbox.wrap_command(cmd.as_std_mut()).map_err(|e| {
             ::zeroclaw_log::record!(
@@ -400,7 +377,7 @@ impl Tool for ShellTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to spawn command: {e}")),
                 });
             }
@@ -412,45 +389,30 @@ impl Tool for ShellTool {
         let stdout_handle = child.stdout.take();
         let stderr_handle = child.stderr.take();
 
-        let drain_stdout = drain_capped(stdout_handle, MAX_OUTPUT_BYTES);
-        let drain_stderr = drain_capped(stderr_handle, MAX_OUTPUT_BYTES);
-        let wait_fut = async {
-            let status = child.wait().await?;
-            #[cfg(unix)]
-            group_guard.disarm();
-            let (out, err) = tokio::join!(
-                tokio::time::timeout(POST_EXIT_DRAIN, drain_stdout),
-                tokio::time::timeout(POST_EXIT_DRAIN, drain_stderr),
-            );
-            Ok::<_, std::io::Error>((status, out.unwrap_or_default(), err.unwrap_or_default()))
-        };
+        let stdout_drain = spawn_drain(stdout_handle, MAX_OUTPUT_BYTES);
+        let stderr_drain = spawn_drain(stderr_handle, MAX_OUTPUT_BYTES);
 
         let mut result =
-            match tokio::time::timeout(Duration::from_secs(timeout_secs), wait_fut).await {
-                Ok(Ok((status, stdout_bytes, stderr_bytes))) => {
-                    let mut stdout = decode_output(&stdout_bytes);
-                    let mut stderr = decode_output(&stderr_bytes);
+            match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
+                Ok(Ok(status)) => {
+                    #[cfg(unix)]
+                    group_guard.disarm();
+                    let (stdout_capture, stderr_capture) =
+                        tokio::join!(finish_drain(stdout_drain), finish_drain(stderr_drain));
 
-                    if stdout.len() > MAX_OUTPUT_BYTES {
-                        let mut b = MAX_OUTPUT_BYTES.min(stdout.len());
-                        while b > 0 && !stdout.is_char_boundary(b) {
-                            b -= 1;
-                        }
-                        stdout.truncate(b);
-                        stdout.push_str("\n... [output truncated at 1MB]");
+                    let mut stdout = decode_output(&stdout_capture.bytes);
+                    let mut stderr = decode_output(&stderr_capture.bytes);
+
+                    if stdout_capture.truncated || stdout.len() > MAX_OUTPUT_BYTES {
+                        append_truncation_marker(&mut stdout, "\n... [output truncated at 1MB]");
                     }
-                    if stderr.len() > MAX_OUTPUT_BYTES {
-                        let mut b = MAX_OUTPUT_BYTES.min(stderr.len());
-                        while b > 0 && !stderr.is_char_boundary(b) {
-                            b -= 1;
-                        }
-                        stderr.truncate(b);
-                        stderr.push_str("\n... [stderr truncated at 1MB]");
+                    if stderr_capture.truncated || stderr.len() > MAX_OUTPUT_BYTES {
+                        append_truncation_marker(&mut stderr, "\n... [stderr truncated at 1MB]");
                     }
 
                     ToolResult {
                         success: status.success(),
-                        output: stdout,
+                        output: stdout.into(),
                         error: if stderr.is_empty() {
                             None
                         } else {
@@ -458,26 +420,33 @@ impl Tool for ShellTool {
                         },
                     }
                 }
-                Ok(Err(e)) => ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to execute command: {e}")),
-                },
-                Err(_) => ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "Command timed out after {timeout_secs}s and was killed"
-                    )),
-                },
+                Ok(Err(e)) => {
+                    tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
+                    ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("Failed to execute command: {e}")),
+                    }
+                }
+                Err(_) => {
+                    let _ = child.start_kill();
+                    tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
+                    ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!(
+                            "Command timed out after {timeout_secs}s and was killed"
+                        )),
+                    }
+                }
             };
 
         // The command ran inside an ephemeral workspace: any files it wrote are
-        // invisible on the host and discarded at session end (issue #4627).
+        // invisible on the host and discarded at session end
         // Inject the warning into whichever field the dispatcher surfaces to the
         // model — `output` on success, `error` on failure — so it is never lost.
         if !self.persistent_writes {
-            result.output = with_ephemeral_workspace_warning(&result.output);
+            result.output = with_ephemeral_workspace_warning(&result.output).into();
             if let Some(err) = result.error.take() {
                 result.error = Some(with_ephemeral_workspace_warning(&err));
             }
@@ -487,30 +456,90 @@ impl Tool for ShellTool {
     }
 }
 
-async fn drain_capped<R>(reader: Option<R>, cap: usize) -> Vec<u8>
+struct DrainHandle {
+    task: tokio::task::JoinHandle<()>,
+    output: Arc<std::sync::Mutex<DrainOutput>>,
+}
+
+#[derive(Clone, Default)]
+struct DrainOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn spawn_drain<R>(reader: Option<R>, cap: usize) -> DrainHandle
 where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let output = Arc::new(std::sync::Mutex::new(DrainOutput::default()));
+    let shared = Arc::clone(&output);
+    let task = zeroclaw_spawn::spawn!(async move {
+        drain_capped_into(reader, cap, shared).await;
+    });
+    DrainHandle { task, output }
+}
+
+async fn finish_drain(mut drain: DrainHandle) -> DrainOutput {
+    if tokio::time::timeout(POST_EXIT_DRAIN, &mut drain.task)
+        .await
+        .is_err()
+    {
+        drain.task.abort();
+        let _ = drain.task.await;
+    }
+
+    drain
+        .output
+        .lock()
+        .map(|output| output.clone())
+        .unwrap_or_default()
+}
+
+async fn abort_drain(drain: DrainHandle) {
+    drain.task.abort();
+    let _ = drain.task.await;
+}
+
+async fn drain_capped_into<R>(
+    reader: Option<R>,
+    cap: usize,
+    output: Arc<std::sync::Mutex<DrainOutput>>,
+) where
     R: tokio::io::AsyncRead + Unpin,
 {
     use tokio::io::AsyncReadExt;
     let Some(mut reader) = reader else {
-        return Vec::new();
+        return;
     };
-    let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
         match reader.read(&mut chunk).await {
             Ok(0) => break,
             Ok(n) => {
-                let take = n.min(cap.saturating_sub(buf.len()).max(1));
-                buf.extend_from_slice(&chunk[..take]);
-                if buf.len() >= cap {
+                let Ok(mut capture) = output.lock() else {
                     break;
+                };
+                let remaining = cap.saturating_sub(capture.bytes.len());
+                if remaining > 0 {
+                    let take = n.min(remaining);
+                    capture.bytes.extend_from_slice(&chunk[..take]);
+                    capture.truncated |= take < n;
+                } else {
+                    capture.truncated = true;
                 }
             }
             Err(_) => break,
         }
     }
-    buf
+}
+
+fn append_truncation_marker(output: &mut String, marker: &str) {
+    let mut boundary = MAX_OUTPUT_BYTES.min(output.len());
+    while boundary > 0 && !output.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    output.truncate(boundary);
+    output.push_str(marker);
 }
 
 /// Compose the child `PATH` for an Android shell: the platform tool dirs
@@ -584,8 +613,56 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
+    fn unrestricted_shell_test_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        })
+    }
+
     fn test_runtime() -> Arc<dyn RuntimeAdapter> {
         Arc::new(NativeRuntime::new())
+    }
+
+    #[cfg(windows)]
+    fn stdin_reader_command() -> &'static str {
+        "more"
+    }
+
+    #[cfg(not(windows))]
+    fn stdin_reader_command() -> &'static str {
+        "cat"
+    }
+
+    #[cfg(windows)]
+    fn success_with_stderr_command() -> &'static str {
+        "echo out && echo warn 1>&2"
+    }
+
+    #[cfg(not(windows))]
+    fn success_with_stderr_command() -> &'static str {
+        "echo out; echo warn >&2"
+    }
+
+    #[cfg(windows)]
+    fn medium_risk_write_command() -> &'static str {
+        "copy /Y NUL zeroclaw_shell_approval_test"
+    }
+
+    #[cfg(not(windows))]
+    fn medium_risk_write_command() -> &'static str {
+        "touch zeroclaw_shell_approval_test"
+    }
+
+    fn medium_risk_write_base() -> &'static str {
+        medium_risk_write_command()
+            .split_whitespace()
+            .next()
+            .expect("medium-risk test command should have a base command")
     }
 
     /// Returns the fully-wrapped shell tool as it is composed in production:
@@ -632,17 +709,21 @@ mod tests {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: std::env::temp_dir(),
-            allowed_commands: vec!["cat".into()],
+            allowed_commands: vec![stdin_reader_command().into()],
             ..SecurityPolicy::default()
         });
         let tool = ShellTool::new(security, test_runtime());
-        let fut = tool.execute(json!({"command": "cat"}));
+        let fut = tool.execute(json!({"command": stdin_reader_command()}));
         let res = tokio::time::timeout(std::time::Duration::from_secs(10), fut).await;
         assert!(
             res.is_ok(),
             "a stdin-reading command hung — stdin is not null and may reach the terminal"
         );
-        assert!(res.unwrap().expect("cat should return a result").success);
+        assert!(
+            res.unwrap()
+                .expect("stdin reader should return a result")
+                .success
+        );
     }
 
     #[tokio::test]
@@ -711,11 +792,8 @@ mod tests {
         assert!(!result.success);
     }
 
-    // ── Ephemeral-workspace warning (issue #4627) ────────────────
+    // ── Ephemeral-workspace warning────────────────
 
-    /// On an ephemeral runtime the shell tool stays usable but every executed
-    /// command's output carries a loud warning so writes that won't persist are
-    /// visible. The original command output must be preserved below the banner.
     #[tokio::test]
     async fn shell_warns_on_ephemeral_workspace() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime())
@@ -742,9 +820,6 @@ mod tests {
         );
     }
 
-    /// A failed command surfaces `error`, not `output`, to the model. The
-    /// ephemeral warning must be injected into the error field too so it is
-    /// never lost on the failure path.
     #[tokio::test]
     async fn shell_warns_on_ephemeral_workspace_failure_path() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime())
@@ -765,16 +840,12 @@ mod tests {
         );
     }
 
-    /// A command that exits 0 but also writes to stderr yields
-    /// `{ success: true, output, error: Some }`. The dispatcher shows `output`
-    /// on success, but the banner must land in BOTH fields so it survives
-    /// regardless of which the model reads. Exercises the dual-field branch.
     #[tokio::test]
     async fn shell_warns_on_ephemeral_success_with_stderr() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime())
             .with_persistent_writes(false);
         let result = tool
-            .execute(json!({"command": "echo out; echo warn >&2"}))
+            .execute(json!({"command": success_with_stderr_command()}))
             .await
             .expect("command should run");
         assert!(
@@ -794,7 +865,6 @@ mod tests {
         );
     }
 
-    /// On a persistent runtime (the default) no warning is attached.
     #[tokio::test]
     async fn shell_no_warning_when_persistent() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
@@ -1097,14 +1167,14 @@ mod tests {
     async fn shell_requires_approval_for_medium_risk_command() {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            allowed_commands: vec!["touch".into()],
+            allowed_commands: vec![medium_risk_write_base().into()],
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
 
         let tool = ShellTool::new(security.clone(), test_runtime());
         let denied = tool
-            .execute(json!({"command": "touch zeroclaw_shell_approval_test"}))
+            .execute(json!({"command": medium_risk_write_command()}))
             .await
             .expect("unapproved command should return a result");
         assert!(!denied.success);
@@ -1118,7 +1188,7 @@ mod tests {
 
         let allowed = tool
             .execute(json!({
-                "command": "touch zeroclaw_shell_approval_test",
+                "command": medium_risk_write_command(),
                 "approved": true
             }))
             .await
@@ -1143,6 +1213,101 @@ mod tests {
         assert_eq!(
             MAX_OUTPUT_BYTES, 1_048_576,
             "max output must be 1 MB to prevent OOM"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_drains_large_stdout_while_child_runs() {
+        let tool =
+            ShellTool::new(unrestricted_shell_test_security(), test_runtime()).with_timeout_secs(2);
+        let result = tool
+            .execute(json!({
+                "command": "awk 'BEGIN { for (i = 0; i < 200000; i++) printf \"x\" }'"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "large stdout command should not time out: {:?}",
+            result.error
+        );
+        assert_eq!(
+            result.output.len(),
+            200_000,
+            "stdout should be drained while the child is still running"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_marks_stdout_truncated_after_limit() {
+        let tool =
+            ShellTool::new(unrestricted_shell_test_security(), test_runtime()).with_timeout_secs(2);
+        let result = tool
+            .execute(json!({
+                "command": "awk 'BEGIN { for (i = 0; i < 1048600; i++) printf \"x\" }'"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "large stdout command should complete: {:?}",
+            result.error
+        );
+        assert!(
+            result.output.ends_with("\n... [output truncated at 1MB]"),
+            "stdout should retain the truncation marker after the drain cap"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_marks_stderr_truncated_after_limit() {
+        let tool =
+            ShellTool::new(unrestricted_shell_test_security(), test_runtime()).with_timeout_secs(2);
+        let result = tool
+            .execute(json!({
+                "command": "awk 'BEGIN { for (i = 0; i < 1048600; i++) printf \"x\" }' 1>&2"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "large stderr command should complete: {:?}",
+            result.error
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .ends_with("\n... [stderr truncated at 1MB]"),
+            "stderr should retain the truncation marker after the drain cap"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_keeps_output_when_grandchild_holds_pipe_open() {
+        let tool =
+            ShellTool::new(unrestricted_shell_test_security(), test_runtime()).with_timeout_secs(2);
+        let result = tool
+            .execute(json!({"command": "printf done; (sleep 1) &"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "main shell process should complete: {:?}",
+            result.error
+        );
+        assert!(
+            result.output.contains("done"),
+            "output drained before EOF should be preserved when a grandchild holds the pipe open"
         );
     }
 

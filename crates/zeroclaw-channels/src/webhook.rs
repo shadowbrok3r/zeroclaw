@@ -102,7 +102,6 @@ impl WebhookChannel {
         Duration::from_millis(capped)
     }
 
-    /// Verify an incoming request's signature if a secret is configured.
     #[cfg(test)]
     fn verify_signature(&self, body: &[u8], signature: Option<&str>) -> bool {
         let Some(ref secret) = self.secret else {
@@ -164,11 +163,6 @@ impl WebhookChannel {
             .and_then(|v| v.to_str().ok())
             .and_then(parse_retry_after_ms);
 
-        // 429 and 503 may include Retry-After; honor it if present. 429 appears here
-        // *and* in the branch below: here we take the server-supplied delay, below we
-        // fall back to exponential backoff when no Retry-After header was sent.
-        // Reading the body is deferred until after this early-return so hot 429 loops
-        // against large pages don't pay the I/O cost.
         if (code == 429 || code == 503)
             && let Some(ms) = retry_after
         {
@@ -357,6 +351,18 @@ impl Channel for WebhookChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+        // Fail-fast: a webhook with no secret accepts *all* incoming requests,
+        // including unauthenticated ones.  Refuse to start so the operator is
+        // forced to configure a secret.
+        if self.secret.is_none() {
+            anyhow::bail!(
+                "webhook channel requires a `secret` configured for request \
+                 authentication; set [channels.webhook.{}].secret in config \
+                 or remove the channel to silence this error",
+                self.alias,
+            );
+        }
+
         use axum::{
             Router,
             body::Bytes,
@@ -465,6 +471,8 @@ impl Channel for WebhookChannel {
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             };
 
             if state.tx.send(msg).await.is_err() {
@@ -507,6 +515,15 @@ impl Channel for WebhookChannel {
         // Webhook channel is healthy if the port can be bound (basic check).
         // In practice, once listen() starts the server is running.
         true
+    }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No back-channel to a generic webhook client for a typing signal.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 
@@ -796,6 +813,18 @@ mod tests {
         assert_eq!(json["content"], "response");
         assert!(json.get("thread_id").is_none());
         assert!(json.get("recipient").is_none());
+    }
+
+    #[tokio::test]
+    async fn listen_requires_secret() {
+        let ch = make_channel(); // no secret
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let err = ch.listen(tx).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires a `secret`"),
+            "expected error about missing secret, got: {msg}",
+        );
     }
 
     #[test]

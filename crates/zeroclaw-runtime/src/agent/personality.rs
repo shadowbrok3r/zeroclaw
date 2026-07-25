@@ -1,9 +1,5 @@
 //! Personality system — loads workspace identity files (SOUL.md, IDENTITY.md,
 //! USER.md) and injects them into the system prompt pipeline.
-//!
-//! Ported from RustyClaw `src/agent/personality.rs`.  The loader reads markdown
-//! files from the workspace root, validates size limits, and produces a
-//! [`PersonalityProfile`] that the prompt builder can render.
 
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
@@ -23,11 +19,6 @@ pub const PERSONALITY_FILES: &[&str] = &[
     "MEMORY.md",
 ];
 
-/// Subset of [`PERSONALITY_FILES`] that the dashboard exposes for
-/// authoring. `BOOTSTRAP.md` is deliberately excluded: it's a
-/// first-run scaffold the agent reads once and deletes, not a file
-/// the user is meant to hand-edit. The runtime still injects it when
-/// it exists on disk.
 pub const EDITABLE_PERSONALITY_FILES: &[&str] = &[
     "SOUL.md",
     "IDENTITY.md",
@@ -94,11 +85,29 @@ impl PersonalityProfile {
 }
 
 /// Loads personality files from a workspace directory.
-///
 /// Each well-known file is read and validated.  Missing files are recorded
 /// in `PersonalityProfile::missing` rather than treated as errors.
 pub fn load_personality(workspace_dir: &Path) -> PersonalityProfile {
     load_personality_files(workspace_dir, PERSONALITY_FILES)
+}
+
+pub async fn seed_default_personality(
+    config: &zeroclaw_config::schema::Config,
+    alias: &str,
+    workspace_dir: &Path,
+) -> std::io::Result<Vec<&'static str>> {
+    use zeroclaw_config::multi_agent::MemoryBackendKind;
+    let include_memory = config
+        .agents
+        .get(alias)
+        .map(|agent| agent.memory.backend != MemoryBackendKind::None)
+        .unwrap_or(true);
+    let ctx = crate::agent::personality_templates::TemplateContext {
+        agent: alias.to_string(),
+        include_memory,
+        ..Default::default()
+    };
+    crate::agent::personality_templates::ensure_personality_preset(workspace_dir, &ctx).await
 }
 
 /// Load a specific set of personality files from a workspace directory.
@@ -264,5 +273,71 @@ mod tests {
         assert!(profile.is_empty());
         assert!(!profile.missing.is_empty());
         let _ = std::fs::remove_dir_all(ws);
+    }
+
+    fn config_with_agent_memory_backend(
+        alias: &str,
+        backend: zeroclaw_config::multi_agent::MemoryBackendKind,
+    ) -> zeroclaw_config::schema::Config {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.agents.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                memory: zeroclaw_config::multi_agent::AgentMemoryConfig { backend },
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    #[tokio::test]
+    async fn seed_default_personality_memoryless_agent_uses_no_memory_variant() {
+        use zeroclaw_config::multi_agent::MemoryBackendKind;
+        let dir = tempfile::tempdir().unwrap();
+        // The agent's OWN backend is `none`, even though the install-wide
+        // default (config.memory.backend) is memory-enabled (sqlite).
+        let config = config_with_agent_memory_backend("clawdia", MemoryBackendKind::None);
+        assert_eq!(config.memory.backend.as_str(), "sqlite");
+
+        let written = seed_default_personality(&config, "clawdia", dir.path())
+            .await
+            .unwrap();
+
+        // MEMORY.md must be skipped for a memoryless agent.
+        assert!(
+            !written.contains(&"MEMORY.md"),
+            "memoryless agent must not be seeded MEMORY.md"
+        );
+        assert!(
+            !dir.path().join("MEMORY.md").exists(),
+            "MEMORY.md must not exist on disk for a none-backend agent"
+        );
+        // AGENTS.md must be the no-memory variant.
+        let agents = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        assert!(
+            agents.contains("memory.backend = \"none\""),
+            "memoryless agent must get the no-memory AGENTS.md variant, got:\n{agents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_default_personality_memory_agent_gets_memory_variant() {
+        use zeroclaw_config::multi_agent::MemoryBackendKind;
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_agent_memory_backend("clawdia", MemoryBackendKind::Sqlite);
+
+        let written = seed_default_personality(&config, "clawdia", dir.path())
+            .await
+            .unwrap();
+
+        assert!(
+            written.contains(&"MEMORY.md"),
+            "a memory-backed agent must be seeded MEMORY.md"
+        );
+        let agents = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        assert!(
+            agents.contains("Daily notes"),
+            "memory-backed agent must get the memory-on AGENTS.md variant"
+        );
     }
 }

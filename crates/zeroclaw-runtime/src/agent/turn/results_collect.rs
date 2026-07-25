@@ -3,7 +3,8 @@
 //! identical-output abort.
 
 use crate::agent::history::{
-    append_or_merge_system_message, canonicalize_tool_result_media_markers, truncate_tool_result,
+    append_or_merge_system_message, canonicalize_tool_result_media_markers_for,
+    truncate_tool_result,
 };
 use crate::agent::loop_detector::LoopDetector;
 use crate::agent::tool_execution::ToolExecutionOutcome;
@@ -55,20 +56,26 @@ pub(crate) fn collect_tool_results(
         .filter_map(|(i, opt)| opt.map(|v| (i, v)))
     {
         if !loop_ignore_tools.contains(tool_name.as_str()) {
-            detection_relevant_output.push_str(&outcome.output);
+            if outcome.success {
+                detection_relevant_output.push_str(&outcome.output);
+            }
 
-            // Feed the pattern-based loop detector with name + args + result.
             let args = tool_calls
                 .get(result_index)
                 .map(|c| &c.arguments)
                 .unwrap_or(&serde_json::Value::Null);
-            let det_result = loop_detector.record(&tool_name, args, &outcome.output);
+            let det_result = if outcome.success {
+                loop_detector.record(&tool_name, args, &outcome.output)
+            } else {
+                crate::agent::loop_detector::LoopDetectionResult::Ok
+            };
             match det_result {
                 crate::agent::loop_detector::LoopDetectionResult::Ok => {}
                 crate::agent::loop_detector::LoopDetectionResult::Warning(ref msg) => {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Tool)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(
                                 ::serde_json::json!({"tool": tool_name, "msg": msg.to_string()})
@@ -80,8 +87,9 @@ pub(crate) fn collect_tool_results(
                 crate::agent::loop_detector::LoopDetectionResult::Block(ref msg) => {
                     ::zeroclaw_log::record!(
                         WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_category(::zeroclaw_log::EventCategory::Tool)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(
                                 ::serde_json::json!({"tool": tool_name, "msg": msg.to_string()})
                             ),
@@ -98,6 +106,7 @@ pub(crate) fn collect_tool_results(
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_category(::zeroclaw_log::EventCategory::Tool)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
                                 "model": model,
@@ -112,13 +121,15 @@ pub(crate) fn collect_tool_results(
                 }
             }
         }
-        let canonical_output = canonicalize_tool_result_media_markers(&outcome.output);
+        let canonical_output =
+            canonicalize_tool_result_media_markers_for(&tool_name, &outcome.output);
         let mut result_output = truncate_tool_result(&canonical_output, max_tool_result_chars);
         // Append HMAC receipt to tool result when receipts are enabled
         if let Some(ref receipt) = outcome.receipt {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
                     .with_attrs(::serde_json::json!({"tool": tool_name, "receipt": receipt})),
                 "Tool receipt generated"
             );
@@ -158,13 +169,6 @@ pub(crate) fn check_identical_output_abort(
     iteration: usize,
     turn_id: &str,
 ) -> Result<()> {
-    // ── Time-gated loop detection ──────────────────────────
-    // When pacing.loop_detection_min_elapsed_secs is set, identical-output
-    // loop detection activates after the task has been running that long.
-    // This avoids false-positive aborts on long-running browser/research
-    // workflows while keeping aggressive protection for quick tasks.
-    // When not configured, identical-output detection is disabled (preserving
-    // existing behavior where only max_iterations prevents runaway loops).
     let loop_detection_active = match pacing.loop_detection_min_elapsed_secs {
         Some(min_secs) => loop_started_at.elapsed() >= Duration::from_secs(min_secs),
         None => false, // disabled when not configured (backwards compatible)
@@ -188,6 +192,7 @@ pub(crate) fn check_identical_output_abort(
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "model": model,
@@ -204,4 +209,138 @@ pub(crate) fn check_identical_output_abort(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::loop_detector::{LoopDetector, LoopDetectorConfig};
+    use crate::agent::tool_execution::ToolExecutionOutcome;
+    use zeroclaw_tool_call_parser::ParsedToolCall;
+
+    const RATE_LIMIT_ERR: &str = "Rate limit exceeded: too many actions in the last hour";
+
+    fn outcome(output: &str, success: bool) -> ToolExecutionOutcome {
+        ToolExecutionOutcome {
+            output: output.to_string(),
+            success,
+            error_reason: if success {
+                None
+            } else {
+                Some(output.to_string())
+            },
+            duration: Duration::from_millis(1),
+            receipt: None,
+            output_data: None,
+        }
+    }
+
+    /// Run one results-collection pass over `n` `file_read` calls that each use
+    /// different args but return an identical `output` string, with the given
+    /// `success` flag.
+    fn run(n: usize, output: &str, success: bool) -> Result<CollectedResults> {
+        let mut detector = LoopDetector::new(LoopDetectorConfig::default());
+        let ignore: HashSet<&str> = HashSet::new();
+        let mut history: Vec<ChatMessage> = Vec::new();
+        let mut tool_calls: Vec<ParsedToolCall> = Vec::new();
+        let mut ordered: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>> = Vec::new();
+        for i in 0..n {
+            tool_calls.push(ParsedToolCall {
+                name: "file_read".to_string(),
+                arguments: serde_json::json!({ "path": format!("file_{i}.rs") }),
+                tool_call_id: None,
+            });
+            ordered.push(Some((
+                "file_read".to_string(),
+                None,
+                outcome(output, success),
+            )));
+        }
+        collect_tool_results(
+            ordered,
+            &tool_calls,
+            &mut history,
+            &mut detector,
+            &ignore,
+            10_000,
+            None,
+            "test-model",
+            0,
+            "turn-test",
+        )
+    }
+
+    #[test]
+    fn failed_tool_results_do_not_trip_no_progress_breaker() {
+        // Many failed reads (different paths, identical rate-limit error) must
+        // NOT abort the turn: a recoverable rate-limit/budget error is not a
+        // "no progress" exploration loop. Regression for the circuit breaker
+        // firing on `file_read` "called N times ... identical results".
+        assert!(run(8, RATE_LIMIT_ERR, false).is_ok());
+    }
+
+    #[test]
+    fn successful_identical_results_still_trip_no_progress_breaker() {
+        // Identical *successful* output across different args is the genuine
+        // stuck-loop signaland must still hard-abort the turn.
+        let err = match run(8, "byte-identical successful output", true) {
+            Ok(_) => panic!("expected the no-progress circuit breaker to abort the turn"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("loop detector"), "got: {err}");
+    }
+
+    fn run_hash_path(n: usize, output: &str, success: bool) -> Result<()> {
+        // `Some(0)` => loop detection active immediately (`elapsed() >= 0s`).
+        let pacing = PacingConfig {
+            loop_detection_min_elapsed_secs: Some(0),
+            ..PacingConfig::default()
+        };
+        let loop_started_at = Instant::now();
+        let mut consecutive_identical_outputs = 0usize;
+        let mut last_tool_output_hash: Option<u64> = None;
+        let mut detector = LoopDetector::new(LoopDetectorConfig::default());
+        let ignore: HashSet<&str> = HashSet::new();
+        for iteration in 0..n {
+            let mut history: Vec<ChatMessage> = Vec::new();
+            let tool_calls = vec![ParsedToolCall {
+                name: "file_read".to_string(),
+                arguments: serde_json::json!({ "path": format!("file_{iteration}.rs") }),
+                tool_call_id: None,
+            }];
+            let ordered = vec![Some((
+                "file_read".to_string(),
+                None,
+                outcome(output, success),
+            ))];
+            let collected = collect_tool_results(
+                ordered,
+                &tool_calls,
+                &mut history,
+                &mut detector,
+                &ignore,
+                10_000,
+                None,
+                "test-model",
+                iteration,
+                "turn-test",
+            )?;
+            check_identical_output_abort(
+                &collected.detection_relevant_output,
+                loop_started_at,
+                &pacing,
+                &mut consecutive_identical_outputs,
+                &mut last_tool_output_hash,
+                "test-model",
+                iteration,
+                "turn-test",
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_identical_outputs_do_not_trip_hash_based_abort() {
+        assert!(run_hash_path(8, RATE_LIMIT_ERR, false).is_ok());
+    }
 }

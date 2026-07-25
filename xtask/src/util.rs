@@ -16,12 +16,6 @@ pub fn ref_dir(root: &Path) -> PathBuf {
     root.join("docs/book/src/reference")
 }
 
-/// Resolve the Cargo target directory, honoring `CARGO_TARGET_DIR`, a
-/// `.cargo/config.toml` `build.target-dir`, and any other override Cargo
-/// applies. `cargo doc` writes its output under `<target-dir>/doc`; hardcoding
-/// `<root>/target/doc` breaks whenever the target dir is relocated (CI runners,
-/// shared caches, `CARGO_TARGET_DIR`). Falls back to `<root>/target` only when
-/// `cargo metadata` is unavailable.
 pub fn target_dir(root: &Path) -> PathBuf {
     let output = Command::new("cargo")
         .args(["metadata", "--no-deps", "--format-version", "1"])
@@ -49,6 +43,59 @@ pub fn po_dir(root: &Path) -> PathBuf {
 
 pub fn pot_file(root: &Path) -> PathBuf {
     root.join("docs/book/po/messages.pot")
+}
+
+pub fn ensure_po_submodule(root: &Path) -> anyhow::Result<()> {
+    let po = po_dir(root);
+    if po.join(".git").exists() {
+        return Ok(());
+    }
+    if po.is_dir() {
+        clear_stray_po_artifacts(&po)?;
+    }
+    println!("==> initializing translations submodule → {}", po.display());
+    run_cmd(
+        Command::new("git")
+            .args(["submodule", "update", "--init", "--", "docs/book/po"])
+            .current_dir(root),
+    )?;
+    if !po.join(".git").exists() {
+        anyhow::bail!(
+            "translations submodule still not checked out at {}\n  \
+             run manually: git submodule update --init -- docs/book/po",
+            po.display()
+        );
+    }
+    Ok(())
+}
+
+/// Remove only generated catalog artifacts from an uninitialized gitlink
+/// directory so the submodule clone can populate it. Bails if the directory
+/// holds any other file, so unexpected content is never silently deleted.
+fn clear_stray_po_artifacts(po: &Path) -> anyhow::Result<()> {
+    let generated = |name: &str| {
+        name.ends_with(".po") || name.ends_with(".pot") || name.ends_with(".failures.log")
+    };
+    let mut stray = vec![];
+    for entry in std::fs::read_dir(po)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if generated(&name) {
+            stray.push(entry.path());
+        } else {
+            anyhow::bail!(
+                "translations submodule path {} is not checked out but holds \
+                 unexpected file '{name}'; refusing to clear it. Resolve manually, then \
+                 run: git submodule update --init -- docs/book/po",
+                po.display()
+            );
+        }
+    }
+    for path in stray {
+        std::fs::remove_file(&path)?;
+    }
+    Ok(())
 }
 
 pub struct LocaleEntry {
@@ -104,11 +151,6 @@ fn tool_on_path(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Resolve the real `mdbook` binary on PATH, skipping the xtask's own build dir.
-/// The xtask itself is named `mdbook`; Cargo prepends `target/debug` and
-/// `target/debug/deps` to PATH for `cargo run`, and on Windows `Command::new`
-/// also searches the parent process's directory first — so without this guard
-/// the xtask would recursively spawn itself.
 pub fn mdbook_program() -> anyhow::Result<PathBuf> {
     let exclude = std::env::current_exe()
         .ok()
@@ -134,15 +176,6 @@ pub fn mdbook_program() -> anyhow::Result<PathBuf> {
     )
 }
 
-/// Point mdBook's `peer-groups` preprocessor at the xtask binary Cargo actually
-/// built, rather than the repo-relative `target/release/mdbook` hardcoded in
-/// `book.toml`. With a non-default `CARGO_TARGET_DIR` the helper lands under the
-/// external target dir while mdBook still tries the repo-relative path and fails
-/// with "preprocessor not found". The running xtask binary *is* the preprocessor
-/// (its `preprocess` subcommand), so the override resolves wherever Cargo placed
-/// it. mdBook maps `MDBOOK_PREPROCESSOR__PEER_GROUPS__COMMAND` to the
-/// `preprocessor.peer-groups.command` key (`__` -> `.`, `_` -> `-`) and splits
-/// the value with shlex, so the path is quoted.
 pub fn peer_groups_preprocessor_env() -> Option<(String, String)> {
     let exe = std::env::current_exe().ok()?;
     let exe_str = exe.to_string_lossy();
@@ -169,13 +202,6 @@ pub fn run_cmd(cmd: &mut Command) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Catalogue roots that `cargo fluent` walks. Each root holds `<locale>/`
-/// subdirectories of `.ftl` files. The runtime catalogue is the primary
-/// source; zerocode ships an independent catalogue under the same layout.
-/// Named Fluent catalogue roots. Each root holds `<locale>/` subdirectories of
-/// `.ftl` files. The runtime catalogue is the primary source; zerocode ships an
-/// independent catalogue under the same layout. The name is the `--catalog`
-/// selector value.
 pub fn fluent_catalog_roots_named(root: &Path) -> Vec<(&'static str, PathBuf)> {
     vec![
         ("runtime", root.join("crates/zeroclaw-runtime/locales")),
@@ -246,11 +272,6 @@ pub fn ftl_files_in(locale_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Build a ready-to-use `ModelProvider` for a configured alias, loading the
-/// typed `Config` from `config_dir` (mirrors `zeroclaw --config-dir`; defaults
-/// to ~/.zeroclaw then ~/.config/zeroclaw). The provider stack resolves the
-/// family endpoint, auth header, wire protocol, and decrypts secrets — this
-/// tool hand-rolls none of it. Returns the provider plus the resolved model id.
 pub fn build_model_provider(
     provider_name: &str,
     config_dir: Option<&str>,
@@ -332,6 +353,30 @@ pub fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> anyhow::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_stray_po_artifacts_removes_only_generated() {
+        let dir = std::env::temp_dir().join(format!("zc-po-stray-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["fr.po", "messages.pot", "ja.failures.log"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        clear_stray_po_artifacts(&dir).unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clear_stray_po_artifacts_refuses_unknown_files() {
+        let dir = std::env::temp_dir().join(format!("zc-po-keep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("fr.po"), b"x").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+        let err = clear_stray_po_artifacts(&dir).unwrap_err();
+        assert!(err.to_string().contains("notes.txt"));
+        assert!(dir.join("fr.po").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn peer_groups_env_key_matches_mdbook_mapping() {

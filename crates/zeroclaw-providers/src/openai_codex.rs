@@ -63,7 +63,9 @@ pub(crate) struct ResponsesToolSpec {
     pub(crate) kind: String,
     pub(crate) name: String,
     pub(crate) description: String,
-    pub(crate) parameters: Value,
+    /// `Arc`-shared with the tool registry's stored schema — serialized
+    /// transparently, never deep-cloned per request
+    pub(crate) parameters: std::sync::Arc<Value>,
     pub(crate) strict: bool,
 }
 
@@ -89,6 +91,7 @@ struct ResponsesResponse {
 #[derive(Debug, Default)]
 pub(crate) struct ResponsesStreamState {
     pub(crate) saw_text_delta: bool,
+    pub(crate) saw_completion: bool,
     pub(crate) text_accumulator: String,
     pub(crate) fallback_text: Option<String>,
     pub(crate) tool_calls: HashMap<String, PendingToolCall>,
@@ -226,6 +229,10 @@ fn normalize_model_id(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
 
+pub(crate) fn has_turn_tools(tools: Option<&Vec<ResponsesToolSpec>>) -> bool {
+    tools.as_ref().is_some_and(|t| !t.is_empty())
+}
+
 pub(crate) fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<ResponsesToolSpec>> {
     let items = tools?;
     if items.is_empty() {
@@ -239,7 +246,7 @@ pub(crate) fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<ResponsesT
                 kind: "function".to_string(),
                 name: tool.name.clone(),
                 description: tool.description.clone(),
-                parameters: tool.parameters.clone(),
+                parameters: std::sync::Arc::clone(&tool.parameters),
                 strict: false,
             })
             .collect(),
@@ -318,6 +325,22 @@ fn decode_responses_history_items(reasoning_content: &str) -> Option<Vec<Value>>
         .collect::<Vec<_>>();
 
     (!items.is_empty()).then_some(items)
+}
+
+/// Build a single Responses-API `function_call` input item from a parsed
+/// `ProviderToolCall`. The `arguments` field is routed through the shared
+/// `sanitize_tool_arguments` helper so the openai_codex call site inherits
+/// the same malformed-JSON → `"{}"` contract as the other four typed
+/// providers. Factored out so the call-site behavior is testable without
+/// running the full input builder.
+pub(crate) fn build_function_call_item(call: ProviderToolCall) -> Value {
+    let name = call.name;
+    serde_json::json!({
+        "type": "function_call",
+        "call_id": call.id,
+        "name": name,
+        "arguments": crate::compatible::sanitize_tool_arguments(&name, &call.arguments),
+    })
 }
 
 pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
@@ -404,12 +427,7 @@ pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Va
                     }
 
                     for call in parsed_calls {
-                        input.push(serde_json::json!({
-                            "type": "function_call",
-                            "call_id": call.id,
-                            "name": call.name,
-                            "arguments": call.arguments,
-                        }));
+                        input.push(build_function_call_item(call));
                     }
                 } else if !msg.content.trim().is_empty() {
                     input.push(response_message_item(
@@ -812,6 +830,7 @@ pub(crate) fn process_responses_stream_event(
             }
         }
         Some("response.completed" | "response.done") => {
+            state.saw_completion = true;
             if let Some(response) = event
                 .get("response")
                 .and_then(|value| serde_json::from_value::<ResponsesResponse>(value.clone()).ok())
@@ -849,6 +868,9 @@ pub(crate) fn process_sse_chunk(
     let joined = data_lines.join("\n");
     let trimmed = joined.trim();
     if trimmed.is_empty() || trimmed == "[DONE]" {
+        if trimmed == "[DONE]" {
+            state.saw_completion = true;
+        }
         return Ok(Vec::new());
     }
 
@@ -860,6 +882,9 @@ pub(crate) fn process_sse_chunk(
     for line in data_lines {
         let line = line.trim();
         if line.is_empty() || line == "[DONE]" {
+            if line == "[DONE]" {
+                state.saw_completion = true;
+            }
             continue;
         }
         let event = serde_json::from_str::<Value>(line).map_err(|err| {
@@ -1064,12 +1089,6 @@ fn parse_responses_body(body: &str) -> anyhow::Result<ResponsesTurnResult> {
     })
 }
 
-/// Read the response body incrementally via `bytes_stream()` to avoid
-/// buffering the entire SSE payload in memory.  The previous implementation
-/// used `response.text().await?` which holds the HTTP connection open until
-/// every byte has arrived — on high-latency links the long-lived connection
-/// often drops mid-read, producing the "error decoding response body" failure
-/// reported in #3544.
 async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<ResponsesTurnResult> {
     let mut body = String::new();
     let mut pending_utf8 = Vec::new();
@@ -1175,6 +1194,11 @@ impl OpenAiCodexModelProvider {
             Err(err) => return Err(err),
         };
 
+        // Distinguish "no credentials at all" from "credentials present but
+        // unusable" (expired / could not be refreshed) so the call-time error
+        // stops blaming a missing profile when the real fix is re-authentication.
+        let had_profile = profile.is_some();
+
         let account_id = profile.and_then(|p| p.account_id).or_else(|| {
             oauth_access_token
                 .as_deref()
@@ -1185,16 +1209,35 @@ impl OpenAiCodexModelProvider {
             oauth_access_token
         } else {
             Some(oauth_access_token.ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"missing": "oauth_access_token"})),
-                    "openai_codex: auth profile not found"
-                );
-                anyhow::Error::msg(
-                    "OpenAI Codex auth profile not found. Run `zeroclaw auth login --provider openai-codex`.",
-                )
+                if had_profile {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "missing": "oauth_access_token",
+                                "had_profile": true,
+                            })),
+                        "openai_codex: auth profile present but no usable access token"
+                    );
+                    anyhow::Error::msg(
+                        "OpenAI Codex credentials are present but expired or could not be refreshed. Re-run `zeroclaw auth login --model-provider openai-codex` to sign in again.",
+                    )
+                } else {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "missing": "oauth_access_token",
+                                "had_profile": false,
+                            })),
+                        "openai_codex: no auth profile found"
+                    );
+                    anyhow::Error::msg(
+                        "No OpenAI Codex credentials found. Run `zeroclaw auth login --model-provider openai-codex` to sign in.",
+                    )
+                }
             })?)
         };
 
@@ -1210,7 +1253,7 @@ impl OpenAiCodexModelProvider {
                     "openai_codex: account_id not found in profile/token"
                 );
                 anyhow::Error::msg(
-                    "OpenAI Codex account id not found in auth profile/token. Run `zeroclaw auth login --provider openai-codex` again.",
+                    "OpenAI Codex account id not found in auth profile/token. Run `zeroclaw auth login --model-provider openai-codex` again.",
                 )
             })?)
         };
@@ -1276,7 +1319,7 @@ impl OpenAiCodexModelProvider {
         let normalized_model = normalize_model_id(model);
 
         let tools_count = tools.as_ref().map_or(0, Vec::len);
-        let has_tools = tools.is_some();
+        let has_tools = has_turn_tools(tools.as_ref());
         let mut request = ResponsesRequest {
             model: normalized_model.to_string(),
             input,
@@ -1522,7 +1565,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
             let normalized_model = normalize_model_id(&model);
             let tools = convert_tools(tools.as_deref());
             let tools_count = tools.as_ref().map_or(0, Vec::len);
-            let has_tools = tools.is_some();
+            let has_tools = has_turn_tools(tools.as_ref());
             let request = ResponsesRequest {
                 model: normalized_model.to_string(),
                 input,
@@ -1699,6 +1742,76 @@ mod tests {
             output_text: None,
         };
         assert_eq!(extract_responses_text(&response).as_deref(), Some("nested"));
+    }
+
+    #[test]
+    fn has_turn_tools_returns_false_for_empty_and_none() {
+        // Pure unit test on the gate helper, complementing the end-to-end
+        // `chat()`-based regression below. Asserts the four boundary
+        // cases of the `is_some_and(!is_empty())` invariant.
+        assert!(!has_turn_tools(None));
+        assert!(!has_turn_tools(Some(&vec![])));
+        assert!(has_turn_tools(Some(&vec![make_test_tool_spec("echo")])));
+        // A non-empty list still passes even when all entries are
+        // syntactically distinct from each other; the helper does not
+        // dedupe.
+        let two = vec![make_test_tool_spec("a"), make_test_tool_spec("b")];
+        assert!(has_turn_tools(Some(&two)));
+    }
+
+    fn make_test_tool_spec(name: &str) -> ResponsesToolSpec {
+        ResponsesToolSpec {
+            kind: "function".to_string(),
+            name: name.to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({}).into(),
+            strict: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_with_empty_tools_list_omits_tool_choice_and_parallel_tool_calls() {
+        let (provider, captured, server_handle, _temp_dir) =
+            mock_codex_provider(vec![MockCodexReply::Json(serde_json::json!({
+                "output_text": "ok",
+                "output": []
+            }))])
+            .await;
+
+        let messages = vec![ChatMessage::user("hello")];
+        let empty_tools: Vec<zeroclaw_api::tool::ToolSpec> = vec![];
+        let response = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&empty_tools),
+                    thinking: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .expect("chat() should succeed with an empty tool list");
+        assert_eq!(response.text.as_deref(), Some("ok"));
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1, "expected exactly one captured request");
+        let body = &requests[0];
+        assert!(
+            body.get("tool_choice").is_none(),
+            "empty tools list must produce a request body without `tool_choice`; got: {body}"
+        );
+        assert!(
+            body.get("parallel_tool_calls").is_none(),
+            "empty tools list must produce a request body without `parallel_tool_calls`; got: {body}"
+        );
+        // Sanity: a non-empty tool list still produces both fields.
+        assert!(
+            body.get("tools").is_none() || body["tools"].as_array().is_none_or(|a| a.is_empty()),
+            "empty input list should produce a no-tools request; got: {body}"
+        );
+
+        server_handle.abort();
     }
 
     #[test]
@@ -1963,6 +2076,35 @@ data: [DONE]
             parse_sse_turn(payload).unwrap().text.as_deref(),
             Some("Hello world")
         );
+    }
+
+    #[test]
+    fn process_sse_chunk_marks_completion_on_response_completed() {
+        let mut state = ResponsesStreamState::default();
+        let _ = process_sse_chunk(
+            "data: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"hi\"}}",
+            &mut state,
+        )
+        .unwrap();
+        assert!(state.saw_completion);
+    }
+
+    #[test]
+    fn process_sse_chunk_marks_completion_on_done_sentinel() {
+        let mut state = ResponsesStreamState::default();
+        let _ = process_sse_chunk("data: [DONE]", &mut state).unwrap();
+        assert!(state.saw_completion);
+    }
+
+    #[test]
+    fn process_sse_chunk_leaves_completion_unset_on_text_delta() {
+        let mut state = ResponsesStreamState::default();
+        let _ = process_sse_chunk(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}",
+            &mut state,
+        )
+        .unwrap();
+        assert!(!state.saw_completion);
     }
 
     #[test]
@@ -2268,10 +2410,10 @@ data: [DONE]
 
     #[test]
     fn convert_tools_opts_out_of_responses_strict_mode() {
-        let tools = vec![ToolSpec {
-            name: "jira".to_string(),
-            description: "Interact with Jira".to_string(),
-            parameters: serde_json::json!({
+        let tools = vec![ToolSpec::new(
+            "jira",
+            "Interact with Jira",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "action": { "type": "string" },
@@ -2279,7 +2421,7 @@ data: [DONE]
                 },
                 "required": ["action"]
             }),
-        }];
+        )];
 
         let converted = convert_tools(Some(&tools)).expect("tool should convert");
         let value = serde_json::to_value(&converted[0]).expect("tool should serialize");
@@ -2380,5 +2522,38 @@ data: [DONE]
 
         assert!(provider.supports_streaming());
         assert!(provider.supports_streaming_tool_events());
+    }
+
+    #[test]
+    fn build_function_call_item_sanitizes_invalid_arguments_to_empty_object() {
+        // Pins that the openai_codex call site of `sanitize_tool_arguments`
+        // is wired in. The helper contract itself is covered in
+        // `compatible::tests::sanitize_tool_arguments_*`.
+        let call = ProviderToolCall {
+            id: "call_bad".to_string(),
+            name: "shell".to_string(),
+            arguments: r#"{"command":"rm -rf"#.to_string(),
+            extra_content: None,
+        };
+
+        let item = build_function_call_item(call);
+        assert_eq!(item["type"], "function_call");
+        assert_eq!(item["call_id"], "call_bad");
+        assert_eq!(item["name"], "shell");
+        assert_eq!(item["arguments"], "{}");
+    }
+
+    #[test]
+    fn build_function_call_item_passes_through_valid_arguments() {
+        // Companion regression: valid JSON must round-trip byte-for-byte.
+        let call = ProviderToolCall {
+            id: "call_ok".to_string(),
+            name: "shell".to_string(),
+            arguments: r#"{"command":"pwd"}"#.to_string(),
+            extra_content: None,
+        };
+
+        let item = build_function_call_item(call);
+        assert_eq!(item["arguments"], r#"{"command":"pwd"}"#);
     }
 }

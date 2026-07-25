@@ -1,41 +1,6 @@
 //! Process-global cache for skill-directory loads.
-//!
-//! [`super::load_skills_from_directory`] and [`super::load_open_skills_from_directory`]
-//! are pure functions of `(dir, allow_scripts, filesystem state)`, but each call
-//! does a recursive read *and* a full security audit (content scan + parse) of
-//! every skill subdirectory. They run on every prompt build and every
-//! `read_skill` invocation, so the cost recurs constantly even when nothing on
-//! disk has changed.
-//!
-//! This module memoizes the result keyed by `(canonical dir, allow_scripts, tag)`
-//! and validates freshness with a **content digest** of the directory: it hashes
-//! the bytes of every file reachable under `dir` (plus each symlink's target),
-//! never following symlinks so it can't loop. Because the digest covers file
-//! *content*, any change the auditor would care about — an edited `SKILL.md`, a
-//! flipped script, a retargeted symlink, altered TOML — produces a different
-//! signature and forces a re-audit. This matters specifically because the cache
-//! sits in front of the security audit: serving a cached "clean" verdict for
-//! content that has since changed would defeat the audit, so the freshness key is
-//! deliberately tied to the audited bytes rather than to metadata (mtime/length),
-//! which an edit can preserve. (The only residual risk is a 64-bit hash
-//! collision, which is not a practical forgery vector.)
-//!
-//! The digest reads each file once, but a cache *hit* then skips the audit's
-//! content scan, its regex/script/symlink checks, and the Markdown/TOML parsing —
-//! work the loader otherwise repeats (re-reading files) on every prompt build and
-//! every `read_skill` call. So the cache stays a net win without weakening the
-//! audit boundary.
-//!
-//! [`invalidate`] gives the [`super::SkillsService`] an explicit hook to drop the
-//! cache immediately after a write, so an added/edited/removed skill is picked up
-//! on the very next load without waiting on anything.
-//!
-//! Kill-switch: the cache is on by default; setting `ZEROCLAW_SKILLS_CACHE_ENABLED`
-//! to a falsey value (`0` / `false` / `no` / `off`) forces every load to re-walk
-//! and re-audit, i.e. the exact pre-cache behavior. This is a runtime off-ramp if
-//! the cache is ever suspected of serving stale results.
 
-use super::Skill;
+use super::{DroppedSkill, Skill};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
@@ -51,9 +16,15 @@ struct CacheKey {
     tag: &'static str,
 }
 
+#[derive(Clone)]
+pub(super) struct LoadOutput {
+    pub skills: Vec<Skill>,
+    pub dropped: Vec<DroppedSkill>,
+}
+
 struct CacheEntry {
     signature: u64,
-    skills: Vec<Skill>,
+    output: LoadOutput,
 }
 
 fn cache() -> &'static RwLock<HashMap<CacheKey, CacheEntry>> {
@@ -85,15 +56,6 @@ fn cache_enabled() -> bool {
     cache_enabled_from_env(std::env::var(CACHE_ENABLED_ENV).ok().as_deref())
 }
 
-/// Content fingerprint of everything reachable under `dir` (recursive). Hashes
-/// each entry's path plus a digest of its *bytes* (files) or link target
-/// (symlinks). Never follows symlinks, so it can't loop on a cycle and matches
-/// the auditor's no-follow stance. Tying the key to content — not metadata an edit
-/// can preserve — is what keeps a cached "clean" audit verdict from outliving the
-/// bytes it audited. Only *regular* files are opened: a non-regular entry (FIFO,
-/// socket, device) makes this return `None` so we never block opening it just to
-/// build a key. Returns `None` too when `dir` is absent or any entry can't be
-/// read; callers treat that as "do not cache" rather than trust a partial digest.
 fn dir_signature(dir: &Path) -> Option<u64> {
     if !dir.exists() {
         return None;
@@ -126,12 +88,6 @@ fn dir_signature(dir: &Path) -> Option<u64> {
                 let digest = hash_file_contents(&path)?;
                 entries.insert(path, (1, digest));
             } else {
-                // Non-regular entry (FIFO, socket, device, ...). Opening a FIFO
-                // for read blocks on a writer, so probing it just to build the
-                // cache key could hang skill loading / prompt building — a far
-                // wider open surface than the uncached loader, which only reads
-                // the manifest it parses. Never open it: decline to cache this
-                // directory and let the uncached path handle whatever it is.
                 return None;
             }
         }
@@ -165,17 +121,22 @@ fn hash_file_contents(path: &Path) -> Option<u64> {
     Some(hasher.finish())
 }
 
-/// Memoize `load` for `(dir, allow_scripts, tag)`, validated by the directory
-/// signature. On a hit with a matching signature, returns a clone of the cached
-/// skills without touching the auditor. On a miss (or when the directory can't be
-/// signed) runs `load` and stores the result. Concurrent misses simply run the
-/// idempotent loader more than once; lock poisoning is recovered, not panicked.
 pub(super) fn cached_load(
     dir: &Path,
     allow_scripts: bool,
     tag: &'static str,
-    load: impl FnOnce() -> Vec<Skill>,
-) -> Vec<Skill> {
+    load: impl FnOnce() -> LoadOutput,
+) -> LoadOutput {
+    cached_load_in(cache(), dir, allow_scripts, tag, load)
+}
+
+fn cached_load_in(
+    cache: &RwLock<HashMap<CacheKey, CacheEntry>>,
+    dir: &Path,
+    allow_scripts: bool,
+    tag: &'static str,
+    load: impl FnOnce() -> LoadOutput,
+) -> LoadOutput {
     if !cache_enabled() {
         return load();
     }
@@ -189,11 +150,11 @@ pub(super) fn cached_load(
     };
 
     {
-        let guard = cache().read().unwrap_or_else(|e| e.into_inner());
+        let guard = cache.read().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = guard.get(&key)
             && entry.signature == signature
         {
-            return entry.skills.clone();
+            return entry.output.clone();
         }
     }
 
@@ -201,16 +162,16 @@ pub(super) fn cached_load(
     // relative to lock contention here and we want a single store. If the dir
     // mutates during `load`, its content digest changes, so the *next* call's
     // signature differs from what we store and the entry self-heals.
-    let skills = load();
-    let mut guard = cache().write().unwrap_or_else(|e| e.into_inner());
+    let output = load();
+    let mut guard = cache.write().unwrap_or_else(|e| e.into_inner());
     guard.insert(
         key,
         CacheEntry {
             signature,
-            skills: skills.clone(),
+            output: output.clone(),
         },
     );
-    skills
+    output
 }
 
 /// Drop every cached entry. Call after any out-of-band mutation of a skills
@@ -234,7 +195,7 @@ mod tests {
 
     #[test]
     fn second_load_is_a_cache_hit() {
-        invalidate();
+        let local_cache = RwLock::new(HashMap::new());
         let tmp = TempDir::new().unwrap();
         let skills_dir = tmp.path().join("skills");
         write(&skills_dir, "alpha", "# Alpha\n");
@@ -242,41 +203,48 @@ mod tests {
 
         let load = || {
             calls.fetch_add(1, Ordering::SeqCst);
-            vec![Skill {
-                name: "alpha".into(),
-                description: String::new(),
-                version: String::new(),
-                author: None,
-                tags: vec![],
-                tools: vec![],
-                prompts: vec![],
-                slash_options: vec![],
-                location: None,
-            }]
+            LoadOutput {
+                skills: vec![Skill {
+                    name: "alpha".into(),
+                    description: String::new(),
+                    description_localizations: Default::default(),
+                    version: String::new(),
+                    author: None,
+                    tags: vec![],
+                    tools: vec![],
+                    prompts: vec![],
+                    slash_options: vec![],
+                    location: None,
+                }],
+                dropped: vec![],
+            }
         };
 
-        let a = cached_load(&skills_dir, false, "test", load);
-        let b = cached_load(&skills_dir, false, "test", load);
-        assert_eq!(a.len(), 1);
-        assert_eq!(b.len(), 1);
+        let a = cached_load_in(&local_cache, &skills_dir, false, "test", load);
+        let b = cached_load_in(&local_cache, &skills_dir, false, "test", load);
+        assert_eq!(a.skills.len(), 1);
+        assert_eq!(b.skills.len(), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 1, "loader should run once");
     }
 
     #[test]
     fn adding_a_skill_invalidates_via_signature() {
-        invalidate();
+        let local_cache = RwLock::new(HashMap::new());
         let tmp = TempDir::new().unwrap();
         let skills_dir = tmp.path().join("skills");
         write(&skills_dir, "alpha", "# Alpha\n");
         let calls = AtomicUsize::new(0);
         let load = || {
             calls.fetch_add(1, Ordering::SeqCst);
-            Vec::<Skill>::new()
+            LoadOutput {
+                skills: Vec::new(),
+                dropped: vec![],
+            }
         };
 
-        cached_load(&skills_dir, false, "test", load);
+        cached_load_in(&local_cache, &skills_dir, false, "test", load);
         write(&skills_dir, "beta", "# Beta\n");
-        cached_load(&skills_dir, false, "test", load);
+        cached_load_in(&local_cache, &skills_dir, false, "test", load);
 
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -287,24 +255,27 @@ mod tests {
 
     #[test]
     fn editing_content_invalidates_via_signature() {
-        invalidate();
+        let local_cache = RwLock::new(HashMap::new());
         let tmp = TempDir::new().unwrap();
         let skills_dir = tmp.path().join("skills");
         write(&skills_dir, "alpha", "# Alpha\n");
         let calls = AtomicUsize::new(0);
         let load = || {
             calls.fetch_add(1, Ordering::SeqCst);
-            Vec::<Skill>::new()
+            LoadOutput {
+                skills: Vec::new(),
+                dropped: vec![],
+            }
         };
 
-        cached_load(&skills_dir, false, "test", load);
-        // Different length → signature changes even if mtime resolution is coarse.
+        cached_load_in(&local_cache, &skills_dir, false, "test", load);
+        // Different length -> signature changes even if mtime resolution is coarse.
         write(
             &skills_dir,
             "alpha",
             "# Alpha skill, now with a longer body.\n",
         );
-        cached_load(&skills_dir, false, "test", load);
+        cached_load_in(&local_cache, &skills_dir, false, "test", load);
 
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -313,14 +284,9 @@ mod tests {
         );
     }
 
-    // Audit-boundary regression (review of #7786): the cache sits in front of the
-    // security audit, so an edit that preserves BOTH length and mtime — exactly the
-    // case a metadata-only signature would miss — must still force a re-audit. This
-    // would fail on the original mtime+length signature and passes because the key
-    // is now a content digest.
     #[test]
     fn same_length_same_mtime_edit_still_busts_cache() {
-        invalidate();
+        let local_cache = RwLock::new(HashMap::new());
         let tmp = TempDir::new().unwrap();
         let skills_dir = tmp.path().join("skills");
         write(&skills_dir, "alpha", "AAAA\n");
@@ -331,10 +297,13 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let load = || {
             calls.fetch_add(1, Ordering::SeqCst);
-            Vec::<Skill>::new()
+            LoadOutput {
+                skills: Vec::new(),
+                dropped: vec![],
+            }
         };
 
-        cached_load(&skills_dir, false, "test", load);
+        cached_load_in(&local_cache, &skills_dir, false, "test", load);
 
         // Rewrite with same byte length, then forcibly restore the original mtime
         // so length + mtime are byte-for-byte identical to the cached state.
@@ -349,7 +318,7 @@ mod tests {
             "test precondition: length unchanged"
         );
 
-        cached_load(&skills_dir, false, "test", load);
+        cached_load_in(&local_cache, &skills_dir, false, "test", load);
 
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -358,15 +327,10 @@ mod tests {
         );
     }
 
-    // Audit-boundary regression (review of #7786, round 2): a FIFO (or other
-    // non-regular entry) inside a skills dir must never be opened while building
-    // the cache key — opening a FIFO for read blocks on a writer and would hang
-    // skill loading / prompt building. `dir_signature` must bail to `None` so the
-    // directory simply bypasses the cache. If this regresses, the test hangs.
     #[cfg(unix)]
     #[test]
     fn non_regular_entry_bypasses_cache_without_hanging() {
-        invalidate();
+        let local_cache = RwLock::new(HashMap::new());
         let tmp = TempDir::new().unwrap();
         let skills_dir = tmp.path().join("skills");
         write(&skills_dir, "alpha", "# Alpha\n");
@@ -380,13 +344,16 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let load = || {
             calls.fetch_add(1, Ordering::SeqCst);
-            Vec::<Skill>::new()
+            LoadOutput {
+                skills: Vec::new(),
+                dropped: vec![],
+            }
         };
 
         // Must return promptly (no hang) and, because the dir can't be signed,
         // run the loader every time instead of caching.
-        cached_load(&skills_dir, false, "test", load);
-        cached_load(&skills_dir, false, "test", load);
+        cached_load_in(&local_cache, &skills_dir, false, "test", load);
+        cached_load_in(&local_cache, &skills_dir, false, "test", load);
 
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -404,7 +371,10 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let load = || {
             calls.fetch_add(1, Ordering::SeqCst);
-            Vec::<Skill>::new()
+            LoadOutput {
+                skills: Vec::new(),
+                dropped: vec![],
+            }
         };
 
         cached_load(&skills_dir, false, "test", load);
@@ -427,7 +397,10 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let load = || {
             calls.fetch_add(1, Ordering::SeqCst);
-            Vec::<Skill>::new()
+            LoadOutput {
+                skills: Vec::new(),
+                dropped: vec![],
+            }
         };
 
         cached_load(&skills_dir, false, "test", load);
@@ -448,7 +421,10 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let load = || {
             calls.fetch_add(1, Ordering::SeqCst);
-            Vec::<Skill>::new()
+            LoadOutput {
+                skills: Vec::new(),
+                dropped: vec![],
+            }
         };
 
         cached_load(&absent, false, "test", load);
@@ -473,5 +449,52 @@ mod tests {
         for v in ["1", "true", "yes", "on", "", "garbage"] {
             assert!(cache_enabled_from_env(Some(v)), "{v:?} should stay enabled");
         }
+    }
+
+    #[test]
+    fn dropped_records_survive_cache_hit() {
+        let local_cache = RwLock::new(HashMap::new());
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        write(&skills_dir, "alpha", "# Alpha\n");
+        let calls = AtomicUsize::new(0);
+
+        let drop = || DroppedSkill {
+            name: "bad".into(),
+            origin_hint: "workspace".into(),
+            reason: super::super::SkillDropReason::AuditError("boom".into()),
+            location: None,
+        };
+        let load = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            LoadOutput {
+                skills: Vec::new(),
+                dropped: vec![drop()],
+            }
+        };
+
+        let first = cached_load_in(&local_cache, &skills_dir, false, "test", load);
+        // On the hit the loader must NOT run; the closure asserts via call count.
+        let hit_load = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            LoadOutput {
+                skills: Vec::new(),
+                dropped: vec![],
+            }
+        };
+        let second = cached_load_in(&local_cache, &skills_dir, false, "test", hit_load);
+
+        assert_eq!(first.dropped.len(), 1);
+        assert_eq!(
+            second.dropped.len(),
+            1,
+            "drops must survive the cache hit, not be recomputed"
+        );
+        assert_eq!(second.dropped[0].name, "bad");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the loader must run only on the miss"
+        );
     }
 }

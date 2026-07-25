@@ -1,14 +1,4 @@
 //! Custom wa-rs storage backend using ZeroClaw's rusqlite
-//!
-//! This module implements all 4 wa-rs storage traits using rusqlite directly,
-//! avoiding the Diesel/libsqlite3-sys dependency conflict from wa-rs-sqlite-storage.
-//!
-//! # Traits Implemented
-//!
-//! - [`SignalStore`]: Signal protocol cryptographic operations
-//! - [`AppSyncStore`]: WhatsApp app state synchronization
-//! - [`ProtocolStore`]: WhatsApp Web protocol alignment
-//! - [`DeviceStore`]: Device persistence operations
 
 #[cfg(feature = "whatsapp-web")]
 use async_trait::async_trait;
@@ -38,11 +28,6 @@ use wacore::store::traits::DeviceStore as DeviceStoreTrait;
 #[cfg(feature = "whatsapp-web")]
 use wacore::store::traits::*;
 
-/// Custom wa-rs storage backend using rusqlite
-///
-/// This implements all 4 storage traits required by wa-rs.
-/// The backend uses ZeroClaw's existing rusqlite setup, avoiding the
-/// Diesel/libsqlite3-sys conflict from wa-rs-sqlite-storage.
 #[cfg(feature = "whatsapp-web")]
 #[derive(Clone)]
 pub struct RusqliteStore {
@@ -54,11 +39,6 @@ pub struct RusqliteStore {
     device_id: i32,
 }
 
-/// Helper macro to convert rusqlite errors to StoreError
-/// For execute statements that return usize, maps to ()
-///
-/// Wraps the underlying error in a `Box<dyn std::error::Error + Send + Sync>`
-/// to match the `StoreError::Database` variant signature in wacore 0.6.
 macro_rules! to_store_err {
     // For expressions returning Result<usize, E>
     (execute: $expr:expr) => {
@@ -78,13 +58,61 @@ macro_rules! to_store_err {
     };
 }
 
+/// Device ID used for single-session stores; every store created by
+/// [`RusqliteStore::new`] persists its device under this row id.
+#[cfg(feature = "whatsapp-web")]
+const DEFAULT_DEVICE_ID: i32 = 1;
+
+/// Used by [`DeviceStoreTrait::exists`]: "does the store hold a device row
+/// to load?" — true as soon as the store is initialized, even before any
+/// account is linked (the background saver persists the fresh, unregistered
+/// device while the QR pairing is still pending).
+#[cfg(feature = "whatsapp-web")]
+const DEVICE_EXISTS_SQL: &str = "SELECT COUNT(*) FROM device WHERE id = ?1";
+
+/// Used by [`persisted_device_exists`]: "does the store hold a *linked*
+/// device?" — `pn` (the account JID) is NULL until pairing completes and is
+/// only written by a successful login, so it distinguishes a linked session
+/// from the unregistered row a starting channel persists pre-pairing.
+#[cfg(feature = "whatsapp-web")]
+const LINKED_DEVICE_EXISTS_SQL: &str =
+    "SELECT COUNT(*) FROM device WHERE id = ?1 AND pn IS NOT NULL";
+
+/// Channel-owned persisted-login probe for readiness reporting.
+///
+/// Reports whether the session database holds a device linked to a WhatsApp
+/// account — a device row whose `pn` records the account JID written when a
+/// QR pairing completes. Deliberately stricter than the store's `exists()`:
+/// a channel that is running but still waiting for its QR scan has already
+/// persisted an unregistered device row, and that must not read as
+/// "authenticated". Usable without constructing a [`RusqliteStore`]: the
+/// database is opened read-only and nothing is created on disk, so probing
+/// an unpaired channel leaves no trace. Every negative case (file absent,
+/// schema not yet initialized, no linked device row, unreadable database)
+/// reports `false`.
+#[cfg(feature = "whatsapp-web")]
+pub fn persisted_device_exists<P: AsRef<Path>>(db_path: P) -> bool {
+    let path = db_path.as_ref();
+    if !path.is_file() {
+        return false;
+    }
+    let Ok(conn) = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return false;
+    };
+    conn.query_row(
+        LINKED_DEVICE_EXISTS_SQL,
+        params![DEFAULT_DEVICE_ID],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count > 0)
+    .unwrap_or(false)
+}
+
 #[cfg(feature = "whatsapp-web")]
 impl RusqliteStore {
-    /// Create a new rusqlite-based storage backend
-    ///
-    /// # Arguments
-    ///
-    /// * `db_path` - Path to the SQLite database file (will be created if needed)
     pub fn new<P: AsRef<Path>>(db_path: P) -> anyhow::Result<Self> {
         let db_path = db_path.as_ref().to_string_lossy().to_string();
 
@@ -104,7 +132,7 @@ impl RusqliteStore {
         let store = Self {
             db_path,
             conn: Arc::new(Mutex::new(conn)),
-            device_id: 1, // Default device ID
+            device_id: DEFAULT_DEVICE_ID,
         };
 
         store.init_schema()?;
@@ -116,11 +144,6 @@ impl RusqliteStore {
     fn init_schema(&self) -> anyhow::Result<()> {
         let mut conn = self.conn.lock();
 
-        // Decide whether the `raw_id` ALTER is needed BEFORE opening the tx.
-        // PRAGMA table_info is read-only and may target a not-yet-created
-        // table (returns no rows) — in that case the CREATE TABLE inside the
-        // transaction will produce the column anyway, so `needs_raw_id` stays
-        // false and we correctly skip the ALTER.
         let needs_raw_id = {
             let mut stmt = conn.prepare("PRAGMA table_info(device_registry)")?;
             let mut has_raw_id = false;
@@ -136,13 +159,6 @@ impl RusqliteStore {
             table_exists && !has_raw_id
         };
 
-        // Probe `device` for the 5 wacore-0.6 columns. Each entry is
-        // (column_name, SQL fragment for ALTER TABLE ... ADD COLUMN).
-        // The order mirrors upstream's sqlite-storage migration history
-        // so a sqlite-browser diff against an upstream DB is readable.
-        // SQLite has no `ADD COLUMN IF NOT EXISTS`, so we resolve which
-        // ones to add up-front and apply only the missing ones inside
-        // the transaction — same crash-safety contract as `raw_id`.
         let device_06_migrations: Vec<(&'static str, &'static str)> = {
             let mut existing: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut stmt = conn.prepare("PRAGMA table_info(device)")?;
@@ -171,11 +187,6 @@ impl RusqliteStore {
             }
         };
 
-        // Wrap CREATEs + the conditional ALTER in a single transaction so a
-        // crash between them can't leave the DB with new tables but no
-        // `raw_id` column — that state survives reboots because the PRAGMA
-        // probe sees the column as missing yet the ALTER may have already
-        // been recorded as run.
         let tx = to_store_err!(conn.transaction())?;
 
         to_store_err!(tx.execute_batch(
@@ -372,12 +383,6 @@ impl RusqliteStore {
                 ON sent_messages(device_id, created_at);",
         ))?;
 
-        // Migration: ensure `raw_id` column exists on legacy device_registry
-        // rows (added in wacore 0.6 for ADV identity-change detection).
-        // SQLite has no `IF NOT EXISTS` for ADD COLUMN, so we use the pragma
-        // probe performed above to skip the ALTER if it is already applied.
-        // Runs inside the same transaction as the CREATEs so a crash between
-        // them rolls everything back.
         if needs_raw_id {
             to_store_err!(execute: tx.execute(
                 "ALTER TABLE device_registry ADD COLUMN raw_id INTEGER",
@@ -385,12 +390,6 @@ impl RusqliteStore {
             ))?;
         }
 
-        // Apply the wacore-0.6 device column migrations inside the same
-        // transaction as the CREATEs + raw_id ALTER. SQLite refuses to
-        // ALTER TABLE if the column already exists, so we use the
-        // pre-computed `device_06_migrations` list rather than a blanket
-        // probe inside the loop (which would re-read PRAGMA after each
-        // ALTER and complicate failure modes).
         for (col, ty) in &device_06_migrations {
             to_store_err!(execute: tx.execute(
                 &format!("ALTER TABLE device ADD COLUMN {col} {ty}"),
@@ -714,14 +713,11 @@ impl AppSyncStore for RusqliteStore {
         let conn = self.conn.lock();
 
         for mutation in mutations {
-            let index_mac = to_store_err!(serde_json::to_vec(&mutation.index_mac))?;
-            let value_mac = to_store_err!(serde_json::to_vec(&mutation.value_mac))?;
-
             to_store_err!(execute: conn.execute(
                 "INSERT OR REPLACE INTO app_state_mutation_macs
                  (name, version, index_mac, value_mac, device_id)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![name, i64::try_from(version).unwrap_or(i64::MAX), index_mac, value_mac, self.device_id],
+                params![name, i64::try_from(version).unwrap_or(i64::MAX), mutation.index_mac, mutation.value_mac, self.device_id],
             ))?;
         }
 
@@ -734,12 +730,11 @@ impl AppSyncStore for RusqliteStore {
         index_mac: &[u8],
     ) -> wacore::store::error::Result<Option<Vec<u8>>> {
         let conn = self.conn.lock();
-        let index_mac_json = to_store_err!(serde_json::to_vec(index_mac))?;
 
         let result = conn.query_row(
             "SELECT value_mac FROM app_state_mutation_macs
              WHERE name = ?1 AND index_mac = ?2 AND device_id = ?3",
-            params![name, index_mac_json, self.device_id],
+            params![name, index_mac, self.device_id],
             |row| row.get::<_, Vec<u8>>(0),
         );
 
@@ -758,12 +753,10 @@ impl AppSyncStore for RusqliteStore {
         let conn = self.conn.lock();
 
         for index_mac in index_macs {
-            let index_mac_json = to_store_err!(serde_json::to_vec(index_mac))?;
-
             to_store_err!(execute: conn.execute(
                 "DELETE FROM app_state_mutation_macs
                  WHERE name = ?1 AND index_mac = ?2 AND device_id = ?3",
-                params![name, index_mac_json, self.device_id],
+                params![name, index_mac, self.device_id],
             ))?;
         }
 
@@ -796,14 +789,6 @@ impl AppSyncStore for RusqliteStore {
 #[cfg(feature = "whatsapp-web")]
 #[async_trait]
 impl ProtocolStore for RusqliteStore {
-    // --- Per-Device Sender Key Tracking ---
-    //
-    // Replaces the wacore 0.2 SKDM-recipients model with WA Web's
-    // `participant.senderKey` map. Tracks per-device `(has_key)` status:
-    // `true` = SKDM already distributed, `false` = needs fresh SKDM.
-    // The legacy `skdm_recipients` table is kept around (no migration drops it)
-    // but is no longer read or written.
-
     async fn get_sender_key_devices(
         &self,
         group_jid: &str,
@@ -1130,13 +1115,6 @@ impl ProtocolStore for RusqliteStore {
         ))
     }
 
-    // NOTE: `mark_forget_sender_key` / `consume_forget_marks` were dropped from
-    // ProtocolStore in wacore 0.6. The lazy-deletion semantics they implemented
-    // (a separate "marked for forget" set drained on next send) are now handled
-    // in-band by the boolean status column on `sender_key_devices` (see
-    // `set_sender_key_status` above). The old `sender_key_status` table is left
-    // in place but is no longer read or written.
-
     // --- TcToken Storage ---
 
     async fn get_tc_token(&self, jid: &str) -> wacore::store::error::Result<Option<TcTokenEntry>> {
@@ -1233,15 +1211,6 @@ impl ProtocolStore for RusqliteStore {
 
         Ok(deleted)
     }
-
-    // --- Sent Message Store (retry support) ---
-    //
-    // Added in wacore 0.6 to mirror WA Web's `getMessageTable`. Each outbound
-    // send writes the protobuf-encoded payload here keyed by (chat_jid,
-    // message_id); retry-receipt handling consumes (atomic SELECT + DELETE)
-    // the entry so we don't double-retry. Expiry is invoked from a periodic
-    // cleanup hook ZeroClaw doesn't yet schedule — see TODO in
-    // `delete_expired_sent_messages`.
 
     async fn store_sent_message(
         &self,
@@ -1518,11 +1487,10 @@ impl DeviceStoreTrait for RusqliteStore {
 
     async fn exists(&self) -> wacore::store::error::Result<bool> {
         let conn = self.conn.lock();
-        let count: i64 = to_store_err!(conn.query_row(
-            "SELECT COUNT(*) FROM device WHERE id = ?1",
-            params![self.device_id],
-            |row| row.get(0),
-        ))?;
+        let count: i64 =
+            to_store_err!(
+                conn.query_row(DEVICE_EXISTS_SQL, params![self.device_id], |row| row.get(0),)
+            )?;
 
         Ok(count > 0)
     }
@@ -1564,6 +1532,96 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = RusqliteStore::new(tmp.path()).unwrap();
         assert_eq!(store.device_id, 1);
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn persisted_device_probe_is_read_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("absent-session.db");
+
+        assert!(!persisted_device_exists(&path));
+        assert!(
+            !path.exists(),
+            "probing an absent session must not create the database"
+        );
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn persisted_device_probe_requires_linked_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.db");
+        let store = RusqliteStore::new(&path).unwrap();
+
+        // Initialized schema, no device row at all: no session, no login.
+        assert!(!DeviceStoreTrait::exists(&store).await.unwrap());
+        assert!(!persisted_device_exists(&path));
+
+        // The pre-pairing state a starting channel persists: a device row
+        // exists (store `exists()` is true so the channel resumes its keys),
+        // but no account is linked yet — the probe must NOT report a login.
+        DeviceStoreTrait::save(&store, &CoreDevice::new())
+            .await
+            .unwrap();
+        assert!(DeviceStoreTrait::exists(&store).await.unwrap());
+        assert!(
+            !persisted_device_exists(&path),
+            "an unregistered device row (pn IS NULL) is not a persisted login"
+        );
+
+        // Pairing completes: the login writes the account JID into `pn`.
+        let mut device = CoreDevice::new();
+        device.pn = Some(wacore_binary::jid::Jid::pn("15551234567"));
+        DeviceStoreTrait::save(&store, &device).await.unwrap();
+        assert!(persisted_device_exists(&path));
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn mutation_macs_round_trip_raw_bytes() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = RusqliteStore::new(tmp.path()).unwrap();
+
+        // Bytes chosen so a JSON re-encoding would differ from the raw value
+        // (NUL + high bytes). Guards against regressing to JSON-wrapped MACs:
+        // `get_mutation_mac`'s result is fed verbatim into the app-state LTHash,
+        // so a non-raw value corrupts the running hash (snapshot MAC mismatch).
+        let index_mac = vec![0x00u8, 0x7f, 0x80, 0xff, 0x10, 0x22];
+        let value_mac = vec![0xdeu8, 0xad, 0xbe, 0xef, 0x00, 0x99];
+        let mac = AppStateMutationMAC {
+            index_mac: index_mac.clone(),
+            value_mac: value_mac.clone(),
+        };
+
+        AppSyncStore::put_mutation_macs(&store, "critical_block", 1, std::slice::from_ref(&mac))
+            .await
+            .unwrap();
+
+        // Must return the raw value_mac verbatim, not a JSON encoding of it.
+        let got = AppSyncStore::get_mutation_mac(&store, "critical_block", &index_mac)
+            .await
+            .unwrap();
+        assert_eq!(got, Some(value_mac));
+
+        // Unknown index → None.
+        let missing = AppSyncStore::get_mutation_mac(&store, "critical_block", &[1, 2, 3])
+            .await
+            .unwrap();
+        assert_eq!(missing, None);
+
+        // Delete removes the entry.
+        AppSyncStore::delete_mutation_macs(
+            &store,
+            "critical_block",
+            std::slice::from_ref(&index_mac),
+        )
+        .await
+        .unwrap();
+        let after_delete = AppSyncStore::get_mutation_mac(&store, "critical_block", &index_mac)
+            .await
+            .unwrap();
+        assert_eq!(after_delete, None);
     }
 
     #[cfg(feature = "whatsapp-web")]

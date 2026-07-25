@@ -1,16 +1,4 @@
 //! Runtime-generated OpenAPI 3.1 document for the new `/api/config/*` surface.
-//!
-//! Built from the same `schemars::JsonSchema` derives the request/response
-//! types carry. The generator does not introspect the axum router — instead it
-//! walks a hand-maintained `(method, path, request_type, response_type)` list
-//! local to this module. New endpoints under the same surface should be added
-//! to that list when they land. CI checks (forthcoming) can diff the rendered
-//! spec against a committed snapshot to fail builds when handlers are added
-//! without a corresponding OpenAPI entry.
-//!
-//! Cached behind a `OnceCell` because the spec is static per build.
-//!
-//!
 
 use axum::{
     http::{HeaderValue, StatusCode, header},
@@ -18,24 +6,38 @@ use axum::{
 };
 use std::sync::OnceLock;
 
+/// Route-specific CSP for the Scalar explorer page. The finalized router is
+/// wrapped by the default security-header layer, whose `set_if_absent` keeps a
+/// handler-owned `content-security-policy`. The default dashboard CSP only
+/// permits `script-src 'self'`, which would block the Scalar bundle served from
+/// `cdn.jsdelivr.net` and silently degrade `/api/docs` to the offline fallback.
+/// This policy admits the CDN script (and the styles/fonts/images it injects)
+/// while still denying framing and object embedding.
+const DOCS_CSP: &str = "default-src 'self'; \
+     script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; \
+     style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; \
+     img-src 'self' data: https://cdn.jsdelivr.net; \
+     font-src 'self' data: https://cdn.jsdelivr.net; \
+     connect-src 'self'; \
+     object-src 'none'; \
+     frame-ancestors 'none'; \
+     base-uri 'none'";
+
 #[cfg(feature = "schema-export")]
 use schemars::{JsonSchema, schema_for};
 
 static CACHED: OnceLock<serde_json::Value> = OnceLock::new();
 
-/// `GET /api/docs` — the Scalar API explorer page. Loads the standalone Scalar
-/// bundle from a CDN and points it at `/api/openapi.json`. The page is a
-/// single static HTML blob — no NPM dep, no committed bundle, ~2KB.
-///
-/// Authentication: Scalar's built-in panel prompts the user for the bearer
-/// token before any "Try it out" call, so the docs themselves are
-/// unauthenticated but the live calls honor the existing pairing/bearer auth.
 pub async fn handle_docs() -> Response {
     let html = include_str!("openapi_docs.html");
     let mut response = (StatusCode::OK, html).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(DOCS_CSP),
     );
     response
 }
@@ -53,17 +55,15 @@ pub async fn handle_openapi_json() -> Response {
     response
 }
 
-/// Build the OpenAPI 3.1 document. Pub so the `xtask gen-openapi` binary
-/// can render the same JSON the gateway serves and write it to the
-/// committed snapshot at `crates/zeroclaw-gateway/openapi.json`. CI
-/// staleness check (`xtask gen-openapi --check`) diffs the rendered
-/// spec against the committed file so a handler change without a spec
-/// update fails the build.
 #[cfg(feature = "schema-export")]
 pub fn build_spec() -> serde_json::Value {
     use crate::api_config::{
         DriftEntry, DriftResponse, InitQuery, InitResponse, ListResponse, MigrateResponse, PatchOp,
         PatchResponse, PropPutBody, PropResponse, ReloadStatusResponse, SecretResponse,
+    };
+    use crate::version::{
+        UpgradeAcceptedResponse, UpgradeRequest, UpgradeStatusResponse, VersionCheckResponse,
+        VersionErrorResponse,
     };
     use zeroclaw_config::api_error::ConfigApiError;
 
@@ -87,6 +87,18 @@ pub fn build_spec() -> serde_json::Value {
             "DriftResponse":    schema_value::<DriftResponse>(),
             "ReloadStatusResponse": schema_value::<ReloadStatusResponse>(),
             "Config":           schema_value::<zeroclaw_config::schema::Config>(),
+            "VersionCheckResponse":   schema_value::<VersionCheckResponse>(),
+            "UpgradeRequest":         schema_value::<UpgradeRequest>(),
+            "UpgradeAcceptedResponse": schema_value::<UpgradeAcceptedResponse>(),
+            "UpgradeStatusResponse":  schema_value::<UpgradeStatusResponse>(),
+            "VersionError":           schema_value::<VersionErrorResponse>(),
+            "Sop":              schema_value::<zeroclaw_runtime::sop::Sop>(),
+            "SopGraph":         schema_value::<zeroclaw_runtime::sop::SopGraph>(),
+            "GraphLegend":      schema_value::<zeroclaw_runtime::sop::GraphLegend>(),
+            "RunOverlay":       schema_value::<zeroclaw_runtime::sop::RunOverlay>(),
+            "ApprovalDecision": schema_value::<zeroclaw_runtime::sop::ApprovalDecision>(),
+            "TriggerSourceRegistry": schema_value::<zeroclaw_runtime::sop::TriggerSourceRegistry>(),
+            "SlashOptionKindsResult": schema_value::<crate::api_skills::SlashOptionKindsResult>(),
         },
         "securitySchemes": {
             "bearerAuth": {
@@ -120,6 +132,37 @@ pub fn build_spec() -> serde_json::Value {
         "schema": { "type": "string" },
         "description": "Section prefix to scope the init pass (e.g. `model_providers`)."
     });
+
+    let force_param = serde_json::json!({
+        "name": "force",
+        "in": "query",
+        "required": false,
+        "schema": { "type": "boolean" },
+        "description": "Bypass the 1h server-side cache and re-query GitHub."
+    });
+
+    let check_version_param = serde_json::json!({
+        "name": "version",
+        "in": "query",
+        "required": false,
+        "schema": { "type": "string" },
+        "description": "Check a specific release tag instead of the latest."
+    });
+
+    let handoff_param = serde_json::json!({
+        "name": "handoff_id",
+        "in": "query",
+        "required": false,
+        "schema": { "type": "string" },
+        "description": "Scope the status read to a specific upgrade run (404 on mismatch)."
+    });
+
+    let version_error = |description: &str| {
+        serde_json::json!({
+            "description": description,
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VersionError" } } }
+        })
+    };
 
     let error_responses = serde_json::json!({
         "400": {
@@ -193,6 +236,19 @@ pub fn build_spec() -> serde_json::Value {
                     "200": {
                         "description": "List of properties.",
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ListResponse" } } }
+                    }
+                }
+            }
+        },
+        "/api/skills/slash-option-kinds": {
+            "get": {
+                "tags": ["skills"],
+                "summary": "Typed slash-option kind registry",
+                "description": "Returns the canonical set of typed slash-command option kinds and each kind's constraint capabilities (choices / numeric bounds / length bounds), built by walking the backend kind enum. Surfaces read this instead of restating the kind list.",
+                "responses": {
+                    "200": {
+                        "description": "The slash-option kind registry.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlashOptionKindsResult" } } }
                     }
                 }
             }
@@ -294,6 +350,55 @@ pub fn build_spec() -> serde_json::Value {
                     }
                 }
             }
+        },
+        "/api/version/check": {
+            "get": {
+                "tags": ["version"],
+                "summary": "Check for a newer release",
+                "description": "Runs `zeroclaw update --check --json` server-side (1h cache, force-refreshable). Never fails the dashboard: on any error it still returns 200 with `is_newer: false` and an `error` string so the version badge degrades gracefully.",
+                "parameters": [force_param, check_version_param],
+                "responses": {
+                    "200": {
+                        "description": "Version comparison, or a soft-error envelope carrying `error`.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VersionCheckResponse" } } }
+                    }
+                }
+            }
+        },
+        "/api/version/upgrade": {
+            "post": {
+                "tags": ["version"],
+                "summary": "Apply an upgrade via `zeroclaw update`",
+                "description": "Replaces the running binary and (opt-in) restarts the process. Gated by `gateway.allow_self_upgrade` (default off → 403). Single-flight: a concurrent call returns 409. Returns 202 with a `handoff_id`; poll `/api/version/upgrade/status` for progress. An empty body uses defaults (latest version, no auto-restart).",
+                "requestBody": {
+                    "required": false,
+                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpgradeRequest" } } }
+                },
+                "responses": {
+                    "202": {
+                        "description": "Upgrade accepted; it runs on a detached task.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpgradeAcceptedResponse" } } }
+                    },
+                    "400": version_error("Invalid JSON body, or `auto_restart` is not available in this environment (container/non-unix bare process)."),
+                    "403": version_error("Self-upgrade is disabled (`gateway.allow_self_upgrade = false`)."),
+                    "409": version_error("An upgrade is already in progress."),
+                }
+            }
+        },
+        "/api/version/upgrade/status": {
+            "get": {
+                "tags": ["version"],
+                "summary": "Poll in-flight upgrade progress",
+                "description": "Returns `{ state: \"idle\" }` when no upgrade has run this process, else the live phase (0..=6), the last ~50 log lines, and restart metadata. Pass `handoff_id` to scope the read to a specific run.",
+                "parameters": [handoff_param],
+                "responses": {
+                    "200": {
+                        "description": "Current upgrade progress.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpgradeStatusResponse" } } }
+                    },
+                    "404": version_error("Unknown `handoff_id`."),
+                }
+            }
         }
     });
 
@@ -308,25 +413,73 @@ pub fn build_spec() -> serde_json::Value {
         "paths": paths,
         "components": components,
     });
+    #[cfg(feature = "a2a")]
+    augment_spec_with_a2a(
+        &mut spec,
+        schema_value::<crate::a2a::JsonRpcRequest>(),
+        schema_value::<crate::a2a::OutTask>(),
+    );
     flatten_defs_into_components(&mut spec);
     spec
 }
 
-/// schemars emits nested types under each component's `$defs` and
-/// references them as `#/$defs/<Name>`. OpenAPI 3.1 tooling
-/// (openapi-typescript, Scalar, codegen) expects them at top-level
-/// `#/components/schemas/<Name>`. Hoist every `$defs` entry into
-/// `components.schemas` and rewrite refs in place so the spec validates
-/// and external tooling can walk it.
+/// Add the A2A task endpoint and its request/response schemas to the spec.
+/// Gated on `feature = "a2a"` so `--no-default-features --features
+/// schema-export` (a2a off) still compiles and renders a coherent spec.
+#[cfg(all(feature = "schema-export", feature = "a2a"))]
+fn augment_spec_with_a2a(
+    spec: &mut serde_json::Value,
+    task_request_schema: serde_json::Value,
+    task_schema: serde_json::Value,
+) {
+    if let Some(schemas) = spec
+        .pointer_mut("/components/schemas")
+        .and_then(|v| v.as_object_mut())
+    {
+        schemas.insert("A2aTaskRequest".to_string(), task_request_schema);
+        schemas.insert("A2aTask".to_string(), task_schema);
+    }
+    if let Some(paths) = spec.pointer_mut("/paths").and_then(|v| v.as_object_mut()) {
+        paths.insert(
+            "/a2a/{alias}".to_string(),
+            serde_json::json!({
+                "post": {
+                    "tags": ["a2a"],
+                    "summary": "Send a task to a published A2A agent",
+                    "description": "JSON-RPC 2.0 endpoint for one published agent. Only `message/send` is handled: the message `parts` of kind `text` are joined into the agent prompt, the agent runs one turn, and a completed A2A `Task` carrying the reply as an artifact is returned. Requires a pairing-derived bearer token (the turn is tool-enabled, so it is never served unauthenticated). Unpublished or disabled aliases return 404. The server must be enabled (`[a2a.server] enabled`) and the alias published (`[agents.<alias>.a2a] published`).",
+                    "parameters": [{
+                        "name": "alias",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "string" },
+                        "description": "Published agent alias, as listed in the discovery catalog."
+                    }],
+                    "requestBody": {
+                        "required": true,
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/A2aTaskRequest" } } }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "JSON-RPC response. On success `result` is a completed A2A Task; on a JSON-RPC error (unknown method, bad params) `error` carries the code and message.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/A2aTask" } } }
+                        },
+                        "401": {
+                            "description": "Missing or invalid bearer token while pairing is required."
+                        },
+                        "404": {
+                            "description": "Server disabled, alias unpublished, or alias unknown."
+                        }
+                    }
+                }
+            }),
+        );
+    }
+}
+
 #[cfg(feature = "schema-export")]
 fn flatten_defs_into_components(spec: &mut serde_json::Value) {
     use serde_json::Value;
 
-    // Collect every `$defs` map across the spec — typically one per
-    // top-level component schema. Hoist entries into a single
-    // `components.schemas` map. Later entries with the same name win;
-    // the macro generates identical schemas for identical types so
-    // collisions are benign.
     let mut hoisted: serde_json::Map<String, Value> = serde_json::Map::new();
     collect_defs(spec, &mut hoisted);
     if let Some(schemas) = spec
@@ -435,6 +588,75 @@ mod tests {
         assert!(paths.get("/api/config/migrate").is_some());
         assert!(paths.get("/api/config/drift").is_some());
         assert!(paths.get("/api/config/reload-status").is_some());
+        assert!(paths.get("/api/version/check").is_some());
+        assert!(paths.get("/api/version/upgrade").is_some());
+        assert!(paths.get("/api/version/upgrade/status").is_some());
+        assert!(paths.get("/api/skills/slash-option-kinds").is_some());
+        #[cfg(feature = "a2a")]
+        assert!(paths.get("/a2a/{alias}").is_some());
+    }
+
+    #[cfg(feature = "schema-export")]
+    #[test]
+    fn spec_registers_version_schemas() {
+        let spec = build_spec();
+        let schemas = spec.pointer("/components/schemas").unwrap();
+        assert!(schemas.get("VersionCheckResponse").is_some());
+        assert!(schemas.get("UpgradeRequest").is_some());
+        assert!(schemas.get("UpgradeAcceptedResponse").is_some());
+        assert!(schemas.get("UpgradeStatusResponse").is_some());
+        assert!(schemas.get("VersionError").is_some());
+        // The `state` enum is hoisted out of UpgradeStatusResponse's `$defs`
+        // into top-level components by `flatten_defs_into_components`.
+        assert!(schemas.get("UpgradeStatusState").is_some());
+        // Refs must be rewritten to point at the hoisted component, not `$defs`.
+        let spec_str = serde_json::to_string(&spec).unwrap();
+        assert!(!spec_str.contains("#/$defs/"));
+    }
+
+    #[cfg(feature = "schema-export")]
+    #[test]
+    fn config_api_schemas_keep_operator_descriptions() {
+        let spec = build_spec();
+        let cases = [
+            ("/components/schemas/PatchOp/description", "JSON Patch"),
+            (
+                "/components/schemas/PatchResponse/properties/warnings/description",
+                "Non-fatal validation warnings",
+            ),
+            (
+                "/components/schemas/ListEntry/description",
+                "Single entry in the list response",
+            ),
+            (
+                "/components/schemas/DriftEntry/description",
+                "in-memory Config diverges",
+            ),
+            (
+                "/components/schemas/ReloadStatusResponse/properties/pending_reload/description",
+                "subsystem re-instantiation",
+            ),
+        ];
+
+        for (pointer, expected) in cases {
+            let description = spec
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("missing generated description at {pointer}"));
+            assert!(
+                description.contains(expected),
+                "description at {pointer} must retain `{expected}`: {description}",
+            );
+        }
+    }
+
+    #[cfg(all(feature = "schema-export", feature = "a2a"))]
+    #[test]
+    fn spec_registers_a2a_task_schemas() {
+        let spec = build_spec();
+        let schemas = spec.pointer("/components/schemas").unwrap();
+        assert!(schemas.get("A2aTaskRequest").is_some());
+        assert!(schemas.get("A2aTask").is_some());
     }
 
     #[cfg(feature = "schema-export")]
@@ -445,5 +667,60 @@ mod tests {
             .pointer("/components/securitySchemes/bearerAuth/scheme")
             .and_then(|v| v.as_str());
         assert_eq!(scheme, Some("bearer"));
+    }
+
+    #[tokio::test]
+    async fn docs_route_sets_own_csp_admitting_scalar_cdn() {
+        let response = handle_docs().await;
+        let csp = response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .expect("docs route must set its own CSP")
+            .to_str()
+            .unwrap();
+        assert!(
+            csp.contains("script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net"),
+            "docs CSP must admit the Scalar CDN script: {csp}"
+        );
+    }
+
+    #[test]
+    fn docs_csp_survives_default_security_layer() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(DOCS_CSP),
+        );
+        crate::security_headers::inject(&mut headers, false);
+        let csp = headers
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            csp.contains("https://cdn.jsdelivr.net"),
+            "default layer must not clobber the handler-owned docs CSP: {csp}"
+        );
+    }
+
+    #[cfg(all(feature = "schema-export", feature = "a2a"))]
+    #[test]
+    fn a2a_task_operation_requires_bearer_auth() {
+        let spec = build_spec();
+        // No per-operation security override: the endpoint inherits the
+        // global `bearerAuth` requirement. A tool-enabled agent turn is never
+        // served unauthenticated.
+        let security = spec.pointer("/paths/~1a2a~1{alias}/post/security");
+        assert_eq!(security, None);
+        let global = spec
+            .pointer("/security")
+            .and_then(|v| v.as_array())
+            .expect("global security present");
+        assert!(
+            global
+                .iter()
+                .any(|scheme| scheme.get("bearerAuth").is_some()),
+            "global security must require bearerAuth"
+        );
     }
 }

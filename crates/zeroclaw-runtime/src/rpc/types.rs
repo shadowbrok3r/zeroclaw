@@ -1,16 +1,4 @@
 //! Shared request/response types for the ZeroClaw RPC + gateway API surface.
-//!
-//! **Single source of truth.** Every domain's wire types live here.
-//! The RPC dispatcher, the HTTP gateway, and the TUI client all
-//! import from this module. No ad-hoc `json!()`, no duplicated structs.
-//!
-//! ## Conventions
-//!
-//! - All structs derive `Debug, Clone, Serialize, Deserialize`.
-//! - All structs use `#[serde(rename_all = "snake_case")]`.
-//! - Optional fields use `#[serde(default, skip_serializing_if = "Option::is_none")]`.
-//! - Types that already exist elsewhere (`MemoryEntry`, `CronJob`,
-//!   `CostSummary`, `SkillFrontmatter`) are re-exported, not re-defined.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -23,6 +11,7 @@ pub use crate::doctor::{DiagResult, Severity as DoctorSeverity};
 pub use crate::rpc::session::SessionOverrides;
 pub use crate::skills::frontmatter::SkillFrontmatter;
 pub use zeroclaw_api::memory_traits::{MemoryCategory, MemoryEntry};
+pub use zeroclaw_api::runtime_status::RuntimeConfigKind;
 pub use zeroclaw_config::cost::types::CostSummary;
 pub use zeroclaw_config::traits::{ConfigFieldEntry, PropKind};
 
@@ -68,6 +57,12 @@ rpc_type! {
         /// daemon on their behalf. Omitted by older clients; defaults to empty.
         #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
         pub env: std::collections::HashMap<String, String>,
+        #[serde(
+            default,
+            rename = "clientCapabilities",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub client_capabilities: Option<serde_json::Value>,
     }
 }
 
@@ -97,6 +92,14 @@ rpc_type! {
         pub protocol_version: u64,
         pub active_sessions: usize,
         pub session_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub config_dir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub config_file: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub config_kind: Option<RuntimeConfigKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub local_ipc_endpoint: Option<String>,
     }
 }
 
@@ -308,11 +311,6 @@ rpc_type! {
 }
 
 rpc_type! {
-    /// Params for `session/messages`. `limit` + `before_index`
-    /// page-window the load so a long session doesn't slurp every
-    /// message into client memory at once. Both default to the
-    /// legacy "load everything" behaviour for callers that pre-date
-    /// the pagination change.
     pub struct SessionMessagesParams {
         pub session_id: String,
         #[serde(default)]
@@ -540,7 +538,11 @@ rpc_type! {
     pub struct CronTriggerResult {
         pub id: String,
         pub success: bool,
+        pub status: String,
         pub output: String,
+        pub duration_ms: i64,
+        pub started_at: String,
+        pub finished_at: String,
     }
 }
 
@@ -691,6 +693,8 @@ rpc_type! {
         pub from: String,
         pub to: String,
         pub renamed: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub warnings: Vec<String>,
     }
 }
 
@@ -822,11 +826,6 @@ rpc_type! {
 }
 
 rpc_type! {
-    /// One skill in an agent's *effective* set (the runtime's four-source
-    /// union), with provenance — for `GET /api/agents/{alias}/skills` (#7757).
-    /// Distinct from [`SkillListEntry`] (bundle-editor wire type); the two must
-    /// not be conflated. `origin` is the discriminant; `plugin`/`bundle` carry
-    /// the source detail; `editable` is `true` only for `origin == "bundle"`.
     pub struct AgentSkillEntry {
         pub name: String,
         pub description: String,
@@ -839,6 +838,39 @@ rpc_type! {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub directory: Option<String>,
         pub editable: bool,
+        /// Lower-precedence same-name skills this one shadows. Empty normally;
+        /// additive so old clients ignore it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub shadowed: Vec<ShadowedSkillEntry>,
+    }
+}
+
+rpc_type! {
+    /// A lower-precedence same-name skill shadowed by a winning skill
+    pub struct ShadowedSkillEntry {
+        pub name: String,
+        /// `"workspace"` | `"open-skills"` | `"plugin"` | `"bundle"`.
+        pub origin: String,
+    }
+}
+
+rpc_type! {
+    /// A candidate skill the audited resolver dropped (security audit failed,
+    /// unauditable, or manifest parse error)
+    pub struct DroppedSkillEntry {
+        pub name: String,
+        pub origin: String,
+        /// `"audit_findings"` | `"audit_error"` | `"manifest_parse_error"`.
+        pub reason_kind: String,
+        /// Human-readable detail (the audit summary / error text).
+        pub reason: String,
+        /// True when the secure-default script policy is the blocker, so the
+        /// dashboard can surface the `skills.allow_scripts = true` remediation
+        /// without parsing `reason`. Additive; old clients ignore it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub scripts_blocked: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub directory: Option<String>,
     }
 }
 
@@ -846,6 +878,10 @@ rpc_type! {
     pub struct AgentSkillsResult {
         pub agent: String,
         pub skills: Vec<AgentSkillEntry>,
+        /// Audit-dropped candidates the resolver skipped. Empty normally;
+        /// additive so old clients ignore it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub dropped: Vec<DroppedSkillEntry>,
     }
 }
 
@@ -1056,6 +1092,8 @@ rpc_type! {
         /// backend picker).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub shape: Option<zeroclaw_config::sections::SectionShape>,
+        #[serde(default)]
+        pub cost_category: String,
     }
 }
 
@@ -1209,6 +1247,11 @@ rpc_type! {
         pub until_ts: Option<String>,
         #[serde(default)]
         pub until_id: Option<String>,
+        /// Byte offset to resume reading from. Set from the previous
+        /// `LogsQueryResult::next_cursor_line_offset` for deterministic
+        /// pagination regardless of id ordering.
+        #[serde(default)]
+        pub until_line_offset: Option<u64>,
         #[serde(default)]
         pub severity_min: Option<u8>,
         #[serde(default)]
@@ -1231,7 +1274,19 @@ rpc_type! {
 rpc_type! {
     pub struct LogsQueryResult {
         pub events: Vec<serde_json::Value>,
+        /// Legacy cursor. Deprecated since 0.8.0; tracked for removal in
+        /// <https://github.com/zeroclaw-labs/zeroclaw/issues/8012>.
+        #[deprecated(
+            since = "0.8.0",
+            note = "tie-breaks by lexicographic id and can silently drop events; \
+                    use `next_cursor_line_offset` / `until_line_offset` instead. \
+                    Removal tracked in zeroclaw-labs/zeroclaw#8012."
+        )]
         pub next_cursor: Option<(String, String)>,
+        /// Byte offset past the last event on this page. Callers should
+        /// pass this back as `until_line_offset` on the next request to
+        /// resume without re-scanning already-read bytes.
+        pub next_cursor_line_offset: Option<u64>,
         pub at_end: bool,
     }
 }
@@ -1290,7 +1345,8 @@ pub enum SessionUpdateEvent {
         timeout_secs: u64,
     },
     /// Per-LLM-call token usage. `input_tokens` is the cumulative context size
-    /// for this turn; `max_context_tokens` is the configured limit. Both may be
+    /// for this turn; `max_context_tokens` is the runtime-profile context
+    /// budget (`[runtime_profiles.<name>] max_context_tokens`). Both may be
     /// absent when the provider doesn't report usage.
     ContextUsage {
         session_id: String,
@@ -1298,6 +1354,13 @@ pub enum SessionUpdateEvent {
         input_tokens: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_context_tokens: Option<u64>,
+    },
+    /// Emitted when the TodoWrite tool produces a plan. The `entries` array
+    /// carries the normalized `PlanEntry` values (content, status, priority,
+    /// optional activeForm) so the client can render the live tracker.
+    Plan {
+        session_id: String,
+        entries: Vec<zeroclaw_api::plan::PlanEntry>,
     },
     /// Terminal event for a turn. Replaces the response of `session/prompt`.
     /// `outcome` distinguishes a clean finish from a user-initiated cancel.
@@ -1307,6 +1370,17 @@ pub enum SessionUpdateEvent {
         /// Final assistant text (Completed) or partial accumulated text
         /// at cancel point (Cancelled).
         content: String,
+    },
+    /// Emitted whenever older whole turns were dropped from structured history
+    /// to fit a token budget or message cap. Surfaces a user-visible "context
+    /// was cut here" marker so trimming is never silent. `dropped_messages` is
+    /// the count of conversation messages removed; `kept_turns` is how many
+    /// whole turns remained after the cut.
+    HistoryTrimmed {
+        session_id: String,
+        dropped_messages: usize,
+        kept_turns: usize,
+        reason: String,
     },
 }
 
@@ -1321,16 +1395,6 @@ pub enum TurnCompletionOutcome {
     Failed,
 }
 
-// ══════════════════════════════════════════════════════════════════════
-// ── Quickstart ───────────────────────────────────────────────────────
-// ══════════════════════════════════════════════════════════════════════
-//
-// RPC mirror of the HTTP `/api/quickstart/*` routes in
-// `zeroclaw-gateway`. The wire shapes are deliberately identical so the
-// drift test in `tests/quickstart_drift.rs` can submit the same fixture
-// `BuilderSubmission` through both transports and assert identical
-// on-disk delta + identical response shape.
-
 pub use crate::quickstart::{
     AppliedAgent, FieldDescriptor, FieldSection, QuickstartError, QuickstartStep, Surface,
 };
@@ -1343,6 +1407,9 @@ rpc_type! {
         pub agents: Vec<String>,
         pub risk_profiles: Vec<String>,
         pub runtime_profiles: Vec<String>,
+        /// Canonical runtime fallback for providers without a recommendation.
+        #[serde(default)]
+        pub default_runtime_profile: Option<String>,
         /// `<provider_type>.<alias>` refs.
         pub model_providers: Vec<String>,
         /// `<channel_type>.<alias>` refs.
@@ -1378,6 +1445,9 @@ rpc_type! {
         /// `true` when the entry runs locally and needs no remote
         /// credential. Always `false` for channels.
         pub local: bool,
+        /// Daemon-derived runtime preset to auto-select for this provider.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub default_runtime_profile: Option<String>,
     }
 }
 
@@ -1446,5 +1516,252 @@ rpc_type! {
 rpc_type! {
     pub struct QuickstartDismissResult {
         pub recorded: bool,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn chat_mode_serializes_as_snake_case() {
+        assert_eq!(serde_json::to_value(ChatMode::Chat).unwrap(), json!("chat"));
+        assert_eq!(serde_json::to_value(ChatMode::Acp).unwrap(), json!("acp"));
+    }
+
+    #[test]
+    fn chat_mode_deserializes_from_snake_case() {
+        assert_eq!(
+            serde_json::from_value::<ChatMode>(json!("chat")).unwrap(),
+            ChatMode::Chat
+        );
+        assert_eq!(
+            serde_json::from_value::<ChatMode>(json!("acp")).unwrap(),
+            ChatMode::Acp
+        );
+    }
+
+    #[test]
+    fn file_source_default_is_file() {
+        // `FileSource` does not derive `PartialEq`; assert via the wire
+        // spelling instead. Default is `File` per the `#[default]`
+        // attribute — drift here would change file-attach defaults for
+        // every caller.
+        assert_eq!(
+            serde_json::to_value(FileSource::default()).unwrap(),
+            json!("file")
+        );
+        assert_eq!(
+            serde_json::to_value(FileSource::File).unwrap(),
+            json!("file")
+        );
+        assert_eq!(
+            serde_json::to_value(FileSource::Clipboard).unwrap(),
+            json!("clipboard")
+        );
+    }
+
+    #[test]
+    fn turn_completion_outcome_round_trips_each_variant() {
+        for variant in [
+            TurnCompletionOutcome::Completed,
+            TurnCompletionOutcome::Cancelled,
+            TurnCompletionOutcome::Failed,
+        ] {
+            let s = serde_json::to_value(variant).unwrap();
+            let back: TurnCompletionOutcome = serde_json::from_value(s.clone()).unwrap();
+            assert_eq!(back, variant, "round-trip failed for {s:?}");
+        }
+        // Lock the wire spelling — older clients string-match on these.
+        assert_eq!(
+            serde_json::to_value(TurnCompletionOutcome::Completed).unwrap(),
+            json!("completed")
+        );
+    }
+
+    #[test]
+    fn session_update_event_uses_snake_case_variants() {
+        // Variants stay PascalCase → wire is snake_case, including the
+        // multi-word ones that historically drifted when serde flattened
+        // them. The discriminant lives under `"type"` (adjacent tagging)
+        // — a change here would break every TUI that subscribes.
+        let evt = SessionUpdateEvent::AgentMessageChunk {
+            session_id: "s".into(),
+            text: "t".into(),
+        };
+        let v = serde_json::to_value(evt).unwrap();
+        assert_eq!(v["type"], json!("agent_message_chunk"));
+        assert_eq!(v["session_id"], json!("s"));
+        assert_eq!(v["text"], json!("t"));
+
+        let evt = SessionUpdateEvent::ApprovalRequest {
+            session_id: "s".into(),
+            request_id: "r".into(),
+            tool_name: "shell".into(),
+            arguments_summary: "ls".into(),
+            timeout_secs: 30,
+        };
+        let v = serde_json::to_value(evt).unwrap();
+        assert_eq!(v["type"], json!("approval_request"));
+        assert!(v.get("tool_name").is_some(), "got: {v}");
+    }
+
+    #[test]
+    fn quickstart_validate_result_ok_variant_uses_kind_tag() {
+        let v = serde_json::to_value(QuickstartValidateResult::Ok).unwrap();
+        assert_eq!(v, json!({"kind": "ok"}));
+    }
+
+    #[test]
+    fn quickstart_validate_result_errors_variant_carries_payload() {
+        // Just smoke-test the field structure — `QuickstartError` is owned
+        // by `quickstart` and has its own coverage there.
+        let v =
+            serde_json::to_value(QuickstartValidateResult::Errors { errors: Vec::new() }).unwrap();
+        assert_eq!(v["kind"], json!("errors"));
+        assert!(v["errors"].is_array(), "got: {v}");
+    }
+
+    #[test]
+    fn quickstart_apply_result_applied_variant_carries_daemon_flag() {
+        // `daemon_restarted: false` is the test-harness contract — the web
+        // surface reads this to decide whether to tell the user to restart
+        // manually. Lock it. The variant is tagged (`"kind": "applied"`),
+        // and the agent payload is snake_case.
+        let v = serde_json::to_value(QuickstartApplyResult::Applied {
+            agent: AppliedAgent {
+                alias: "primary".into(),
+                model_provider: "anthropic.claude".into(),
+                risk_profile: "standard".into(),
+                runtime_profile: "default".into(),
+                channels: vec!["telegram.main".into()],
+                memory_backend: "sqlite".into(),
+            },
+            daemon_restarted: false,
+        })
+        .unwrap();
+        assert_eq!(v["kind"], json!("applied"));
+        assert_eq!(v["daemon_restarted"], json!(false));
+        assert_eq!(v["agent"]["alias"], json!("primary"));
+    }
+
+    #[test]
+    fn initialize_params_defaults_protocol_version_to_one() {
+        // Older clients omit `protocol_version`; the runtime must default
+        // to `1` so the handshake succeeds without an explicit version.
+        let p: InitializeParams = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(p.protocol_version, 1);
+    }
+
+    #[test]
+    fn initialize_params_accepts_snake_case_field_names() {
+        let p: InitializeParams = serde_json::from_value(json!({
+            "protocol_version": 2,
+            "tui_id": "abc",
+            "tui_sig": "sig",
+            "env": {"PATH": "/bin"}
+        }))
+        .unwrap();
+        assert_eq!(p.protocol_version, 2);
+        assert_eq!(p.tui_id.as_deref(), Some("abc"));
+        assert_eq!(p.env.get("PATH").map(String::as_str), Some("/bin"));
+    }
+
+    #[test]
+    fn initialize_params_renames_client_capabilities_field() {
+        // The ACP elicitation RFD uses camelCase on the wire; the rename
+        // is a one-shot field-level override — losing it would silently
+        // break elicitation handshake for every TUI that speaks it.
+        let p: InitializeParams = serde_json::from_value(json!({
+            "clientCapabilities": {"elicitation": {"form": true}}
+        }))
+        .unwrap();
+        let caps = p.client_capabilities.expect("rename lost the field");
+        assert_eq!(caps["elicitation"]["form"], json!(true));
+    }
+
+    #[test]
+    fn file_entry_skips_none_optional_fields_in_output() {
+        // `skip_serializing_if = "Option::is_none"` is what keeps the
+        // wire format tight for older clients that don't understand the
+        // `data_b64` field. Symmetric with the deserialize side.
+        let entry = FileEntry {
+            path: Some("/tmp/x".into()),
+            data_b64: None,
+            filename: None,
+            mime_type: None,
+            source: FileSource::File,
+        };
+        let v = serde_json::to_value(entry).unwrap();
+        assert_eq!(v["path"], json!("/tmp/x"));
+        assert_eq!(v["source"], json!("file"));
+        assert!(
+            v.as_object().unwrap().get("data_b64").is_none(),
+            "None data_b64 leaked into wire: {v}"
+        );
+        assert!(
+            v.as_object().unwrap().get("filename").is_none(),
+            "None filename leaked into wire: {v}"
+        );
+    }
+
+    #[test]
+    fn file_entry_deserializes_when_only_path_is_present() {
+        // The contract is "path OR data_b64"; the schema must accept
+        // path-only entries without forcing the caller to send nulls.
+        let entry: FileEntry = serde_json::from_value(json!({"path": "/tmp/a"})).unwrap();
+        assert_eq!(entry.path.as_deref(), Some("/tmp/a"));
+        assert!(entry.data_b64.is_none());
+        assert_eq!(serde_json::to_value(entry.source).unwrap(), json!("file"));
+    }
+
+    #[test]
+    fn tui_list_entry_round_trip_preserves_all_fields() {
+        let entry = TuiListEntry {
+            tui_id: "tui-1".into(),
+            connected_at: "2026-06-29T10:00:00Z".into(),
+            connected_at_unix: 1_750_000_000,
+            peer_label: "desktop".into(),
+            transport: "wss".into(),
+        };
+        let v: Value = serde_json::to_value(&entry).unwrap();
+        let back: TuiListEntry = serde_json::from_value(v).unwrap();
+        assert_eq!(back.tui_id, entry.tui_id);
+        assert_eq!(back.connected_at_unix, entry.connected_at_unix);
+        assert_eq!(back.transport, entry.transport);
+    }
+
+    #[test]
+    fn quickstart_type_option_round_trip() {
+        let opt = QuickstartTypeOption {
+            kind: "anthropic".into(),
+            display_name: "Anthropic".into(),
+            local: false,
+            default_runtime_profile: Some("unbounded".into()),
+        };
+        let v = serde_json::to_value(&opt).unwrap();
+        assert_eq!(v["kind"], json!("anthropic"));
+        assert_eq!(v["local"], json!(false));
+        assert_eq!(v["default_runtime_profile"], json!("unbounded"));
+        let back: QuickstartTypeOption = serde_json::from_value(v).unwrap();
+        assert_eq!(back.kind, opt.kind);
+        assert_eq!(back.local, opt.local);
+        assert_eq!(back.default_runtime_profile, opt.default_runtime_profile);
+    }
+
+    #[test]
+    fn quickstart_dismiss_params_deserializes_with_optional_last_step() {
+        // `last_step` is `#[serde(default)] Option<QuickstartStep>` — older
+        // dismiss payloads omit it. Must default to `None` without error.
+        let params: QuickstartDismissParams = serde_json::from_value(json!({
+            "run_id": "r1",
+            "surface": "tui"
+        }))
+        .unwrap();
+        assert_eq!(params.run_id, "r1");
+        assert_eq!(params.surface, Surface::Tui);
+        assert!(params.last_step.is_none());
     }
 }

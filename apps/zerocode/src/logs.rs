@@ -53,11 +53,6 @@ fn severity_label(num: u8) -> &'static str {
 
 // ── Log entry ────────────────────────────────────────────────────
 
-/// Preview row stored in `LogsPane.events`. Carries only the fields
-/// rendered in the left-side list. The right-side detail pane fetches
-/// the full event payload via `logs/get` when opened and drops it on
-/// close — keeping the per-row footprint to a few short strings even
-/// across thousands of buffered events.
 struct LogEntry {
     /// Stable event id from the persistent log store. Used to lazy-fetch
     /// the full payload via `logs/get { id }` when the detail pane opens.
@@ -67,25 +62,13 @@ struct LogEntry {
     category: String,
     action: String,
     message: String,
+    live_detail_fallback: Option<Value>,
 }
 
-/// Full event payload — populated by `logs/get` when the detail pane
-/// opens, dropped back to `None` when the pane closes. Holds the raw
-/// `Value` (with trace ids, attribution map, attributes JSON, …) so
-/// the renderer can read every field on demand without the list ever
-/// storing them.
 pub(crate) struct LogDetail {
     raw: Value,
 }
 
-/// Three-state lifecycle for the detail pane body. `logs/get` can
-/// legitimately fail — events that arrive via the `logs/event` push
-/// before the daemon's writer has flushed them carry a fallback id
-/// (the timestamp) that the persistent store cannot resolve. Without
-/// a distinct failed state the renderer cannot tell an in-flight
-/// fetch from a resolved-but-empty one, and the pane sticks on
-/// "Loading…" forever. `Ready` carries either the full payload or a
-/// preview-only fallback built from the list row.
 pub(crate) enum DetailState {
     /// `logs/get` is in flight (or the pane just opened).
     Loading,
@@ -95,11 +78,16 @@ pub(crate) enum DetailState {
 
 impl LogEntry {
     fn from_value(v: &Value) -> Option<Self> {
-        // Prefer the persistent id from the log store. Fall back to
-        // `(timestamp, span_id)` for events arriving via the
-        // `logs/event` push notification before a persistent id is
-        // assigned — those rows lazy-fetch full detail via
-        // `logs/get { id }` once the daemon's writer has flushed them.
+        Self::from_value_with_fallback(v, None)
+    }
+
+    fn from_live_value(v: Value) -> Option<Self> {
+        let mut entry = Self::from_value_with_fallback(&v, None)?;
+        entry.live_detail_fallback = Some(v);
+        Some(entry)
+    }
+
+    fn from_value_with_fallback(v: &Value, live_detail_fallback: Option<Value>) -> Option<Self> {
         let timestamp = v.get("@timestamp")?.as_str()?.to_string();
         let id = v
             .get("id")
@@ -130,7 +118,15 @@ impl LogEntry {
             category,
             action,
             message,
+            live_detail_fallback,
         })
+    }
+
+    fn fallback_detail(&self) -> LogDetail {
+        self.live_detail_fallback
+            .clone()
+            .map(LogDetail::new)
+            .unwrap_or_else(|| LogDetail::from_preview(self))
     }
 
     fn short_time(&self) -> &str {
@@ -468,11 +464,6 @@ pub(crate) struct Logs {
     min_severity: u8,
     subscribed: bool,
     detail_open: bool,
-    /// Lazy-loaded full event payload, tracked as a three-state
-    /// machine so the renderer can tell a fetch still in flight
-    /// apart from one that resolved with no payload. Closing the
-    /// pane resets this to `Loading` so long sessions never
-    /// accumulate detail bodies for events scrolled past.
     detail: DetailState,
     /// Id of the event whose detail is currently being fetched
     /// or shown. Used to ignore stale `logs/get` responses when
@@ -484,8 +475,8 @@ pub(crate) struct Logs {
     search_active: bool,
     search_buf: String,
     search_query: String, // committed query (applied on Enter)
-    // Pagination
-    next_cursor: Option<(String, String)>,
+    next_cursor_offset: Option<u64>,
+    next_cursor_legacy: Option<(String, String)>,
     at_end: bool,
     loading: bool,
     // Viewport
@@ -514,7 +505,8 @@ impl Logs {
             search_active: false,
             search_buf: String::new(),
             search_query: String::new(),
-            next_cursor: None,
+            next_cursor_offset: None,
+            next_cursor_legacy: None,
             at_end: false,
             loading: false,
             list_height: 0,
@@ -528,16 +520,21 @@ impl Logs {
         self.rpc.logs_subscribe().await?;
         self.subscribed = true;
         // Load initial history
-        self.load_page(None).await;
+        self.load_page(None, None).await;
         Ok(())
     }
 
     /// Fetch a page of older events. If `cursor` is None, fetches the newest.
-    async fn load_page(&mut self, cursor: Option<(String, String)>) {
+    async fn load_page(
+        &mut self,
+        cursor_offset: Option<u64>,
+        cursor_legacy: Option<(String, String)>,
+    ) {
         self.loading = true;
         let params = LogsQueryParams {
-            until_ts: cursor.as_ref().map(|(ts, _)| ts.clone()),
-            until_id: cursor.as_ref().map(|(_, id)| id.clone()),
+            until_ts: cursor_legacy.as_ref().map(|(ts, _)| ts.clone()),
+            until_id: cursor_legacy.as_ref().map(|(_, id)| id.clone()),
+            until_line_offset: cursor_offset,
             severity_min: Some(self.min_severity),
             q: if self.search_query.is_empty() {
                 None
@@ -545,13 +542,14 @@ impl Logs {
                 Some(self.search_query.clone())
             },
             hide_internal: true,
-            limit: Some(if cursor.is_none() {
+            limit: Some(if cursor_offset.is_none() && cursor_legacy.is_none() {
                 INITIAL_LOAD
             } else {
                 PAGE_SIZE
             }),
             ..Default::default()
         };
+        let has_cursor = cursor_offset.is_some() || cursor_legacy.is_some();
         match self.rpc.logs_query(params).await {
             Ok(result) => {
                 // Events come newest-first from the daemon; reverse to chronological
@@ -562,7 +560,7 @@ impl Logs {
                     .filter_map(LogEntry::from_value)
                     .collect();
                 let prepended = new_entries.len();
-                if cursor.is_some() && prepended > 0 {
+                if has_cursor && prepended > 0 {
                     // Prepend older events before the existing buffer
                     let mut combined = new_entries;
                     combined.append(&mut self.events);
@@ -571,10 +569,14 @@ impl Logs {
                     if let Some(sel) = self.list_state.selected() {
                         self.list_state.select(Some(sel + prepended));
                     }
-                } else if cursor.is_none() {
+                } else if !has_cursor {
                     self.events = new_entries;
                 }
-                self.next_cursor = result.next_cursor;
+                // Prefer the byte-offset cursor (independent of id ordering);
+                // fall back to the legacy `[timestamp, id]` pair when the
+                // daemon has not been upgraded to expose it.
+                self.next_cursor_offset = result.next_cursor_line_offset;
+                self.next_cursor_legacy = result.next_cursor;
                 self.at_end = result.at_end;
             }
             Err(_) => {
@@ -601,7 +603,8 @@ impl Logs {
 
         // Reset pagination so subsequent scroll-to-top loads can
         // fetch history matching the new filter set.
-        self.next_cursor = None;
+        self.next_cursor_offset = None;
+        self.next_cursor_legacy = None;
         self.at_end = false;
 
         let filtered = self.filtered_indices();
@@ -637,7 +640,7 @@ impl Logs {
         loop {
             match self.notif_rx.try_recv() {
                 Ok(notif) if notif.method == LOGS_EVENT_METHOD => {
-                    if let Some(entry) = LogEntry::from_value(&notif.params) {
+                    if let Some(entry) = LogEntry::from_live_value(notif.params) {
                         self.events.push(entry);
                     }
                 }
@@ -792,7 +795,7 @@ impl Logs {
 
         // Footer: ?=help hint at bottom-left.
         frame.render_widget(
-            Paragraph::new(Span::styled(" ?=help", theme::dim_style())),
+            Paragraph::new(Span::styled(crate::mouse::HELP_HINT, theme::dim_style())),
             chunks[3],
         );
     }
@@ -848,11 +851,6 @@ impl Logs {
             return;
         };
 
-        // Detail body is lazy-loaded via `logs/get` when the pane
-        // opens (see `sync_detail_to_selection`). While the daemon is
-        // still answering, show a placeholder; once the fetch resolves
-        // — with the full payload or a preview-only fallback — render
-        // the fields so the pane never sticks on "Loading…".
         let lines = match &self.detail {
             DetailState::Ready(d) => d.detail_lines(),
             DetailState::Loading => {
@@ -1057,9 +1055,10 @@ impl Logs {
         if sel == 0
             && !self.at_end
             && !self.loading
-            && let Some(cursor) = self.next_cursor.clone()
+            && (self.next_cursor_offset.is_some() || self.next_cursor_legacy.is_some())
         {
-            self.load_page(Some(cursor)).await;
+            self.load_page(self.next_cursor_offset, self.next_cursor_legacy.clone())
+                .await;
         }
     }
 
@@ -1146,11 +1145,12 @@ impl Logs {
         self.detail_request_id = Some(id.clone());
         // `logs/get` can fail for push-delivered rows the persistent
         // store hasn't flushed yet (their id falls back to the
-        // timestamp). Fall back to the preview row rather than leaving
-        // the pane stuck on "Loading…".
+        // timestamp). Prefer the pushed full event as a bounded
+        // in-memory fallback; only drop to preview fields when the row
+        // truly has no full payload.
         let resolved = match self.rpc.logs_get(&id).await {
             Ok(r) => LogDetail::new(r.event),
-            Err(_) => LogDetail::from_preview(&self.events[idx]),
+            Err(_) => self.events[idx].fallback_detail(),
         };
         if self.detail_request_id.as_deref() == Some(id.as_str()) {
             self.detail = DetailState::Ready(resolved);
@@ -1208,56 +1208,51 @@ impl Logs {
 
 impl crate::widgets::HelpContext for Logs {
     fn help_context(&self) -> crate::widgets::HelpNode {
+        use crate::help::entries_for;
+        use crate::keymap::LogsTabAction as L;
         use crate::widgets::{HelpEntry as E, HelpNode};
         if self.search_active {
-            HelpNode::entries(vec![
-                E::key("Enter", crate::i18n::t("zc-logs-help-apply-search")),
-                E::key("Esc", crate::i18n::t("zc-logs-help-cancel-search")),
-            ])
+            HelpNode::entries(entries_for([
+                crate::keymap::SearchBoxAction::Accept,
+                crate::keymap::SearchBoxAction::Cancel,
+            ]))
         } else if self.detail_open {
-            HelpNode::entries(vec![
-                E::new(
-                    vec!["Esc", "Enter"],
-                    crate::i18n::t("zc-logs-help-close-detail"),
-                ),
-                E::new(
-                    vec!["j", "k", "↑↓"],
-                    crate::i18n::t("zc-logs-help-move-cursor"),
-                ),
-                E::new(
-                    vec!["J", "K", "Shift+↑↓"],
-                    crate::i18n::t("zc-logs-help-scroll-detail"),
-                ),
-                E::key("Shift+←→", crate::i18n::t("zc-logs-help-resize-detail")),
-                E::key("f", crate::i18n::t("zc-logs-help-toggle-follow")),
-                E::key("/", crate::i18n::t("zc-logs-help-search")),
-                E::key("+ / -", crate::i18n::t("zc-logs-help-severity-filter")),
-                E::key("c", crate::i18n::t("zc-logs-help-clear-search")),
-                E::key("y", crate::i18n::t("zc-logs-help-yank-detail")),
-                E::key("?", crate::i18n::t("zc-logs-help-this-help")),
-            ])
+            HelpNode::entries(entries_for([
+                L::CloseDetail,
+                L::Up,
+                L::Down,
+                L::DetailScrollUp,
+                L::DetailScrollDown,
+                L::DetailWidenLeft,
+                L::DetailWidenRight,
+                L::ToggleFollow,
+                L::BeginSearch,
+                L::IncreaseLevel,
+                L::DecreaseLevel,
+                L::ClearSearch,
+                L::CopyDetail,
+            ]))
         } else {
-            HelpNode::entries(vec![
-                E::new(
-                    vec!["j", "k", "↑↓"],
-                    crate::i18n::t("zc-logs-help-move-cursor-list"),
-                ),
-                E::new(vec!["G", "End"], crate::i18n::t("zc-logs-help-jump-bottom")),
-                E::new(vec!["g", "Home"], crate::i18n::t("zc-logs-help-jump-top")),
-                E::key("PgDn / PgUp", crate::i18n::t("zc-logs-help-page")),
-                E::key("Enter", crate::i18n::t("zc-logs-help-open-detail")),
-                E::key("f", crate::i18n::t("zc-logs-help-toggle-follow")),
-                E::key("/", crate::i18n::t("zc-logs-help-search")),
-                E::key("+ / -", crate::i18n::t("zc-logs-help-severity-filter")),
-                E::key("c", crate::i18n::t("zc-logs-help-clear-search")),
-                E::key("?", crate::i18n::t("zc-logs-help-this-help")),
-                E::spacer(),
-                E::desc(format!(
-                    "{}: {}",
-                    crate::i18n::t("zc-logs-help-mouse-label"),
-                    crate::i18n::t("zc-logs-help-mouse-desc"),
-                )),
-            ])
+            let mut entries = entries_for([
+                L::Up,
+                L::Down,
+                L::JumpEnd,
+                L::JumpStart,
+                L::PageDown,
+                L::OpenDetail,
+                L::ToggleFollow,
+                L::BeginSearch,
+                L::IncreaseLevel,
+                L::DecreaseLevel,
+                L::ClearSearch,
+            ]);
+            entries.push(E::spacer());
+            entries.push(E::desc(format!(
+                "{}: {}",
+                crate::i18n::t("zc-logs-help-mouse-label"),
+                crate::i18n::t("zc-logs-help-mouse-desc"),
+            )));
+            HelpNode::entries(entries)
         }
     }
 }
@@ -1274,6 +1269,7 @@ mod tests {
             category: "internal".into(),
             action: "note".into(),
             message: "TUI disconnected; session ended".into(),
+            live_detail_fallback: None,
         }
     }
 
@@ -1321,6 +1317,33 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .map(|s| s.content.as_ref())
             .collect();
+        assert!(!text.contains(&crate::i18n::t("zc-logs-preview-only")));
+    }
+
+    #[test]
+    fn live_fallback_preserves_full_event_attributes() {
+        let raw = serde_json::json!({
+            "@timestamp": "2026-07-04T06:32:41.044Z",
+            "severity_number": SEV_INFO,
+            "event": { "category": "provider", "action": "send" },
+            "message": "llm_request",
+            "attributes": {
+                "model": "switched-model",
+                "messages_count": 2
+            }
+        });
+        let entry = LogEntry::from_live_value(raw).expect("live event row");
+        let detail = entry.fallback_detail();
+        assert!(!detail.is_preview_only());
+        assert_eq!(detail.attributes()["model"], "switched-model");
+
+        let text: String = detail
+            .detail_lines()
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("switched-model"));
         assert!(!text.contains(&crate::i18n::t("zc-logs-preview-only")));
     }
 }

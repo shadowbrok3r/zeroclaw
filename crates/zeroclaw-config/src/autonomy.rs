@@ -1,10 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// How much autonomy the agent has.
-///
-/// Variants are ordered from least to most autonomous so that
-/// [`Ord`] / [`PartialOrd`] compare a child's level against a
-/// parent's during SubAgent escalation checks (`child <= parent`).
+/// The agent's autonomy level, ordered from least to most autonomous.
 #[derive(
     Debug,
     Clone,
@@ -46,15 +42,7 @@ impl crate::config::HasPropKind for DelegationMode {
     const PROP_KIND: crate::config::PropKind = crate::config::PropKind::Enum;
 }
 
-/// Whether a risk profile may delegate work to other agents.
-///
-/// `Forbidden` (the default) means a profile cannot delegate at all; `Allow`
-/// permits delegation. The set of reachable targets is *not* an explicit
-/// allow-list — delegation is gated on the caller and target sharing a risk
-/// profile, so the shared profile determines who is reachable.
-///
-/// Wire format: `{ mode = "forbidden" }` or `{ mode = "allow" }`. The struct
-/// shape lets the prop layer expose `mode` as an editable enum leaf.
+/// Risk-profile delegation policy for work sent to agents that share it.
 #[derive(
     Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::Configurable,
 )]
@@ -71,6 +59,44 @@ impl DelegationPolicy {
     pub fn permits(&self) -> bool {
         matches!(self.mode, DelegationMode::Allow)
     }
+}
+
+/// What to do when a configured approver cannot be reached. Default FAIL-CLOSED.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum OnNoApprover {
+    /// Fail-closed: deny when the approver is unreachable / declines / times out.
+    #[default]
+    Deny,
+    /// Explicit opt-in: fall back to the originating channel (today's behavior).
+    InheritOriginator,
+}
+
+impl crate::config::HasPropKind for OnNoApprover {
+    const PROP_KIND: crate::config::PropKind = crate::config::PropKind::Enum;
+}
+
+fn default_approval_timeout_secs() -> u64 {
+    120
+}
+
+/// Routes tool approvals to a distinct approver channel with fail-closed defaults.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct ApprovalRoute {
+    /// A registered channel name (NOT the originator) — the distinct-approver hop.
+    pub approver_channel: String,
+    /// Behavior when the approver is unreachable. Fail-closed by default.
+    #[serde(default)]
+    pub on_no_approver: OnNoApprover,
+    /// Bound the approver's response window; a timeout denies (DoS guard). Default 120s.
+    #[serde(default = "default_approval_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl crate::config::HasPropKind for ApprovalRoute {
+    const PROP_KIND: crate::config::PropKind = crate::config::PropKind::Object;
 }
 
 #[cfg(test)]
@@ -90,6 +116,44 @@ mod tests {
         };
         assert!(p.permits());
         assert!(!DelegationPolicy::default().permits());
+    }
+
+    #[test]
+    fn approval_route_defaults_are_fail_closed() {
+        // Absent optional fields: fail-closed policy + bounded 120s window.
+        let r: ApprovalRoute = toml::from_str("approver_channel = \"ops\"").unwrap();
+        assert_eq!(r.approver_channel, "ops");
+        assert_eq!(
+            r.on_no_approver,
+            OnNoApprover::Deny,
+            "default must fail closed"
+        );
+        assert_eq!(r.timeout_secs, 120);
+    }
+
+    #[test]
+    fn approval_route_round_trips() {
+        let r = ApprovalRoute {
+            approver_channel: "ops".into(),
+            on_no_approver: OnNoApprover::InheritOriginator,
+            timeout_secs: 30,
+        };
+        let s = toml::to_string(&r).unwrap();
+        // kebab-case enum on the wire.
+        assert!(s.contains("on_no_approver = \"inherit-originator\""), "{s}");
+        let back: ApprovalRoute = toml::from_str(&s).unwrap();
+        assert_eq!(back.approver_channel, r.approver_channel);
+        assert_eq!(back.on_no_approver, r.on_no_approver);
+        assert_eq!(back.timeout_secs, r.timeout_secs);
+    }
+
+    #[test]
+    fn risk_profile_has_no_route_by_default() {
+        use crate::schema::RiskProfileConfig;
+        assert!(
+            RiskProfileConfig::default().approval_route.is_none(),
+            "default profile must keep today's originating-channel behavior"
+        );
     }
 
     #[test]

@@ -1,10 +1,4 @@
 //! Voice Wake Word detection channel.
-//!
-//! Listens on the default microphone via `cpal`, detects a configurable wake
-//! word using energy-based VAD followed by transcription-based keyword matching,
-//! then captures the subsequent utterance and dispatches it as a channel message.
-//!
-//! Gated behind the `voice-wake` Cargo feature.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -83,6 +77,16 @@ impl ::zeroclaw_api::attribution::Attributable for VoiceWakeChannel {
 
 #[async_trait]
 impl Channel for VoiceWakeChannel {
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // Voice-wake has no text typing indicator.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // Voice-wake has no text typing indicator.
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "voice_wake"
     }
@@ -90,6 +94,10 @@ impl Channel for VoiceWakeChannel {
     async fn send(&self, _message: &SendMessage) -> Result<()> {
         // Voice wake is input-only; outbound messages are not supported.
         Ok(())
+    }
+
+    fn supports_outbound_send(&self) -> bool {
+        false
     }
 
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
@@ -319,6 +327,8 @@ impl Channel for VoiceWakeChannel {
                                         interruption_scope_id: None,
                                         attachments: vec![],
                                         subject: None,
+
+                                        ..Default::default()
                                     };
 
                                     if let Err(e) = tx.send(msg).await {
@@ -378,7 +388,6 @@ pub fn compute_rms_energy(samples: &[f32]) -> f32 {
 }
 
 /// Encode raw f32 PCM samples as a WAV byte buffer (16-bit PCM).
-///
 /// This produces a minimal valid WAV file that Whisper-compatible APIs accept.
 pub fn encode_wav_from_f32(samples: &[f32], sample_rate: u32, channels: u16) -> Vec<u8> {
     let bits_per_sample: u16 = 16;
@@ -628,5 +637,15 @@ mod tests {
         let transcription_config = TranscriptionConfig::default();
         let channel = VoiceWakeChannel::new("testbot", config, transcription_config);
         assert_eq!(channel.name(), "voice_wake");
+    }
+
+    #[test]
+    fn voice_wake_does_not_support_outbound_send() {
+        let channel = VoiceWakeChannel::new(
+            "testbot",
+            VoiceWakeConfig::default(),
+            TranscriptionConfig::default(),
+        );
+        assert!(!channel.supports_outbound_send());
     }
 }

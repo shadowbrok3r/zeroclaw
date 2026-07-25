@@ -14,6 +14,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
+use zeroclaw_api::media::MediaAttachment;
 
 #[derive(Clone)]
 struct CachedSlackDisplayName {
@@ -41,16 +42,13 @@ pub struct SlackChannel {
     workspace_dir: Option<PathBuf>,
     /// Maps channel_id -> thread_ts for active assistant threads (used for status indicators).
     active_assistant_thread: Mutex<HashMap<String, String>>,
-    /// Threads (`thread_ts`) for which we have already prepended a
-    /// `[Thread context]` backfill block. In-memory only — after a
-    /// process restart the set is empty and each active thread sees one
-    /// re-backfill on the next inbound message, which is the accepted
-    /// tradeoff (matches `matrix.rs::context`).
     seen_threads: Mutex<HashSet<String>>,
     /// Use the newer `markdown` block type (richer formatting, 12k char limit).
     use_markdown_blocks: bool,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
+    #[cfg(test)]
+    api_base_url: Option<String>,
     /// Voice transcription config — when set, audio file attachments are
     /// downloaded, transcribed, and their text inlined into the message.
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
@@ -97,6 +95,7 @@ const SLACK_ATTACHMENT_FILENAME_MAX_CHARS: usize = 128;
 const SLACK_USER_CACHE_MAX_ENTRIES: usize = 1000;
 const SLACK_ATTACHMENT_SAVE_SUBDIR: &str = "slack_files";
 const SLACK_ATTACHMENT_MAX_FILES_PER_MESSAGE: usize = 8;
+const SLACK_OUTBOUND_ATTACHMENT_MAX_BYTES: usize = 20 * 1024 * 1024;
 const SLACK_PERMALINK_MAX_LINKS_PER_MESSAGE: usize = 3;
 const SLACK_PERMALINK_THREAD_MAX_REPLIES: usize = 20;
 const SLACK_PERMALINK_TEXT_MAX_CHARS: usize = 8_000;
@@ -116,11 +115,75 @@ enum SlackPermalinkLookup {
     NotFound,
 }
 
-/// Extract the Slack message timestamp from a ZeroClaw message ID.
-///
-/// Message IDs follow the format `slack_{channel_id}_{ts}` where `ts`
-/// contains a dot (e.g. `"1234567890.123456"`). If the format is
-/// unrecognised the raw `message_id` is returned as-is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SlackOutboundAttachmentKind {
+    Image,
+    File,
+}
+
+impl SlackOutboundAttachmentKind {
+    fn from_marker(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "image" | "img" | "photo" => Some(Self::Image),
+            "file" | "document" | "doc" => Some(Self::File),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlackOutboundAttachmentMarker {
+    kind: SlackOutboundAttachmentKind,
+    target: String,
+}
+
+fn parse_outbound_attachment_markers(
+    message: &str,
+) -> (String, Vec<SlackOutboundAttachmentMarker>) {
+    let mut cleaned = String::with_capacity(message.len());
+    let mut attachments = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(rel_start) = message[cursor..].find('[') {
+        let start = cursor + rel_start;
+        cleaned.push_str(&message[cursor..start]);
+
+        let Some(rel_end) = message[start..].find(']') else {
+            cleaned.push_str(&message[start..]);
+            cursor = message.len();
+            break;
+        };
+        let end = start + rel_end;
+        let marker_text = &message[start + 1..end];
+
+        let parsed = marker_text.split_once(':').and_then(|(kind, target)| {
+            let kind = SlackOutboundAttachmentKind::from_marker(kind.trim())?;
+            let target = target.trim();
+            if target.is_empty() {
+                return None;
+            }
+            Some(SlackOutboundAttachmentMarker {
+                kind,
+                target: target.to_string(),
+            })
+        });
+
+        if let Some(attachment) = parsed {
+            attachments.push(attachment);
+        } else {
+            cleaned.push_str(&message[start..=end]);
+        }
+
+        cursor = end + 1;
+    }
+
+    if cursor < message.len() {
+        cleaned.push_str(&message[cursor..]);
+    }
+
+    (cleaned.trim().to_string(), attachments)
+}
+
 fn extract_slack_ts(message_id: &str) -> &str {
     message_id
         .strip_prefix("slack_")
@@ -134,7 +197,6 @@ fn extract_slack_ts(message_id: &str) -> &str {
 }
 
 /// Map a Unicode emoji to its Slack short-name.
-///
 /// The orchestration layer passes Unicode characters (e.g. `"\u{1F440}"`).
 /// Slack's reactions API expects colon-free short-names (`"eyes"`).
 fn unicode_emoji_to_slack_name(emoji: &str) -> &str {
@@ -200,6 +262,8 @@ impl SlackChannel {
             seen_threads: Mutex::new(HashSet::new()),
             use_markdown_blocks: false,
             proxy_url: None,
+            #[cfg(test)]
+            api_base_url: None,
             transcription: None,
             transcription_manager: None,
             stream_drafts: false,
@@ -281,9 +345,24 @@ impl SlackChannel {
         self
     }
 
+    #[cfg(test)]
+    fn with_api_base_url(mut self, api_base_url: impl Into<String>) -> Self {
+        self.api_base_url = Some(api_base_url.into());
+        self
+    }
+
     pub fn with_approval_timeout_secs(mut self, secs: u64) -> Self {
         self.approval_timeout_secs = secs;
         self
+    }
+
+    fn slack_api_url(&self, method: &str) -> String {
+        #[cfg(test)]
+        if let Some(base) = self.api_base_url.as_deref() {
+            return format!("{}/{}", base.trim_end_matches('/'), method);
+        }
+
+        format!("https://slack.com/api/{method}")
     }
 
     /// Configure voice transcription for audio file attachments.
@@ -470,11 +549,215 @@ impl SlackChannel {
         )
     }
 
-    /// Post a new Slack message and return the message timestamp (`ts`).
-    ///
-    /// This is a lower-level helper that exposes the `ts` value needed for
-    /// subsequent `chat.update` calls. For simple sends, use the [`Channel::send`]
-    /// trait method instead.
+    async fn resolve_outbound_attachment_marker(
+        &self,
+        marker: &SlackOutboundAttachmentMarker,
+    ) -> anyhow::Result<MediaAttachment> {
+        let target = marker.target.trim();
+        if target.starts_with("file:") || target.starts_with("data:") || target.contains("://") {
+            anyhow::bail!("Slack outbound attachment target must be a local workspace path");
+        }
+
+        let path = Path::new(target);
+        if !path.is_absolute() {
+            anyhow::bail!("Slack outbound attachment path must be absolute: {target}");
+        }
+
+        let workspace = self
+            .workspace_dir
+            .as_deref()
+            .context("Slack outbound local attachments require workspace_dir")?;
+        let canonical_workspace = tokio::fs::canonicalize(workspace).await.with_context(|| {
+            format!(
+                "failed to canonicalize Slack workspace {}",
+                workspace.display()
+            )
+        })?;
+        let canonical_path = tokio::fs::canonicalize(path)
+            .await
+            .with_context(|| format!("Slack outbound attachment path not found: {target}"))?;
+
+        if !canonical_path.starts_with(&canonical_workspace) {
+            anyhow::bail!(
+                "Slack outbound attachment path escapes workspace: {}",
+                canonical_path.display()
+            );
+        }
+
+        let metadata = tokio::fs::metadata(&canonical_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to stat Slack outbound attachment {}",
+                    canonical_path.display()
+                )
+            })?;
+        if !metadata.is_file() {
+            anyhow::bail!(
+                "Slack outbound attachment target is not a file: {}",
+                canonical_path.display()
+            );
+        }
+        if metadata.len() > SLACK_OUTBOUND_ATTACHMENT_MAX_BYTES as u64 {
+            anyhow::bail!(
+                "Slack outbound attachment exceeds {} bytes: {}",
+                SLACK_OUTBOUND_ATTACHMENT_MAX_BYTES,
+                canonical_path.display()
+            );
+        }
+
+        let data = tokio::fs::read(&canonical_path).await.with_context(|| {
+            format!(
+                "failed to read Slack outbound attachment {}",
+                canonical_path.display()
+            )
+        })?;
+        let file_name = canonical_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(Self::sanitize_attachment_filename)
+            .unwrap_or_else(|| "attachment.bin".to_string());
+        let mime_type = match marker.kind {
+            SlackOutboundAttachmentKind::Image => Self::detect_image_mime(
+                None,
+                &serde_json::json!({"name": file_name}),
+                &data,
+                target,
+            )
+            .or_else(|| {
+                Self::file_extension(&file_name)
+                    .and_then(|ext| Self::mime_from_extension(&ext).map(str::to_string))
+            }),
+            SlackOutboundAttachmentKind::File => None,
+        };
+
+        Ok(MediaAttachment {
+            file_name,
+            data,
+            mime_type,
+        })
+    }
+
+    async fn upload_outbound_attachment(
+        &self,
+        channel_id: &str,
+        thread_ts: Option<&str>,
+        attachment: &MediaAttachment,
+    ) -> anyhow::Result<()> {
+        if attachment.data.len() > SLACK_OUTBOUND_ATTACHMENT_MAX_BYTES {
+            anyhow::bail!(
+                "Slack outbound attachment exceeds {} bytes: {}",
+                SLACK_OUTBOUND_ATTACHMENT_MAX_BYTES,
+                attachment.file_name
+            );
+        }
+        if attachment.data.is_empty() {
+            anyhow::bail!(
+                "Slack outbound attachment is empty: {}",
+                attachment.file_name
+            );
+        }
+
+        let file_name = Self::sanitize_attachment_filename(&attachment.file_name)
+            .unwrap_or_else(|| "attachment.bin".to_string());
+        let length = attachment.data.len().to_string();
+        let upload_resp = self
+            .http_client()
+            .post(self.slack_api_url("files.getUploadURLExternal"))
+            .bearer_auth(&self.bot_token)
+            .form(&[
+                ("filename", file_name.as_str()),
+                ("length", length.as_str()),
+            ])
+            .send()
+            .await?;
+        let upload_body: serde_json::Value = upload_resp.json().await?;
+        if upload_body.get("ok") != Some(&serde_json::Value::Bool(true)) {
+            let err = upload_body
+                .get("error")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            anyhow::bail!("files.getUploadURLExternal failed: {err}");
+        }
+        let upload_url = upload_body
+            .get("upload_url")
+            .and_then(|value| value.as_str())
+            .context("files.getUploadURLExternal response missing upload_url")?;
+        let file_id = upload_body
+            .get("file_id")
+            .and_then(|value| value.as_str())
+            .context("files.getUploadURLExternal response missing file_id")?;
+
+        let upload_status = self
+            .http_client()
+            .post(upload_url)
+            .body(attachment.data.clone())
+            .send()
+            .await?;
+        let status = upload_status.status();
+        if !status.is_success() {
+            let raw = upload_status
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            let sanitized = zeroclaw_providers::sanitize_api_error(&raw);
+            anyhow::bail!("Slack file byte upload failed ({status}): {sanitized}");
+        }
+
+        let mut complete_request = serde_json::json!({
+            "channel_id": channel_id,
+            "files": [{
+                "id": file_id,
+                "title": file_name,
+            }],
+        });
+        if let Some(ts) = thread_ts {
+            complete_request["thread_ts"] = serde_json::json!(ts);
+        }
+        let complete_resp = self
+            .http_client()
+            .post(self.slack_api_url("files.completeUploadExternal"))
+            .bearer_auth(&self.bot_token)
+            .json(&complete_request)
+            .send()
+            .await?;
+        let complete_body: serde_json::Value = complete_resp.json().await?;
+        if complete_body.get("ok") != Some(&serde_json::Value::Bool(true)) {
+            let err = complete_body
+                .get("error")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            anyhow::bail!("files.completeUploadExternal failed: {err}");
+        }
+
+        Ok(())
+    }
+
+    async fn upload_outbound_attachments(
+        &self,
+        channel_id: &str,
+        thread_ts: Option<&str>,
+        attachments: &[MediaAttachment],
+    ) -> anyhow::Result<()> {
+        for attachment in attachments
+            .iter()
+            .take(SLACK_ATTACHMENT_MAX_FILES_PER_MESSAGE)
+        {
+            self.upload_outbound_attachment(channel_id, thread_ts, attachment)
+                .await?;
+        }
+        if attachments.len() > SLACK_ATTACHMENT_MAX_FILES_PER_MESSAGE {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"count": attachments.len()})),
+                "truncated Slack outbound attachment list"
+            );
+        }
+        Ok(())
+    }
+
     pub async fn post_message(&self, channel: &str, text: &str) -> anyhow::Result<String> {
         let body = serde_json::json!({
             "channel": channel,
@@ -483,7 +766,7 @@ impl SlackChannel {
 
         let resp = self
             .http_client()
-            .post("https://slack.com/api/chat.postMessage")
+            .post(self.slack_api_url("chat.postMessage"))
             .bearer_auth(&self.bot_token)
             .json(&body)
             .send()
@@ -528,7 +811,6 @@ impl SlackChannel {
     }
 
     /// Update an existing Slack message in-place using `chat.update`.
-    ///
     /// `channel` is the channel ID and `ts` is the timestamp of the original
     /// message (returned by `post_message`).
     pub async fn update_message(&self, channel: &str, ts: &str, text: &str) -> anyhow::Result<()> {
@@ -623,27 +905,12 @@ impl SlackChannel {
             .map(str::to_string)
     }
 
-    /// Like `inbound_thread_ts`, but only returns a value when Slack's own
-    /// `thread_ts` field is present (genuine thread reply). Does **not** fall
-    /// back to the message's `ts`, so top-level messages get `None`. Used when
-    /// `thread_replies=false` so that all top-level messages from the same user
-    /// share a single conversation session key.
     fn inbound_thread_ts_genuine_only(msg: &serde_json::Value) -> Option<String> {
         msg.get("thread_ts")
             .and_then(|t| t.as_str())
             .map(str::to_string)
     }
 
-    /// Returns the interruption scope identifier for a Slack message.
-    ///
-    /// Returns `Some(thread_ts)` only when the message is a genuine thread reply
-    /// (Slack's `thread_ts` field is present and differs from the message's own `ts`).
-    /// Returns `None` for top-level messages and thread parent messages (where
-    /// `thread_ts == ts`), placing them in the 3-component scope key
-    /// (`channel_reply_target_sender`).
-    ///
-    /// Intentional: top-level messages and threaded replies are separate conversational
-    /// scopes and should not cancel each other's in-flight tasks.
     fn inbound_interruption_scope_id(msg: &serde_json::Value, ts: &str) -> Option<String> {
         msg.get("thread_ts")
             .and_then(|t| t.as_str())
@@ -931,13 +1198,6 @@ impl SlackChannel {
         })
     }
 
-    /// First-encounter thread-context gate. Returns a rendered
-    /// `[Thread context]` block when this is the first message we forward
-    /// for the given thread; returns `None` for top-level messages, thread
-    /// parents, threads we have already backfilled, or fetch failures.
-    ///
-    /// Marks the thread as seen on success, leaves `seen_threads` untouched
-    /// on fetch failure so the next message in the same thread can retry.
     async fn maybe_render_thread_backfill(
         &self,
         message: &serde_json::Value,
@@ -958,25 +1218,9 @@ impl SlackChannel {
         block
     }
 
-    /// Pure filter for `render_thread_backfill_block`. Drops, in order:
-    ///
-    /// - the triggering message itself (already forwarded as the message
-    ///   body — including it here would duplicate it for the agent),
-    /// - unsupported message subtypes (`channel_join`, `channel_leave`,
-    ///   bot status messages, etc. — same gate the main polling loop uses),
-    /// - messages with no `user` field (webhook posts, integration bots).
-    ///   The normal Socket Mode and polling paths skip these before they
-    ///   reach the agent under a restricted `allowed_users` config; the
-    ///   backfill path matches that boundary so historical webhook
-    ///   content can't be smuggled in via `conversations.replies`. The
-    ///   count is folded into the same allow-list gap marker so the
-    ///   agent learns context exists but is policy-filtered,
-    /// - messages from users not on the channel's allow-list. The count
-    ///   is returned separately so the renderer can surface a gap marker.
-    ///
-    /// The bot's own past replies (`user == bot_user_id`) are the only
-    /// positively-identified passthrough — they're useful self-context
-    /// for the agent and don't widen the channel's privacy boundary.
+    /// Applies the same authorization boundary to historical thread context as
+    /// to live messages. Only the bot's own replies bypass the user allowlist;
+    /// unsupported, unattributed, and unauthorized messages are omitted.
     fn filter_backfill_messages<'a>(
         messages: &'a [serde_json::Value],
         trigger_ts: &str,
@@ -1059,14 +1303,6 @@ impl SlackChannel {
             .to_string()
     }
 
-    /// Pure composer for the `[Thread context]` block. Takes the
-    /// already-rendered per-message lines (after allow-list filtering and
-    /// reply-cap truncation) plus the two omission counts, and returns the
-    /// final block string with header, gap markers, and char-cap
-    /// truncation applied.
-    ///
-    /// Returns `None` when there is no signal to convey (no rendered
-    /// messages and no omissions).
     fn compose_thread_backfill_block(
         rendered_message_lines: Vec<String>,
         dropped_by_allow_list: usize,
@@ -1397,44 +1633,6 @@ impl SlackChannel {
         Self::truncate_text(&lines.join("\n"), SLACK_PERMALINK_TEXT_MAX_CHARS)
     }
 
-    /// Build a `[Thread context]` block summarising the parent and prior
-    /// replies of `thread_ts`, suitable for prepending to the agent payload
-    /// on the bot's first encounter with a thread.
-    ///
-    /// `trigger_ts` is the `ts` of the message currently being forwarded;
-    /// it is filtered out of the backfill so the agent does not see the
-    /// triggering message duplicated (once in the context block, once as
-    /// the message body).
-    ///
-    /// Behaviour:
-    /// - Fail-open: if the underlying Slack fetch fails, returns `None`
-    ///   (logged at WARN so operators can correlate "agent has no context
-    ///   for this thread" with the Slack API failure).
-    /// - Triggering-message filter: the message at `trigger_ts` is dropped
-    ///   so it does not appear twice in the agent payload.
-    /// - Subtype filter: same gate as the main polling loop —
-    ///   `channel_join`, `channel_leave`, bot status messages etc. are
-    ///   skipped so they don't add system noise to the context block.
-    /// - Allow-list filtering: messages from users not on the channel's
-    ///   allow-list are dropped; the count is surfaced as a visible gap
-    ///   marker so the agent knows context is missing for policy reasons.
-    ///   Messages with no `user` field (webhook posts, integration bots)
-    ///   are also dropped and folded into the same gap counter — the
-    ///   normal Socket Mode and polling paths skip these under a
-    ///   restricted allow-list, and the backfill path matches that
-    ///   boundary so historical webhook content can't be smuggled in
-    ///   via `conversations.replies`. The bot's own past replies
-    ///   (`user == bot_user_id`, non-empty) are the only positively-
-    ///   identified passthrough — they're useful self-context and don't
-    ///   widen the channel's privacy boundary.
-    /// - Reply cap: only the most recent `SLACK_PERMALINK_THREAD_MAX_REPLIES`
-    ///   allow-listed messages are rendered, with a `… N earlier thread
-    ///   messages omitted …` prefix marker when the cap activates.
-    /// - Char cap: the joined block is clipped to
-    ///   `SLACK_PERMALINK_TEXT_MAX_CHARS` via `truncate_text`, which
-    ///   appends a `…[truncated]` suffix on overflow.
-    /// - Bot self-mentions (`<@bot_user_id>`) are stripped from each
-    ///   rendered line so downstream re-trigger heuristics don't fire.
     async fn render_thread_backfill_block(
         &self,
         channel_id: &str,
@@ -3025,7 +3223,6 @@ impl SlackChannel {
     }
 
     /// Try to parse a Socket Mode `interactive` envelope as an approval button tap.
-    ///
     /// Returns `Some((token, response))` when the first action's `action_id` matches
     /// `"approval_{TOKEN}_{approve|deny|always}"`, `None` otherwise.
     fn try_parse_approval_block_action(
@@ -3133,6 +3330,8 @@ impl SlackChannel {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         })
     }
 
@@ -3459,6 +3658,8 @@ impl SlackChannel {
                                         interruption_scope_id: scope_id,
                                         attachments: vec![],
                                         subject: None,
+
+                                        ..Default::default()
                                     };
                                     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"cancel_emoji": cancel_emoji, "user": user, "item_channel": item_channel, "item_ts": item_ts})), ":: reaction from on / — sending /stop");
                                     if tx.send(cancel_msg).await.is_err() {
@@ -3583,6 +3784,8 @@ impl SlackChannel {
                     interruption_scope_id: Self::inbound_interruption_scope_id(event, ts),
                     attachments: vec![],
                     subject: None,
+
+                    ..Default::default()
                 };
 
                 // Track thread context so start_typing can set assistant status.
@@ -4055,13 +4258,6 @@ impl Channel for SlackChannel {
         "slack"
     }
 
-    /// Returns the cached `auth.test` `user_id` so the SDK self-loop
-    /// guard can drop the bot's own message echoes (Events API delivers
-    /// the bot's posts back as `bot_id`/`user` events even though
-    /// they're outbound). The cache is populated by
-    /// [`Self::cache_bot_user_id`] on the inbound path; before the
-    /// first hit, returns `None` and the guard falls through to the
-    /// agent-loop fallback in the orchestrator.
     fn self_handle(&self) -> Option<String> {
         self.cached_bot_user_id
             .lock()
@@ -4082,6 +4278,9 @@ impl Channel for SlackChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        let thread_ts = self.outbound_thread_ts(message);
+        let mut outbound_attachments = message.attachments.clone();
+
         // Detect Block Kit payloads produced by the `/config` command.
         let body = if let Some(blocks_json) =
             message.content.strip_prefix(crate::util::BLOCK_KIT_PREFIX)
@@ -4093,14 +4292,29 @@ impl Channel for SlackChannel {
                 "text": "Model configuration",
                 "blocks": blocks
             });
-            if let Some(ts) = self.outbound_thread_ts(message) {
+            if let Some(ts) = thread_ts {
                 body["thread_ts"] = serde_json::json!(ts);
             }
             body
         } else {
+            let (cleaned_content, markers) = parse_outbound_attachment_markers(&message.content);
+            for marker in &markers {
+                outbound_attachments.push(self.resolve_outbound_attachment_marker(marker).await?);
+            }
+
+            if cleaned_content.trim().is_empty() && !outbound_attachments.is_empty() {
+                self.upload_outbound_attachments(
+                    &message.recipient,
+                    thread_ts,
+                    &outbound_attachments,
+                )
+                .await?;
+                return Ok(());
+            }
+
             let mut body = serde_json::json!({
                 "channel": message.recipient,
-                "text": message.content
+                "text": cleaned_content.clone()
             });
 
             // Add rich formatting blocks, split into chunks for the per-block limit.
@@ -4112,9 +4326,9 @@ impl Channel for SlackChannel {
             } else {
                 SLACK_BLOCK_TEXT_MAX_CHARS
             };
-            if message.content.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
+            if cleaned_content.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
                 let chunks = split_text_into_chunks(
-                    &message.content,
+                    &cleaned_content,
                     block_limit,
                     SLACK_MAX_BLOCKS_PER_MESSAGE,
                 );
@@ -4140,7 +4354,7 @@ impl Channel for SlackChannel {
                 body["blocks"] = serde_json::Value::Array(blocks);
             }
 
-            if let Some(ts) = self.outbound_thread_ts(message) {
+            if let Some(ts) = thread_ts {
                 body["thread_ts"] = serde_json::json!(ts);
             }
             body
@@ -4148,7 +4362,7 @@ impl Channel for SlackChannel {
 
         let resp = self
             .http_client()
-            .post("https://slack.com/api/chat.postMessage")
+            .post(self.slack_api_url("chat.postMessage"))
             .bearer_auth(&self.bot_token)
             .json(&body)
             .send()
@@ -4173,6 +4387,11 @@ impl Channel for SlackChannel {
                 .and_then(|e| e.as_str())
                 .unwrap_or("unknown");
             anyhow::bail!("chat.postMessage failed: {err}");
+        }
+
+        if !outbound_attachments.is_empty() {
+            self.upload_outbound_attachments(&message.recipient, thread_ts, &outbound_attachments)
+                .await?;
         }
 
         Ok(())
@@ -4327,6 +4546,7 @@ impl Channel for SlackChannel {
         recipient: &str,
         message_id: &str,
         text: &str,
+        _suppress_voice: bool,
     ) -> anyhow::Result<()> {
         // Clean up rate-limit tracking and lazy draft map
         self.last_draft_edit
@@ -4745,6 +4965,8 @@ impl Channel for SlackChannel {
                             interruption_scope_id: Self::inbound_interruption_scope_id(msg, ts),
                             attachments: vec![],
                             subject: None,
+
+                            ..Default::default()
                         };
 
                         if tx.send(channel_msg).await.is_err() {
@@ -4846,6 +5068,8 @@ impl Channel for SlackChannel {
                         interruption_scope_id: Some(thread_ts.clone()),
                         attachments: vec![],
                         subject: None,
+
+                        ..Default::default()
                     };
 
                     if tx.send(channel_msg).await.is_err() {
@@ -5571,6 +5795,284 @@ mod tests {
     }
 
     #[test]
+    fn parse_outbound_attachment_markers_extracts_supported_markers() {
+        let (cleaned, attachments) =
+            parse_outbound_attachment_markers("Done [IMAGE:/tmp/chart.png] and [file:/tmp/a.pdf]");
+
+        assert_eq!(cleaned, "Done  and");
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].kind, SlackOutboundAttachmentKind::Image);
+        assert_eq!(attachments[0].target, "/tmp/chart.png");
+        assert_eq!(attachments[1].kind, SlackOutboundAttachmentKind::File);
+        assert_eq!(attachments[1].target, "/tmp/a.pdf");
+    }
+
+    #[test]
+    fn parse_outbound_attachment_markers_keeps_unknown_markers() {
+        let (cleaned, attachments) =
+            parse_outbound_attachment_markers("Keep [UNKNOWN:/tmp/chart.png] here");
+
+        assert_eq!(cleaned, "Keep [UNKNOWN:/tmp/chart.png] here");
+        assert!(attachments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_outbound_attachment_marker_accepts_workspace_file() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("chart.png");
+        tokio::fs::write(&path, b"\x89PNG\r\n\x1a\n").await.unwrap();
+        let channel = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            vec![],
+            "slack_test_alias",
+            Arc::new(Vec::new),
+        )
+        .with_workspace_dir(workspace.path().to_path_buf());
+        let marker = SlackOutboundAttachmentMarker {
+            kind: SlackOutboundAttachmentKind::Image,
+            target: path.to_string_lossy().to_string(),
+        };
+
+        let attachment = channel
+            .resolve_outbound_attachment_marker(&marker)
+            .await
+            .unwrap();
+
+        assert_eq!(attachment.file_name, "chart.png");
+        assert_eq!(attachment.mime_type.as_deref(), Some("image/png"));
+        assert_eq!(attachment.data, b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[tokio::test]
+    async fn resolve_outbound_attachment_marker_rejects_workspace_escape() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = outside.path().join("secret.png");
+        tokio::fs::write(&path, b"\x89PNG\r\n\x1a\n").await.unwrap();
+        let channel = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            vec![],
+            "slack_test_alias",
+            Arc::new(Vec::new),
+        )
+        .with_workspace_dir(workspace.path().to_path_buf());
+        let marker = SlackOutboundAttachmentMarker {
+            kind: SlackOutboundAttachmentKind::Image,
+            target: path.to_string_lossy().to_string(),
+        };
+
+        let err = channel
+            .resolve_outbound_attachment_marker(&marker)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("escapes workspace"), "{err}");
+    }
+
+    async fn mock_slack_upload_flow(
+        server: &wiremock::MockServer,
+        file_id: &str,
+        upload_path: &str,
+        complete_status: u16,
+        complete_body: serde_json::Value,
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("POST"))
+            .and(path("/files.getUploadURLExternal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "upload_url": format!("{}{}", server.uri(), upload_path),
+                "file_id": file_id,
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path(upload_path))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .expect(1)
+            .mount(server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/files.completeUploadExternal"))
+            .respond_with(ResponseTemplate::new(complete_status).set_body_json(complete_body))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    fn test_slack_channel(server: &wiremock::MockServer, workspace: &Path) -> SlackChannel {
+        SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            vec![],
+            "slack_test_alias",
+            Arc::new(Vec::new),
+        )
+        .with_workspace_dir(workspace.to_path_buf())
+        .with_api_base_url(server.uri())
+    }
+
+    #[tokio::test]
+    async fn send_uploads_text_and_outbound_attachment_via_slack_external_flow() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let attachment_path = tmp.path().join("report.txt");
+        tokio::fs::write(&attachment_path, b"report-bytes")
+            .await
+            .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/chat.postMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "ts": "1710000000.000100",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mock_slack_upload_flow(
+            &server,
+            "F_TEXT",
+            "/upload/text",
+            200,
+            serde_json::json!({"ok": true}),
+        )
+        .await;
+
+        let ch = test_slack_channel(&server, tmp.path());
+        let mut msg =
+            SendMessage::new(format!("Done [FILE:{}]", attachment_path.display()), "C123");
+        msg.thread_ts = Some("1709999999.000001".into());
+
+        SlackChannel::send(&ch, &msg).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let post = requests
+            .iter()
+            .find(|req| req.url.path() == "/chat.postMessage")
+            .expect("chat.postMessage should be called");
+        let post_body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+        assert_eq!(post_body["channel"], "C123");
+        assert_eq!(post_body["thread_ts"], "1709999999.000001");
+        assert_eq!(post_body["text"], "Done");
+
+        let get_upload = requests
+            .iter()
+            .find(|req| req.url.path() == "/files.getUploadURLExternal")
+            .expect("getUploadURLExternal should be called");
+        let get_upload_body = String::from_utf8_lossy(&get_upload.body);
+        assert!(get_upload_body.contains("filename=report.txt"));
+        assert!(get_upload_body.contains("length=12"));
+
+        let upload = requests
+            .iter()
+            .find(|req| req.url.path() == "/upload/text")
+            .expect("byte upload should be called");
+        assert_eq!(upload.body.as_slice(), b"report-bytes");
+
+        let complete = requests
+            .iter()
+            .find(|req| req.url.path() == "/files.completeUploadExternal")
+            .expect("completeUploadExternal should be called");
+        let complete_body: serde_json::Value = serde_json::from_slice(&complete.body).unwrap();
+        assert_eq!(complete_body["channel_id"], "C123");
+        assert_eq!(complete_body["thread_ts"], "1709999999.000001");
+        assert_eq!(complete_body["files"][0]["id"], "F_TEXT");
+        assert_eq!(complete_body["files"][0]["title"], "report.txt");
+    }
+
+    #[tokio::test]
+    async fn send_uploads_attachment_only_message_without_chat_post() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let attachment_path = tmp.path().join("only.txt");
+        tokio::fs::write(&attachment_path, b"only-bytes")
+            .await
+            .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/chat.postMessage"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("must-not-call"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        mock_slack_upload_flow(
+            &server,
+            "F_ONLY",
+            "/upload/only",
+            200,
+            serde_json::json!({"ok": true}),
+        )
+        .await;
+
+        let ch = test_slack_channel(&server, tmp.path());
+        let msg = SendMessage::new(format!("[FILE:{}]", attachment_path.display()), "C123");
+
+        SlackChannel::send(&ch, &msg).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|req| req.url.path() != "/chat.postMessage"),
+            "attachment-only sends must skip chat.postMessage"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|req| req.url.path() == "/files.completeUploadExternal"),
+            "attachment-only sends must still complete file upload"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_returns_error_when_slack_complete_upload_fails() {
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let attachment_path = tmp.path().join("fail.txt");
+        tokio::fs::write(&attachment_path, b"fail-bytes")
+            .await
+            .unwrap();
+
+        mock_slack_upload_flow(
+            &server,
+            "F_FAIL",
+            "/upload/fail",
+            200,
+            serde_json::json!({"ok": false, "error": "complete_failed"}),
+        )
+        .await;
+
+        let ch = test_slack_channel(&server, tmp.path());
+        let msg = SendMessage::new(format!("[FILE:{}]", attachment_path.display()), "C123");
+
+        let err = SlackChannel::send(&ch, &msg)
+            .await
+            .expect_err("Slack completion failure should propagate");
+        assert!(
+            err.to_string()
+                .contains("files.completeUploadExternal failed: complete_failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn ensure_file_extension_appends_when_missing() {
         assert_eq!(
             SlackChannel::ensure_file_extension("capture", "png"),
@@ -6108,6 +6610,8 @@ mod tests {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
 
         let msg1 = make_msg("100.000");
@@ -6136,6 +6640,8 @@ mod tests {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
 
         let msg1 = make_msg("100.000");
@@ -6336,8 +6842,6 @@ mod tests {
 
     // --- Thread-context backfill tests ---
 
-    /// Top-level message (no thread_ts) and thread-parent (`thread_ts == ts`)
-    /// must not trigger backfill, regardless of `seen_threads` state.
     #[test]
     fn thread_backfill_precheck_skips_non_replies() {
         let seen = Mutex::new(HashSet::new());
@@ -6358,14 +6862,6 @@ mod tests {
         assert!(SlackChannel::precheck_thread_backfill(&parent, &seen).is_none());
     }
 
-    /// `filter_backfill_messages` must drop the triggering message
-    /// (otherwise the agent sees it twice — once in `[Thread context]`,
-    /// once as the message body), drop unsupported subtypes such as
-    /// `channel_join`, drop messages with no `user` field (matches the
-    /// normal Socket Mode + polling boundary — webhooks/integration bots
-    /// don't reach the agent under a restricted allow-list), and count
-    /// non-allow-listed and userless messages toward the gap marker so
-    /// the agent learns context exists but is policy-filtered.
     #[test]
     fn thread_backfill_filter_drops_trigger_subtype_userless_and_non_allow_listed() {
         let messages = vec![
@@ -6385,11 +6881,6 @@ mod tests {
             serde_json::json!({"ts": "T_R3", "thread_ts": "T_PARENT", "user": "U_BAD", "text": "filtered"}),
             // Bot's own past reply — must pass through (useful self-context).
             serde_json::json!({"ts": "T_R4", "thread_ts": "T_PARENT", "user": "U_BOT", "text": "bot turn"}),
-            // Userless message — webhook post, integration bot, etc. The
-            // normal inbound path drops these under restricted
-            // `allowed_users`; the backfill path must match that
-            // boundary so historical webhook content can't be smuggled
-            // into [Thread context]. Must be dropped AND counted.
             serde_json::json!({"ts": "T_R5", "thread_ts": "T_PARENT", "text": "from a webhook"}),
             // Same situation with a `bot_id` instead of `user` (some
             // integration messages carry `bot_id` instead of `user`).
@@ -6421,8 +6912,6 @@ mod tests {
         );
     }
 
-    /// Spec 3.5: Mixed allow / non-allow senders → 3 rendered + gap marker
-    /// noting 2 omitted, plus the `[Thread context]` header.
     #[test]
     fn thread_backfill_compose_renders_allow_list_gap_marker() {
         let lines = vec![
@@ -6441,8 +6930,6 @@ mod tests {
         assert!(!block.contains("earlier thread messages omitted"));
     }
 
-    /// Spec 3.6: Thread containing only non-allow-listed senders → only the
-    /// header and the allow-list gap marker (no rendered messages).
     #[test]
     fn thread_backfill_compose_with_only_dropped_senders() {
         let block = SlackChannel::compose_thread_backfill_block(Vec::new(), 4, 0)
@@ -6453,8 +6940,6 @@ mod tests {
         assert!(!block.contains("- "));
     }
 
-    /// Spec 3.7: Thread exceeds reply cap → reply-cap marker rendered
-    /// alongside the most recent messages.
     #[test]
     fn thread_backfill_compose_renders_reply_cap_marker() {
         let lines = (0..SLACK_PERMALINK_THREAD_MAX_REPLIES)
@@ -6468,8 +6953,6 @@ mod tests {
         assert!(!block.contains("non-allow-listed"));
     }
 
-    /// Spec 3.7b: Thread within reply cap but rendered text exceeds char cap
-    /// → block is clipped with the `…[truncated]` suffix marker.
     #[test]
     fn thread_backfill_compose_truncates_long_text() {
         let huge = "x".repeat(SLACK_PERMALINK_TEXT_MAX_CHARS + 1000);
@@ -6480,9 +6963,6 @@ mod tests {
         assert!(block.starts_with("[Thread context]"));
     }
 
-    /// Spec 3.8: Backfilled message containing `<@bot_user_id>` → mention is
-    /// stripped from the rendered line so downstream re-trigger heuristics
-    /// don't fire.
     #[test]
     fn thread_backfill_strip_bot_mentions_removes_self_mention() {
         let line = "- alice: hey <@U_BOT> can you help?";
@@ -6492,9 +6972,6 @@ mod tests {
         assert!(stripped.contains("can you help?"));
     }
 
-    /// Core contract: first reply in an unseen thread triggers backfill;
-    /// after a successful render the thread is recorded; subsequent replies
-    /// skip backfill.
     #[test]
     fn thread_backfill_first_reply_backfills_then_subsequent_replies_do_not() {
         let ch = SlackChannel::new(
@@ -6533,10 +7010,6 @@ mod tests {
         );
     }
 
-    /// Composition order regression: the agent payload must lead with
-    /// `[Thread context]`, then the triggering message text, then any
-    /// attachment / permalink blocks — matching the PR description and
-    /// changelog.
     #[test]
     fn thread_backfill_block_is_prepended_to_payload() {
         let backfill_block = Some("[Thread context]\n- alice: hi\n- bob: hello".to_string());
@@ -6571,9 +7044,6 @@ mod tests {
         );
     }
 
-    /// Fetch failure → triggering message forwarded without
-    /// `[Thread context]` block, and the thread is NOT inserted into
-    /// `seen_threads` so the next message can retry.
     #[test]
     fn thread_backfill_fetch_failure_does_not_record_thread_as_seen() {
         let seen = Mutex::new(HashSet::new());

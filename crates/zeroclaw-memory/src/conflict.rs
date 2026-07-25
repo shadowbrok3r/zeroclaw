@@ -1,13 +1,8 @@
 //! Conflict resolution for memory entries.
-//!
-//! Before storing Core memories, performs a semantic similarity check against
-//! existing entries. If cosine similarity exceeds a threshold but content
-//! differs, the old entry is marked as superseded.
 
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
 
 /// Check for conflicting memories and mark old ones as superseded.
-///
 /// Returns the list of entry IDs that were superseded.
 pub async fn check_and_resolve_conflicts(
     memory: &dyn Memory,
@@ -64,7 +59,6 @@ pub fn mark_superseded(
 }
 
 /// Simple text-based conflict detection without embeddings.
-///
 /// Uses token overlap (Jaccard similarity) as a fast approximation
 /// when vector embeddings are unavailable.
 pub fn jaccard_similarity(a: &str, b: &str) -> f64 {
@@ -151,6 +145,9 @@ mod tests {
                 namespace: "default".into(),
                 importance: Some(0.7),
                 superseded_by: None,
+                kind: None,
+                pinned: false,
+                tenant_id: None,
                 agent_alias: None,
                 agent_id: None,
             },
@@ -165,6 +162,9 @@ mod tests {
                 namespace: "default".into(),
                 importance: Some(0.3),
                 superseded_by: None,
+                kind: None,
+                pinned: false,
+                tenant_id: None,
                 agent_alias: None,
                 agent_id: None,
             },
@@ -174,5 +174,50 @@ mod tests {
         let conflicts = find_text_conflicts(&entries, "User now prefers Go for systems work", 0.3);
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0], "1");
+    }
+
+    #[test]
+    fn jaccard_deduplicates_repeated_words() {
+        // Token sets ignore repeats: {a, b} vs {a, b} are identical.
+        assert!((jaccard_similarity("a a b", "a b b") - 1.0).abs() < f64::EPSILON);
+        // {a, b} vs {a} -> intersection 1 / union 2.
+        assert!((jaccard_similarity("a a b", "a") - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn find_text_conflicts_skips_superseded_and_identical() {
+        let entry = |id: &str, content: &str, superseded: Option<String>| MemoryEntry {
+            id: id.into(),
+            key: "k".into(),
+            content: content.into(),
+            category: MemoryCategory::Core,
+            timestamp: "now".into(),
+            session_id: None,
+            score: None,
+            namespace: "default".into(),
+            importance: Some(0.7),
+            superseded_by: superseded,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
+            agent_alias: None,
+            agent_id: None,
+        };
+        let entries = vec![
+            entry("active", "User prefers Rust for systems work", None),
+            entry(
+                "old",
+                "User prefers Rust for systems work",
+                Some("x".into()),
+            ),
+        ];
+
+        // The already-superseded "old" entry is skipped; only "active" conflicts.
+        let conflicts = find_text_conflicts(&entries, "User now prefers Go for systems work", 0.3);
+        assert_eq!(conflicts, vec!["active".to_string()]);
+
+        // An identical new_content is an update, not a conflict.
+        let none = find_text_conflicts(&entries, "User prefers Rust for systems work", 0.3);
+        assert!(none.is_empty());
     }
 }

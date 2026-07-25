@@ -9,10 +9,11 @@ use super::protocol_detect::{
 use super::redact::scrub_credentials;
 use super::tool_specs::IterationToolSpecs;
 use crate::agent::cost::record_tool_loop_cost_usage;
+use crate::agent::loop_::capture_llm_messages;
 use crate::observability::ObserverEvent;
 use std::time::Instant;
 use zeroclaw_api::agent::TurnEvent;
-use zeroclaw_providers::{ChatResponse, ToolCall};
+use zeroclaw_providers::{ChatMessage, ChatResponse, ToolCall};
 use zeroclaw_tool_call_parser::{
     ParsedToolCall, build_native_assistant_history_from_parsed_calls,
     looks_like_tool_protocol_example, parse_tool_calls, strip_think_tags,
@@ -29,11 +30,15 @@ pub(crate) fn build_native_assistant_history(
     let calls_json: Vec<serde_json::Value> = tool_calls
         .iter()
         .map(|tc| {
-            serde_json::json!({
-                "id": tc.id,
-                "name": tc.name,
-                "arguments": tc.arguments,
-            })
+            let mut call = serde_json::Map::from_iter([
+                ("id".to_string(), serde_json::json!(tc.id)),
+                ("name".to_string(), serde_json::json!(tc.name)),
+                ("arguments".to_string(), serde_json::json!(tc.arguments)),
+            ]);
+            if let Some(extra_content) = &tc.extra_content {
+                call.insert("extra_content".to_string(), extra_content.clone());
+            }
+            serde_json::Value::Object(call)
         })
         .collect();
 
@@ -81,6 +86,25 @@ pub(crate) fn resolve_display_text(
     }
 }
 
+pub(crate) fn unforwarded_narration<'a>(
+    display_text: &'a str,
+    streamed_visible_text: &str,
+) -> &'a str {
+    if let Some(rest) = display_text.strip_prefix(streamed_visible_text) {
+        return rest;
+    }
+    let stream_lead_normalized = streamed_visible_text.trim_start();
+    if !stream_lead_normalized.is_empty()
+        && let Some(rest) = display_text.strip_prefix(stream_lead_normalized)
+    {
+        return rest;
+    }
+    if streamed_visible_text.trim() == display_text {
+        return "";
+    }
+    display_text
+}
+
 /// The interpreted Ok-arm of one provider call.
 pub(crate) struct InterpretedResponse {
     pub(crate) response_text: String,
@@ -89,6 +113,7 @@ pub(crate) struct InterpretedResponse {
     pub(crate) assistant_history_content: String,
     pub(crate) native_tool_calls: Vec<ToolCall>,
     pub(crate) parse_issue_detected: bool,
+    pub(crate) input_tokens: Option<u64>,
 }
 
 /// Interpret a successful chat response. Takes the response by value and
@@ -96,6 +121,7 @@ pub(crate) struct InterpretedResponse {
 pub(crate) async fn interpret_chat_response(
     ctx: &TurnCtx<'_>,
     resp: ChatResponse,
+    history: &[ChatMessage],
     specs: &IterationToolSpecs,
     streamed_protocol_suppressed: bool,
     llm_started_at: Instant,
@@ -116,10 +142,20 @@ pub(crate) async fn interpret_chat_response(
         error_message: None,
         input_tokens: resp_input_tokens,
         output_tokens: resp_output_tokens,
-        channel: None,
-        agent_alias: None,
-        turn_id: None,
+        channel: Some(ctx.channel_name.to_string()),
+        agent_alias: ctx.agent_alias.map(|s| s.to_string()),
+        parent_agent_alias: ctx.parent_agent_alias.map(|s| s.to_string()),
+        turn_id: Some(ctx.turn_id.to_string()),
+        // Credential-scrubbed prompt/completion content for OTel GenAI export;
+        // `None` unless the `observability-otel` feature is active.
+        messages: capture_llm_messages(history, Some(resp.text_or_empty()), &resp.tool_calls),
     });
+
+    let call_cost_usd = resp
+        .usage
+        .as_ref()
+        .and_then(|usage| record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage))
+        .map(|(_total_tokens, cost_usd)| cost_usd);
 
     // Per-LLM-call usage event, right after the observer success event
     // (upstream E2 parity, agent.rs Usage emission).
@@ -131,16 +167,10 @@ pub(crate) async fn interpret_chat_response(
                 input_tokens: usage.input_tokens,
                 cached_input_tokens: usage.cached_input_tokens,
                 output_tokens: usage.output_tokens,
-                cost_usd: None,
+                cost_usd: call_cost_usd,
             })
             .await;
     }
-
-    // Record cost via task-local tracker (no-op when not scoped)
-    let _ = resp
-        .usage
-        .as_ref()
-        .and_then(|usage| record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage));
 
     let response_text = strip_think_tags(resp.text_or_empty());
     // First try native structured tool calls (OpenAI-format).
@@ -212,6 +242,7 @@ pub(crate) async fn interpret_chat_response(
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_category(::zeroclaw_log::EventCategory::Tool)
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                 .with_attrs(::serde_json::json!({
                     "model": ctx.model,
@@ -227,6 +258,7 @@ pub(crate) async fn interpret_chat_response(
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Receive)
+            .with_category(::zeroclaw_log::EventCategory::Provider)
             .with_outcome(::zeroclaw_log::EventOutcome::Success)
             .with_duration(u64::try_from(llm_started_at.elapsed().as_millis()).unwrap_or(u64::MAX))
             .with_attrs(::serde_json::json!({
@@ -234,6 +266,7 @@ pub(crate) async fn interpret_chat_response(
                 "iteration": iteration + 1,
                 "input_tokens": resp_input_tokens,
                 "output_tokens": resp_output_tokens,
+                "cost_usd": call_cost_usd,
                 "raw_response": scrub_credentials(&response_text),
                 "native_tool_calls": resp.tool_calls.len(),
                 "parsed_tool_calls": calls.len(),
@@ -272,5 +305,263 @@ pub(crate) async fn interpret_chat_response(
         assistant_history_content,
         native_tool_calls: native_calls,
         parse_issue_detected: parse_issue.is_some(),
+        input_tokens: resp_input_tokens,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_native_assistant_history, unforwarded_narration};
+    use zeroclaw_providers::ToolCall;
+
+    #[test]
+    fn native_assistant_history_preserves_tool_call_extra_content() {
+        let history = build_native_assistant_history(
+            "",
+            &[ToolCall {
+                id: "call_1".to_string(),
+                name: "search".to_string(),
+                arguments: "{}".to_string(),
+                extra_content: Some(serde_json::json!({
+                    "google": {
+                        "thought_signature": "sig_1"
+                    }
+                })),
+            }],
+            None,
+        );
+
+        let value = serde_json::from_str::<serde_json::Value>(&history).unwrap();
+        assert_eq!(
+            value["tool_calls"][0]["extra_content"],
+            serde_json::json!({"google": {"thought_signature": "sig_1"}})
+        );
+    }
+
+    #[test]
+    fn returns_suffix_when_streamed_text_is_a_prefix() {
+        assert_eq!(
+            unforwarded_narration("About to check the count.", "About to "),
+            "check the count."
+        );
+    }
+
+    #[test]
+    fn returns_empty_when_everything_was_streamed() {
+        assert_eq!(
+            unforwarded_narration("fully streamed", "fully streamed"),
+            ""
+        );
+    }
+
+    #[test]
+    fn returns_whole_text_when_nothing_was_streamed() {
+        assert_eq!(
+            unforwarded_narration("never streamed", ""),
+            "never streamed"
+        );
+    }
+
+    #[test]
+    fn relays_whole_text_on_prefix_divergence_rather_than_truncating() {
+        assert_eq!(
+            unforwarded_narration("final visible text", "diverged live text"),
+            "final visible text"
+        );
+    }
+
+    #[test]
+    fn returns_empty_when_streamed_text_has_trailing_whitespace() {
+        assert_eq!(
+            unforwarded_narration("Checking the data.", "Checking the data.\n\n"),
+            ""
+        );
+    }
+
+    #[test]
+    fn returns_empty_when_streamed_text_has_leading_whitespace() {
+        assert_eq!(
+            unforwarded_narration("Checking the data.", "\n\nChecking the data."),
+            ""
+        );
+    }
+
+    #[test]
+    fn returns_empty_when_streamed_text_has_whitespace_on_both_ends() {
+        assert_eq!(
+            unforwarded_narration("Checking the data.", "\n\nChecking the data.\n"),
+            ""
+        );
+    }
+
+    #[test]
+    fn returns_suffix_past_the_whitespace_trimmed_streamed_prefix() {
+        assert_eq!(
+            unforwarded_narration("About to check.", "\nAbout to"),
+            " check."
+        );
+    }
+
+    #[test]
+    fn preserves_trailing_prefix_space_when_only_the_leading_edge_diverges() {
+        assert_eq!(
+            unforwarded_narration("About to check.", "\nAbout to "),
+            "check."
+        );
+    }
+}
+
+#[cfg(test)]
+mod cost_usd_regression_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+    use zeroclaw_providers::traits::TokenUsage;
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn cost_usd_flows_to_usage_event_and_llm_response() {
+        // Exact-f64 inputs.
+        let input_tokens: u64 = 2_000_000;
+        let output_tokens: u64 = 1_000_000;
+        let input_rate: f64 = 1.5;
+        let output_rate: f64 = 3.0;
+        // cached_input_tokens = 0, so the full input is billed at input_rate.
+        let expected: f64 = (input_tokens as f64) * input_rate / 1_000_000.0
+            + (output_tokens as f64) * output_rate / 1_000_000.0;
+
+        let provider = "testprov";
+        let model = "testmodel";
+
+        // Cost scope: real CostTracker + a pricing map keyed by provider, with
+        // per-1M-token input/output/cached_input rates for `model`.
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            crate::cost::CostTracker::new(
+                zeroclaw_config::schema::CostConfig::default(),
+                tmpdir.path(),
+            )
+            .unwrap(),
+        );
+        let pricing: HashMap<String, f64> = HashMap::from([
+            (format!("{model}.input"), input_rate),
+            (format!("{model}.output"), output_rate),
+            (format!("{model}.cached_input"), 0.0_f64),
+        ]);
+        let cost_ctx = crate::agent::cost::ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(HashMap::from([(provider.to_string(), pricing)])),
+        );
+
+        // TurnCtx with event_tx wired; everything else empty/None.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(4);
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let dedup_exempt_tools: Vec<String> = Vec::new();
+        let ctx = TurnCtx {
+            parent_agent_alias: None,
+            observer: &crate::observability::NoopObserver,
+            provider_name: provider,
+            model,
+            temperature: None,
+            approval: None,
+            channel_name: "",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: Some(&tx),
+            hooks: None,
+            dedup_exempt_tools: &dedup_exempt_tools,
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            agent_alias: None,
+            turn_id: "turn-cost-regression",
+        };
+
+        let specs = IterationToolSpecs {
+            tool_specs: vec![],
+            known_tool_names: HashSet::new(),
+            use_native_tools: false,
+        };
+
+        let resp = ChatResponse {
+            text: Some("hello".to_string()),
+            tool_calls: vec![],
+            usage: Some(TokenUsage {
+                input_tokens: Some(input_tokens),
+                output_tokens: Some(output_tokens),
+                cached_input_tokens: Some(0),
+            }),
+            reasoning_content: None,
+        };
+
+        // Capture the `llm_response` broadcast record. Hold the public
+        // writer + hook locks so a parallel `clear_broadcast_hook` (or a
+        // peer crate's writer test) doesn't drop this test's event.
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut log_rx = zeroclaw_log::subscribe_or_install();
+        while log_rx.try_recv().is_ok() {}
+
+        // Run interpret_chat_response inside the cost scope so
+        // record_tool_loop_cost_usage sees the pricing map.
+        let now = std::time::Instant::now();
+        crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(cost_ctx), async {
+                interpret_chat_response(&ctx, resp, &[], &specs, false, now, 0, false).await;
+            })
+            .await;
+
+        // (a) The Usage event must carry the cost.
+        let event = rx
+            .try_recv()
+            .expect("interpret_chat_response should emit a TurnEvent::Usage");
+        match event {
+            TurnEvent::Usage { cost_usd, .. } => {
+                let c = cost_usd.expect("Usage event must carry cost_usd, got None");
+                assert!(
+                    (c - expected).abs() < 1e-9,
+                    "Usage event cost_usd {c} != expected {expected}"
+                );
+            }
+            other => panic!("expected TurnEvent::Usage, got {other:?}"),
+        }
+
+        // (b) The llm_response log record must carry the cost.
+        let mut found_cost: Option<f64> = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while found_cost.is_none() && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, log_rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s == "llm_response")
+                        .unwrap_or(false)
+                    {
+                        found_cost = Some(
+                            value
+                                .get("attributes")
+                                .and_then(|a| a.get("cost_usd"))
+                                .and_then(serde_json::Value::as_f64)
+                                .expect("llm_response record must carry attributes.cost_usd"),
+                        );
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_elapsed) => {}
+            }
+        }
+        let logged = found_cost.expect("did not observe an llm_response log record with cost_usd");
+        assert!(
+            (logged - expected).abs() < 1e-9,
+            "llm_response cost_usd {logged} != expected {expected}"
+        );
+
+        zeroclaw_log::clear_broadcast_hook();
     }
 }

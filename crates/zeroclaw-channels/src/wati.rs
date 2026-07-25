@@ -5,12 +5,6 @@ use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
 const MAX_WATI_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 
-/// WATI WhatsApp Business API channel.
-///
-/// This channel operates in webhook mode (push-based) rather than polling.
-/// Messages are received via the gateway's `/wati` webhook endpoint.
-/// The `listen` method here is a keepalive placeholder; actual message handling
-/// happens in the gateway when WATI sends webhook events.
 pub struct WatiChannel {
     api_token: String,
     api_url: String,
@@ -73,14 +67,6 @@ impl WatiChannel {
         }
         match super::transcription::TranscriptionManager::new(&config) {
             Ok(m) => {
-                // Per-agent `transcription_provider` routes through the
-                // orchestrator's resolved-runtime path. For the
-                // `try_transcribe_audio` direct path (gateway WS handler /
-                // channel-side ingest), bind to the sole registered provider
-                // when only one is configured so the single-provider case
-                // dispatches without an agent context. Multi-provider setups
-                // still require explicit `agent.<alias>.transcription_provider`
-                // routing through the orchestrator.
                 let names = m.available_providers();
                 let m = if names.len() == 1 {
                     let only = names[0].to_string();
@@ -163,7 +149,6 @@ impl WatiChannel {
     }
 
     /// Extract and normalize a timestamp from a WATI webhook payload.
-    ///
     /// Handles unix seconds, unix milliseconds (divided by 1000), and ISO 8601
     /// strings. Falls back to the current system time if parsing fails.
     fn extract_timestamp(payload: &serde_json::Value) -> u64 {
@@ -203,7 +188,6 @@ impl WatiChannel {
     }
 
     /// Parse an incoming webhook payload from WATI and extract messages.
-    ///
     /// WATI's webhook payloads have variable field names depending on the API
     /// version and configuration, so we try multiple paths for each field.
     pub fn parse_webhook_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
@@ -261,6 +245,8 @@ impl WatiChannel {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         });
 
         messages
@@ -275,7 +261,6 @@ impl WatiChannel {
     }
 
     /// Attempt to download and transcribe an audio message from a WATI webhook payload.
-    ///
     /// Returns `Some(transcript)` if transcription succeeds, `None` otherwise.
     /// Called by the gateway after detecting `type == "audio"` or `type == "voice"`.
     pub async fn try_transcribe_audio(&self, payload: &serde_json::Value) -> Option<String> {
@@ -389,7 +374,6 @@ impl WatiChannel {
     }
 
     /// Build a ChannelMessage from an audio transcript.
-    ///
     /// This helper reuses the same sender extraction and timestamp logic as
     /// `parse_webhook_payload()` but substitutes the transcript as the message content.
     pub fn parse_audio_as_message(
@@ -443,6 +427,8 @@ impl WatiChannel {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         });
 
         messages
@@ -522,12 +508,12 @@ impl Channel for WatiChannel {
     }
 
     async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
-        // WATI API does not support typing indicators
+        // No typing-indicator endpoint in the WATI API.
         Ok(())
     }
 
     async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
-        // WATI API does not support typing indicators
+        // No typing-indicator endpoint in the WATI API.
         Ok(())
     }
 }

@@ -1,5 +1,4 @@
 //! ClawdTalk voice channel - real-time voice calling via Telnyx SIP infrastructure.
-//!
 //! ClawdTalk (<https://clawdtalk.com>) provides AI-powered voice conversations
 //! using Telnyx's global SIP network for low-latency, high-quality calls.
 
@@ -269,6 +268,16 @@ impl ::zeroclaw_api::attribution::Attributable for ClawdTalkChannel {
 
 #[async_trait]
 impl Channel for ClawdTalkChannel {
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // ClawdTalk has no typing-indicator endpoint.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // ClawdTalk has no typing-indicator endpoint.
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "ClawdTalk"
     }

@@ -1,5 +1,4 @@
 //! Interactive approval workflow for supervised mode.
-//!
 //! Provides a pre-execution hook that prompts the user before tool calls,
 //! with session-scoped "Always" allowlists and audit logging.
 
@@ -8,6 +7,8 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+#[cfg(unix)]
+use std::io::BufReader;
 use std::io::{self, BufRead, Write};
 use zeroclaw_config::schema::RiskProfileConfig;
 
@@ -80,20 +81,6 @@ pub enum ApprovalRequirement {
 
 // ── ApprovalManager ──────────────────────────────────────────────
 
-/// Manages the approval workflow for tool calls.
-///
-/// - Checks config-level `auto_approve` / `always_ask` lists
-/// - Maintains a session-scoped "always" allowlist
-/// - Records an audit trail of all decisions
-///
-/// Two modes:
-/// - **Interactive** (CLI): tools needing approval trigger a stdin prompt.
-/// - **Non-interactive** (channels): tools needing approval are auto-denied
-///   because there is no interactive operator to approve them. `auto_approve`
-///   policy is still enforced, and `always_ask` / supervised-default tools are
-///   denied rather than silently allowed.
-/// - **Non-interactive back-channel** (ACP/WS): tools needing approval are sent
-///   through a client approval channel instead of trusting tool arguments.
 pub struct ApprovalManager {
     /// Tools that never need approval (from config).
     auto_approve: HashSet<String>,
@@ -127,11 +114,6 @@ impl ApprovalManager {
         }
     }
 
-    /// Create a non-interactive approval manager for channel-driven runs.
-    ///
-    /// Enforces the same `auto_approve` / `always_ask` / supervised policies
-    /// as the CLI manager, but tools that would require interactive approval
-    /// are auto-denied instead of prompting (since there is no operator).
     pub fn for_non_interactive(risk_profile: &RiskProfileConfig) -> Self {
         Self {
             auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
@@ -144,12 +126,6 @@ impl ApprovalManager {
         }
     }
 
-    /// Create a non-interactive manager for direct agents with a human
-    /// approval back-channel, such as ACP and the web dashboard WebSocket.
-    /// Reads from the same per-agent risk profile as
-    /// [`Self::for_non_interactive`]; the only difference is that shell
-    /// invocations route through the operator-driven backchannel rather
-    /// than auto-denying.
     pub fn for_non_interactive_backchannel(risk_profile: &RiskProfileConfig) -> Self {
         Self {
             auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
@@ -162,6 +138,28 @@ impl ApprovalManager {
         }
     }
 
+    /// Derive a manager for a different agent's risk profile while preserving
+    /// THIS manager's interactivity mode. Used when a delegated execution (an
+    /// SOP step naming a different agent) must run under the delegate agent's
+    /// own approval policy without losing an operator approval route the
+    /// current surface provides: an interactive parent stays interactive, a
+    /// back-channel parent keeps routing shell approvals through the client
+    /// channel, and a plain non-interactive parent stays auto-deny. Policy
+    /// sets (`auto_approve` / `always_ask` / autonomy level) come entirely
+    /// from `risk_profile`; the session allowlist and audit trail start
+    /// fresh — "Always" grants to one agent never transfer to another.
+    pub fn derive_for_risk_profile(&self, risk_profile: &RiskProfileConfig) -> Self {
+        Self {
+            auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
+            always_ask: risk_profile.always_ask.iter().cloned().collect(),
+            autonomy_level: risk_profile.level,
+            non_interactive: self.non_interactive,
+            non_interactive_shell_requires_approval: self.non_interactive_shell_requires_approval,
+            session_allowlist: Mutex::new(HashSet::new()),
+            audit_log: Mutex::new(Vec::new()),
+        }
+    }
+
     /// Returns `true` when this manager operates in non-interactive mode
     /// (i.e. for channel-driven runs where no operator can approve).
     pub fn is_non_interactive(&self) -> bool {
@@ -169,7 +167,6 @@ impl ApprovalManager {
     }
 
     /// Check whether a tool call requires interactive approval.
-    ///
     /// Returns `true` if the call needs a prompt, `false` if it can proceed.
     pub fn needs_approval(&self, tool_name: &str) -> bool {
         self.approval_requirement(tool_name) == ApprovalRequirement::Prompt
@@ -191,11 +188,6 @@ impl ApprovalManager {
             return ApprovalRequirement::Prompt;
         }
 
-        // Channel-driven shell execution is still guarded by the shell tool's
-        // own command allowlist and risk policy. Skipping the outer approval
-        // gate here lets low-risk allowlisted commands (e.g. `ls`) work in
-        // non-interactive channels without silently allowing medium/high-risk
-        // commands.
         if self.non_interactive
             && tool_name == "shell"
             && !self.non_interactive_shell_requires_approval
@@ -256,7 +248,6 @@ impl ApprovalManager {
     }
 
     /// Prompt the user on the CLI and return their decision.
-    ///
     /// Only called for interactive (CLI) managers. Non-interactive managers
     /// auto-deny in the tool-call loop before reaching this point.
     pub fn prompt_cli(&self, request: &ApprovalRequest) -> ApprovalResponse {
@@ -266,7 +257,8 @@ impl ApprovalManager {
 
 // ── CLI prompt ───────────────────────────────────────────────────
 
-/// Display the approval prompt and read user input from stdin.
+/// Display the approval prompt and read user input from the controlling
+/// terminal when available, falling back to stdin otherwise.
 fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
     let summary = summarize_args(&request.arguments);
     eprintln!();
@@ -275,12 +267,14 @@ fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
     eprint!("   [Y]es / [N]o / [A]lways for {}: ", request.tool_name);
     let _ = io::stderr().flush();
 
-    let stdin = io::stdin();
-    let mut line = String::new();
-    if stdin.lock().read_line(&mut line).is_err() {
+    let Ok(line) = read_cli_approval_line() else {
         return ApprovalResponse::No;
-    }
+    };
 
+    parse_cli_approval_response(&line)
+}
+
+fn parse_cli_approval_response(line: &str) -> ApprovalResponse {
     match line.trim().to_ascii_lowercase().as_str() {
         "y" | "yes" => ApprovalResponse::Yes,
         "a" | "always" => ApprovalResponse::Always,
@@ -288,14 +282,46 @@ fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
     }
 }
 
-/// Produce a short human-readable summary of tool arguments. Argument keys
-/// whose names suggest a credential get their value replaced with
-/// `[redacted]` before truncation, so summaries that cross security
-/// boundaries (e.g. the gateway WebSocket `approval_request` frame) cannot
-/// leak secret-bearing fields. Operators MUST treat the summary as
-/// best-effort: a tool that names its credential field something other than
-/// the patterns below still surfaces. The tool author's typed config and
-/// `#[secret]` annotations are the long-term truth source.
+#[cfg(unix)]
+fn read_cli_approval_line() -> io::Result<String> {
+    read_cli_approval_line_with(
+        || std::fs::File::open("/dev/tty").map(BufReader::new),
+        read_stdin_approval_line,
+    )
+}
+
+#[cfg(unix)]
+fn read_cli_approval_line_with<Tty, OpenTty, ReadStdin>(
+    open_tty: OpenTty,
+    read_stdin: ReadStdin,
+) -> io::Result<String>
+where
+    Tty: BufRead,
+    OpenTty: FnOnce() -> io::Result<Tty>,
+    ReadStdin: FnOnce() -> io::Result<String>,
+{
+    match open_tty() {
+        Ok(tty) => read_approval_line_from(tty),
+        Err(_) => read_stdin(),
+    }
+}
+
+#[cfg(not(unix))]
+fn read_cli_approval_line() -> io::Result<String> {
+    read_stdin_approval_line()
+}
+
+fn read_stdin_approval_line() -> io::Result<String> {
+    let stdin = io::stdin();
+    read_approval_line_from(stdin.lock())
+}
+
+fn read_approval_line_from<R: BufRead>(mut reader: R) -> io::Result<String> {
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    Ok(line)
+}
+
 pub fn summarize_args(args: &serde_json::Value) -> String {
     match args {
         serde_json::Value::Object(map) => {
@@ -416,6 +442,85 @@ mod tests {
             level: AutonomyLevel::Full,
             ..RiskProfileConfig::default()
         }
+    }
+
+    // ── CLI prompt input ────────────────────────────────────
+
+    #[test]
+    fn cli_approval_parser_accepts_yes_and_always() {
+        assert_eq!(parse_cli_approval_response("y\n"), ApprovalResponse::Yes);
+        assert_eq!(parse_cli_approval_response("YES\n"), ApprovalResponse::Yes);
+        assert_eq!(
+            parse_cli_approval_response(" always \n"),
+            ApprovalResponse::Always
+        );
+        assert_eq!(
+            parse_cli_approval_response("A\r\n"),
+            ApprovalResponse::Always
+        );
+    }
+
+    #[test]
+    fn cli_approval_parser_denies_empty_eof_and_unknown_input() {
+        assert_eq!(parse_cli_approval_response(""), ApprovalResponse::No);
+        assert_eq!(parse_cli_approval_response("\n"), ApprovalResponse::No);
+        assert_eq!(parse_cli_approval_response("maybe\n"), ApprovalResponse::No);
+        assert_eq!(parse_cli_approval_response("[Y]\n"), ApprovalResponse::No);
+    }
+
+    #[test]
+    fn approval_line_reader_preserves_existing_stdin_eof_semantics() {
+        let line = read_approval_line_from(std::io::Cursor::new("yes\n")).unwrap();
+        assert_eq!(line, "yes\n");
+
+        let eof = read_approval_line_from(std::io::Cursor::new(Vec::<u8>::new())).unwrap();
+        assert_eq!(eof, "");
+        assert_eq!(parse_cli_approval_response(&eof), ApprovalResponse::No);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_approval_reader_prefers_tty_over_stdin_eof() {
+        let line =
+            read_cli_approval_line_with(|| Ok(std::io::Cursor::new("yes\n")), || Ok(String::new()))
+                .unwrap();
+
+        assert_eq!(line, "yes\n");
+        assert_eq!(parse_cli_approval_response(&line), ApprovalResponse::Yes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_approval_reader_falls_back_to_stdin_when_tty_unavailable() {
+        let line = read_cli_approval_line_with(
+            || -> io::Result<std::io::Cursor<&'static str>> {
+                Err(io::Error::new(io::ErrorKind::NotFound, "no tty"))
+            },
+            || Ok("always\n".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(line, "always\n");
+        assert_eq!(parse_cli_approval_response(&line), ApprovalResponse::Always);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_approval_reader_tty_read_error_fails_without_stdin_fallback() {
+        struct FailingReader;
+
+        impl std::io::Read for FailingReader {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "tty read"))
+            }
+        }
+
+        let result = read_cli_approval_line_with(
+            || Ok(std::io::BufReader::new(FailingReader)),
+            || panic!("stdin fallback should not run after tty read errors"),
+        );
+
+        assert!(result.is_err());
     }
 
     // ── needs_approval ───────────────────────────────────────
@@ -726,7 +831,7 @@ mod tests {
         assert_eq!(parsed.tool_name, "shell");
     }
 
-    // ── Regression: #4247 default approved tools in channels ──
+    // ──default approved tools in channels ──
 
     #[test]
     fn non_interactive_allows_default_auto_approve_tools() {

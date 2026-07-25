@@ -1,17 +1,5 @@
-//! CLI for alias CRUD — `zeroclaw {agents,providers,channels} {create,list,
-//! rename,delete}` (#7468 / #7175).
-//!
-//! Thin surface over the config-layer cascade in
-//! [`zeroclaw_config::alias_refs`]: `rename_with_cascade` / `delete_with_cascade`
-//! rewrite/scrub every reference and report the entry paths that changed; this
-//! module marks each dirty and persists via `Config::save_dirty` (which writes
-//! only marked paths). Plural groups (`agents`/`providers`/`channels`) are
-//! distinct from the singular `agent <alias>` run command, which is untouched.
-//!
-//! Providers and channels carry no owned non-config state, so their delete/
-//! rename is config-only. The agent owned-state cascade (memory / cron / acp /
-//! session rows + the workspace dir) is wired in a follow-up; until then agent
-//! delete/rename warn that owned state was not cascaded.
+//! CLI for alias CRUD: `zeroclaw {agents,providers,channels}
+//! {create,list,rename,delete}`.
 
 use anyhow::{Context, Result, bail};
 use zeroclaw::{AgentsCommands, ChannelsCommands, ProvidersCommands};
@@ -19,10 +7,6 @@ use zeroclaw_config::alias_refs::{
     self, AliasKind, CascadeError, CascadePolicy, ProviderCategory, RenameError,
 };
 use zeroclaw_config::schema::Config;
-
-/// The agent alias reserved as the runtime fallback — protected from delete
-/// (rename is already guarded inside `rename_with_cascade`).
-const RESERVED_DEFAULT_AGENT: &str = "default";
 
 /// Resolve a `cli-*` Fluent key for alias-CRUD CLI output. Under `agent-runtime`
 /// (default + what CI/release build) this routes through Fluent; without it the
@@ -117,10 +101,22 @@ fn list_section(config: &Config, section: &str) -> Result<()> {
 }
 
 fn create_entry(config: &mut Config, section: &str, alias: &str) -> Result<()> {
-    if config
-        .create_map_key(section, alias)
-        .map_err(anyhow::Error::msg)?
-    {
+    // Shared guarded boundary: refuses the reserved `default` agent here too (an
+    // operator create surface), and delegates unchanged for every other section.
+    // The Reserved rejection is localized via Fluent like the delete/rename guards
+    // below; Invalid (unknown section) keeps its pre-existing bare error.
+    let created = match alias_refs::create_map_key_checked(config, section, alias) {
+        Ok(created) => created,
+        Err(alias_refs::CreateError::Reserved(_)) => bail!(
+            "{}",
+            mt(
+                "cli-alias-create-reserved-default",
+                "the `default` agent is reserved and cannot be created"
+            )
+        ),
+        Err(alias_refs::CreateError::Invalid(msg)) => return Err(anyhow::Error::msg(msg)),
+    };
+    if created {
         config.mark_dirty(&format!("{section}.{alias}"));
         println!(
             "{}",
@@ -382,7 +378,7 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
             dry_run,
             yes,
         } => {
-            if alias == RESERVED_DEFAULT_AGENT {
+            if alias_refs::is_reserved_agent_alias(&alias) {
                 bail!(
                     "{}",
                     mt(
@@ -421,12 +417,6 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
     }
 }
 
-// ── agent owned-state cascade (feature-gated) ─────────────────────────────────
-// Memory / cron / acp / session rows + the workspace dir live in infra crates
-// the gateway owns; the CLI opens them from `data_dir` and reuses the gateway's
-// cascade coordinators. A `--no-default-features` build (no gateway/runtime)
-// falls back to a config-only cascade + a warning.
-
 /// Memory + optional session-backend handles opened from `data_dir` for the
 /// owned-state cascade.
 #[cfg(all(feature = "gateway", feature = "agent-runtime"))]
@@ -442,14 +432,8 @@ fn build_owned_state_handles(config: &Config) -> Result<OwnedStateHandles> {
         Arc::new(zeroclaw_memory::NoneMemory::new("none"))
     } else {
         Arc::from(
-            zeroclaw_memory::create_memory_with_storage_and_routes(
-                &config.memory,
-                &config.embedding_routes,
-                config.resolve_active_storage(),
-                &config.data_dir,
-                None,
-            )
-            .context("open memory backend for the owned-state cascade")?,
+            zeroclaw_memory::create_memory_from_config(config, None)
+                .context("open memory backend for the owned-state cascade")?,
         )
     };
     let session_backend = if config.gateway.session_persistence {
@@ -508,18 +492,18 @@ async fn agent_delete_owned_state(
     // Archive the workspace dir alongside the owned-state exports. `workspace`
     // was resolved by the caller before the config entry was removed, so a
     // custom `workspace.path` is preserved (post-removal it would default).
-    if workspace.exists() {
-        if let Err(e) = tokio::fs::rename(&workspace, archive_dir.join("workspace")).await {
-            let es = e.to_string();
-            eprintln!(
-                "{}",
-                mta(
-                    "cli-alias-warn-workspace-archive",
-                    &[("error", es.as_str())],
-                    "warning: workspace archive failed: {$error}"
-                )
-            );
-        }
+    if workspace.exists()
+        && let Err(e) = tokio::fs::rename(&workspace, archive_dir.join("workspace")).await
+    {
+        let es = e.to_string();
+        eprintln!(
+            "{}",
+            mta(
+                "cli-alias-warn-workspace-archive",
+                &[("error", es.as_str())],
+                "warning: workspace archive failed: {$error}"
+            )
+        );
     }
     let report = crate::gateway::agent_owned_state::cascade_owned_state(
         config,

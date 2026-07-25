@@ -108,24 +108,30 @@ impl DeviceRegistry {
         }
     }
 
-    fn open_db(&self) -> Connection {
-        let conn =
-            Connection::open(&self.db_path).expect("Failed to open device registry database");
+    #[cfg(test)]
+    pub(crate) fn with_db_path(db_path: PathBuf) -> Self {
+        Self {
+            cache: Mutex::new(HashMap::new()),
+            db_path,
+        }
+    }
+
+    fn open_db(&self) -> Result<Connection, rusqlite::Error> {
+        let conn = Connection::open(&self.db_path)?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA temp_store = MEMORY;",
-        )
-        .expect("Failed to set device registry pragmas");
-        conn
+        )?;
+        Ok(conn)
     }
 
-    pub fn register(&self, token_hash: String, info: DeviceInfo) {
+    pub fn register(&self, token_hash: String, info: DeviceInfo) -> Result<(), rusqlite::Error> {
         let capabilities_json = info
             .capabilities
             .as_ref()
             .and_then(|c| serde_json::to_string(c).ok());
-        let conn = self.open_db();
+        let conn = self.open_db()?;
         conn.execute(
             "INSERT OR REPLACE INTO devices (token_hash, id, name, device_type, paired_at, last_seen, ip_address, capabilities) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
@@ -138,32 +144,16 @@ impl DeviceRegistry {
                 info.ip_address,
                 capabilities_json,
             ],
-        )
-        .expect("Failed to insert device");
+        )?;
         self.cache.lock().insert(token_hash, info);
+        Ok(())
     }
 
-    /// Backfill placeholder rows for paired tokens that have no device entry.
-    ///
-    /// Bearer tokens paired through the legacy `/pair` route (`handle_pair`)
-    /// historically never called [`register`](Self::register), so their hashes
-    /// live in `gateway.paired_tokens` — the canonical credential set the auth
-    /// gate checks — with no matching device row. Such tokens fully
-    /// authenticate yet are invisible in `GET /api/devices` and cannot be
-    /// revoked from the management UI, which is a security-management gap.
-    ///
-    /// This reconciles the registry (metadata, keyed by `token_hash`) against
-    /// that canonical set on startup: every hash without a row gets a neutral
-    /// `"legacy"` placeholder so it surfaces and can be revoked like any other
-    /// device. The source of truth for *which* tokens are valid remains
-    /// `PairingGuard`/`gateway.paired_tokens` — this never invents a token,
-    /// only surfaces ones that already authenticate. `INSERT OR IGNORE` keeps a
-    /// real row from being clobbered. Returns the number of rows inserted.
     pub fn reconcile_from_token_hashes(
         &self,
         token_hashes: &[String],
     ) -> Result<usize, rusqlite::Error> {
-        let conn = self.open_db();
+        let conn = self.open_db()?;
         let mut cache = self.cache.lock();
         let now = Utc::now();
         let now_str = now.to_rfc3339();
@@ -202,53 +192,43 @@ impl DeviceRegistry {
         Ok(inserted)
     }
 
-    pub fn list(&self) -> Vec<DeviceInfo> {
-        let conn = self.open_db();
-        let mut stmt = conn
-            .prepare("SELECT token_hash, id, name, device_type, paired_at, last_seen, ip_address, capabilities FROM devices")
-            .expect("Failed to prepare device select");
-        let rows = stmt
-            .query_map([], |row| {
-                let id: String = row.get(1)?;
-                let name: Option<String> = row.get(2)?;
-                let device_type: Option<String> = row.get(3)?;
-                let paired_at_str: String = row.get(4)?;
-                let last_seen_str: String = row.get(5)?;
-                let ip_address: Option<String> = row.get(6)?;
-                let capabilities_json: Option<String> = row.get(7)?;
-                let paired_at = DateTime::parse_from_rfc3339(&paired_at_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-                let last_seen = DateTime::parse_from_rfc3339(&last_seen_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-                let capabilities = capabilities_json
-                    .as_deref()
-                    .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok());
-                Ok(DeviceInfo {
-                    id,
-                    name,
-                    device_type,
-                    paired_at,
-                    last_seen,
-                    ip_address,
-                    capabilities,
-                })
+    pub fn list(&self) -> Result<Vec<DeviceInfo>, rusqlite::Error> {
+        let conn = self.open_db()?;
+        let mut stmt = conn.prepare(
+            "SELECT token_hash, id, name, device_type, paired_at, last_seen, ip_address, capabilities FROM devices",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let id: String = row.get(1)?;
+            let name: Option<String> = row.get(2)?;
+            let device_type: Option<String> = row.get(3)?;
+            let paired_at_str: String = row.get(4)?;
+            let last_seen_str: String = row.get(5)?;
+            let ip_address: Option<String> = row.get(6)?;
+            let capabilities_json: Option<String> = row.get(7)?;
+            let paired_at = DateTime::parse_from_rfc3339(&paired_at_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            let last_seen = DateTime::parse_from_rfc3339(&last_seen_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            let capabilities = capabilities_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok());
+            Ok(DeviceInfo {
+                id,
+                name,
+                device_type,
+                paired_at,
+                last_seen,
+                ip_address,
+                capabilities,
             })
-            .expect("Failed to query devices");
-        rows.filter_map(|r| r.ok()).collect()
+        })?;
+        rows.collect()
     }
 
-    /// Delete a device by id and return its SHA-256 token hash so the caller
-    /// can revoke the matching bearer token.
-    ///
-    /// `Ok(None)` means the device did not exist; real SQLite errors are
-    /// propagated so handlers can distinguish "nothing to do" from "DB is
-    /// broken" — confusing the two during incident response is dangerous.
-    /// Uses `DELETE … RETURNING` (SQLite ≥ 3.35) so the read and delete are
-    /// atomic under concurrent revoke calls.
     pub fn revoke(&self, device_id: &str) -> Result<Option<String>, rusqlite::Error> {
-        let conn = self.open_db();
+        let conn = self.open_db()?;
         let deleted: Option<String> = conn
             .query_row(
                 "DELETE FROM devices WHERE id = ?1 RETURNING token_hash",
@@ -271,7 +251,7 @@ impl DeviceRegistry {
     /// for the "rotate after compromise — nuke everything" path so the device
     /// registry does not silently coexist with the now-revoked token set.
     pub fn clear(&self) -> Result<usize, rusqlite::Error> {
-        let conn = self.open_db();
+        let conn = self.open_db()?;
         let removed = conn.execute("DELETE FROM devices", [])?;
         self.cache.lock().clear();
         Ok(removed)
@@ -279,22 +259,27 @@ impl DeviceRegistry {
 
     pub fn update_last_seen(&self, token_hash: &str) {
         let now = Utc::now();
-        let conn = self.open_db();
-        conn.execute(
-            "UPDATE devices SET last_seen = ?1 WHERE token_hash = ?2",
-            rusqlite::params![now.to_rfc3339(), token_hash],
-        )
-        .ok();
+        // Last-seen is a best-effort touch — a write failure here is
+        // observable (the row's last_seen stays stale) but does not affect
+        // pairing or revocation, so swallow the error rather than poisoning
+        // the caller.
+        if let Ok(conn) = self.open_db() {
+            let _ = conn.execute(
+                "UPDATE devices SET last_seen = ?1 WHERE token_hash = ?2",
+                rusqlite::params![now.to_rfc3339(), token_hash],
+            );
+        }
         if let Some(device) = self.cache.lock().get_mut(token_hash) {
             device.last_seen = now;
         }
     }
 
-    /// Replace the capability list for the device identified by `token_hash`.
-    /// Returns true if a row was updated.
     pub fn update_capabilities(&self, token_hash: &str, capabilities: Vec<String>) -> bool {
         let json = serde_json::to_string(&capabilities).unwrap_or_else(|_| "[]".into());
-        let conn = self.open_db();
+        let conn = match self.open_db() {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
         let updated = conn
             .execute(
                 "UPDATE devices SET capabilities = ?1, last_seen = ?2 WHERE token_hash = ?3",
@@ -400,15 +385,15 @@ pub async fn submit_pairing_enhanced(
 
     match state.pairing.try_pair(code, &client_id).await {
         Ok(Some(token)) => {
-            // Register the new device
             let token_hash = {
                 use sha2::{Digest, Sha256};
                 let hash = Sha256::digest(token.as_bytes());
                 hex::encode(hash)
             };
+
             if let Some(ref registry) = state.device_registry {
-                registry.register(
-                    token_hash,
+                if let Err(e) = registry.register(
+                    token_hash.clone(),
                     DeviceInfo {
                         id: uuid::Uuid::new_v4().to_string(),
                         name: device_name,
@@ -418,7 +403,26 @@ pub async fn submit_pairing_enhanced(
                         ip_address: Some(client_id),
                         capabilities: None,
                     },
-                );
+                ) {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                        "device registry insert failed after successful pairing; rolling back in-process token"
+                    );
+                    state.pairing.revoke_token_hash(&token_hash);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "paired": false,
+                            "persisted": false,
+                            "error": format!("Device registry error: {e}"),
+                            "message": "Pairing failed; the in-process token was not retained.",
+                        })),
+                    )
+                        .into_response();
+                }
             }
             if let Err(e) =
                 super::persist_pairing_tokens(state.config.clone(), &state.pairing).await
@@ -428,15 +432,19 @@ pub async fn submit_pairing_enhanced(
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"error": format!("{e}")})),
-                    "pairing succeeded but token persistence failed"
+                    "pairing token persistence failed; rolling back in-process token"
                 );
-                return Json(serde_json::json!({
-                    "paired": true,
-                    "persisted": false,
-                    "token": token,
-                    "message": "Paired for this process, but failed to persist token to config.toml. Check config path and write permissions.",
-                }))
-                .into_response();
+                state.pairing.revoke_token_hash(&token_hash);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "paired": false,
+                        "persisted": false,
+                        "error": format!("Token persistence error: {e}"),
+                        "message": "Pairing failed; the in-process token was not retained.",
+                    })),
+                )
+                    .into_response();
             }
             Json(serde_json::json!({
                 "paired": true,
@@ -461,11 +469,26 @@ pub async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> 
         return e.into_response();
     }
 
-    let devices = state
-        .device_registry
-        .as_ref()
-        .map(|r| r.list())
-        .unwrap_or_default();
+    let devices = match state.device_registry.as_ref() {
+        Some(r) => match r.list() {
+            Ok(devices) => devices,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                    "device registry list failed"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Device registry error: {e}"),
+                )
+                    .into_response();
+            }
+        },
+        None => Vec::new(),
+    };
 
     let count = devices.len();
     Json(serde_json::json!({
@@ -507,11 +530,6 @@ pub async fn revoke_device(
 
     state.pairing.revoke_token_hash(&token_hash);
 
-    // If persistence fails after the in-memory revoke + row delete, the
-    // device row is already gone and the token is already invalid in this
-    // process; a daemon restart will resurrect the token from the unchanged
-    // on-disk config. Surface that to the caller so they know to re-pair
-    // and audit, rather than treating the operation as silently complete.
     if let Err(e) = super::persist_pairing_tokens(state.config.clone(), &state.pairing).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -528,7 +546,6 @@ pub async fn revoke_device(
 }
 
 /// POST /api/devices/me/capabilities — the calling device replaces its capability list.
-///
 /// The "me" path means there's no separate device id in the URL — the bearer token in
 /// Authorization identifies which row gets updated. Body: `{ "capabilities": ["..."] }`.
 pub async fn update_my_capabilities(
@@ -582,22 +599,6 @@ pub async fn update_my_capabilities(
     }
 }
 
-/// POST /api/devices/{id}/token/rotate — revoke the device's current bearer
-/// token and issue a fresh pairing code for re-pairing.
-///
-/// The device row is removed because the schema keys on `token_hash`; once
-/// the token is revoked the row's primary key is dead anyway. Re-pairing
-/// inserts a fresh row with the new token's hash.
-///
-/// The rotation's load-bearing effect is invalidating the leaked token, not
-/// issuing a new code. If another flow holds the pairing-code slot the
-/// revoke still happens; the response reports that no new code was issued
-/// and the operator can use the pending code or call again once it clears.
-///
-/// If the caller is using the same bearer token as the device being rotated
-/// (self-revocation), the response is delivered over the now-invalid token;
-/// subsequent requests from that client will fail until they re-pair. That
-/// is the intended path for "rotate my own token after I think it leaked."
 pub async fn rotate_token(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -667,5 +668,120 @@ pub async fn rotate_token(
             }))
             .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::test_state;
+    use axum::Json;
+    use http_body_util::BodyExt;
+    use std::sync::Arc;
+    use zeroclaw_config::pairing::PairingGuard;
+    use zeroclaw_config::schema::Config;
+
+    /// Build an `AppState` whose device-registry points at a non-existent
+    /// path so every SQLite write fails. Pairing enabled so a freshly
+    /// issued code is actually consumable.
+    fn unwriteable_registry_state() -> AppState {
+        let mut state = test_state(Config::default());
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.device_registry = Some(Arc::new(DeviceRegistry::with_db_path(PathBuf::from(
+            "/this/path/does/not/exist/devices.db",
+        ))));
+        state
+    }
+
+    async fn response_json(response: axum::response::Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn submit_pairing_enhanced_rolls_back_in_process_token_when_registry_register_fails() {
+        let state = unwriteable_registry_state();
+
+        // Issue a pairing code so the next `try_pair` succeeds.
+        let code = state
+            .pairing
+            .generate_new_pairing_code()
+            .expect("pairing code must be issuable when require_pairing=true");
+
+        let (status, body) = response_json(
+            submit_pairing_enhanced(
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(serde_json::json!({"code": code, "device_name": "test"})),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "registry.register failure path must surface as 500"
+        );
+        assert_eq!(body["paired"], serde_json::Value::Bool(false));
+        assert_eq!(body["persisted"], serde_json::Value::Bool(false));
+        assert!(
+            body.get("token").is_none(),
+            "5xx body MUST NOT contain the plaintext bearer token; got: {body}"
+        );
+        assert!(
+            state.pairing.tokens().is_empty(),
+            "PairingGuard::paired_tokens must be empty after a failed registry.register \
+             (compensating `revoke_token_hash`); instead have {:?}",
+            state.pairing.tokens()
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_pairing_enhanced_rolls_back_in_process_token_when_persist_fails() {
+        let mut state = test_state(Config::default());
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"").expect("seed blocker file");
+        {
+            let mut cfg = state.config.write();
+            cfg.config_path = blocker.join("config.toml");
+        }
+
+        let code = state
+            .pairing
+            .generate_new_pairing_code()
+            .expect("pairing code must be issuable when require_pairing=true");
+
+        let (status, body) = response_json(
+            submit_pairing_enhanced(
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(serde_json::json!({"code": code})),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "persistence failure path must surface as 500 (legacy leaked 200 + token)"
+        );
+        assert_eq!(body["paired"], serde_json::Value::Bool(false));
+        assert!(
+            body.get("token").is_none(),
+            "5xx body MUST NOT contain the plaintext bearer token; got: {body}"
+        );
+        assert!(
+            state.pairing.tokens().is_empty(),
+            "PairingGuard::paired_tokens must be empty after a failed persist; have {:?}",
+            state.pairing.tokens()
+        );
     }
 }

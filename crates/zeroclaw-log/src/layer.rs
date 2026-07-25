@@ -2,21 +2,6 @@
 //! `attribution_span!` spans, assembling alias-bound `LogEvent`s and
 //! routing them to JSONL persistence, the broadcast hook, and the
 //! Observer bridge.
-//!
-//! Two recognized span/event shapes:
-//!
-//! 1. `attribution_span!(thing)` — opens a span with `target =
-//!    "zeroclaw_log_internal_attribution"` carrying `zc_role_family`,
-//!    `zc_role_type`, `zc_attribution_field`, `zc_composite_prefix`,
-//!    `zc_default_category`, and `zc_alias`. The layer stashes a
-//!    `ZeroclawAttribution` snapshot in the span's extensions; no
-//!    LogEvent is emitted for the span itself.
-//! 2. `record!(LEVEL, Event::new(...), "msg")` — emits an event with
-//!    `target = "zeroclaw_log_event"` carrying `zc_name`, `zc_action`,
-//!    `zc_outcome`, `zc_category`, `zc_attrs`, `zc_has_duration`,
-//!    `zc_duration_ms`, and `message`. The layer walks the span scope
-//!    leaf→root, merges every attribution snapshot it finds, and
-//!    writes a fully populated `LogEvent`.
 
 use std::fmt::Write;
 
@@ -43,6 +28,11 @@ const F_ACTION: &str = "zc_action";
 const F_OUTCOME: &str = "zc_outcome";
 const F_CATEGORY: &str = "zc_category";
 const F_ATTRS: &str = "zc_attrs";
+/// `record!` transport field carrying broadcast-only ephemeral attributes
+/// (QR payloads, pair codes). Shared with the terminal formatter so it can
+/// redact this field from verbose stderr output. See
+/// `subscriber::RedactEphemeralFields`.
+pub(crate) const F_EPHEMERAL_ATTRS: &str = "zc_ephemeral_attrs";
 const F_HAS_DURATION: &str = "zc_has_duration";
 const F_DURATION_MS: &str = "zc_duration_ms";
 const F_FILE: &str = "zc_file";
@@ -172,6 +162,12 @@ where
         {
             log_event.attributes = v;
         }
+        if let Some(ephemeral_json) = visitor.ephemeral_attrs_json
+            && !ephemeral_json.is_empty()
+            && let Ok(v) = serde_json::from_str::<Value>(&ephemeral_json)
+        {
+            log_event.ephemeral_attributes = v;
+        }
         if !visitor.extra.is_empty() {
             if log_event.attributes.is_null() {
                 log_event.attributes = Value::Object(visitor.extra);
@@ -227,6 +223,14 @@ where
             }
         }
 
+        // Copy the recognized trace id into the native field while retaining the
+        // attributes entry consumed by the observer bridge.
+        if log_event.trace_id.is_none()
+            && let Some(tid) = log_event.attributes.get("trace_id").and_then(Value::as_str)
+        {
+            log_event.trace_id = Some(tid.to_string());
+        }
+
         record_event(log_event);
     }
 }
@@ -241,6 +245,7 @@ struct EventCollector {
     outcome: Option<String>,
     category: Option<String>,
     attrs_json: Option<String>,
+    ephemeral_attrs_json: Option<String>,
     has_duration: Option<bool>,
     duration_ms: Option<u64>,
     file: Option<String>,
@@ -337,6 +342,11 @@ impl EventCollector {
             F_ATTRS => {
                 if let Value::String(s) = value {
                     self.attrs_json = Some(s);
+                }
+            }
+            F_EPHEMERAL_ATTRS => {
+                if let Value::String(s) = value {
+                    self.ephemeral_attrs_json = Some(s);
                 }
             }
             F_DURATION_MS => {
@@ -447,11 +457,6 @@ impl AttributionSpanCollector {
     }
 }
 
-/// Carries ad-hoc per-scope context (sender id, message id, turn id,
-/// etc.) emitted via [`crate::scope!`]. Recognized attribution fields
-/// land in `attribution`; any free-form keys land in `extra`. Both
-/// stashes ride on the span's extensions and are merged onto every
-/// descendant event by the layer's scope walk.
 #[derive(Default)]
 struct ScopeExtra {
     extra: JsonMap<String, Value>,
@@ -596,6 +601,21 @@ mod e2e_tests {
         }
     }
 
+    /// Synthetic `Role::System` fixture standing in for config
+    /// load/migration attribution.
+    struct FakeSystemSurface {
+        alias: String,
+    }
+
+    impl Attributable for FakeSystemSurface {
+        fn role(&self) -> Role {
+            Role::System
+        }
+        fn alias(&self) -> &str {
+            &self.alias
+        }
+    }
+
     static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     #[allow(clippy::await_holding_lock)]
@@ -635,11 +655,6 @@ mod e2e_tests {
             .await;
         }
 
-        // Drain captured events and find ours. `recv` is awaited inside a
-        // deadline so the receiver can recover from `Lagged` errors caused
-        // by other workspace tests firing `record!` into the same global
-        // broadcast hook in parallel; a single Lagged would otherwise abort
-        // the search prematurely.
         let mut found = false;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while !found && std::time::Instant::now() < deadline {
@@ -681,6 +696,192 @@ mod e2e_tests {
         );
 
         // Clean up so subsequent parallel tests aren't affected.
+        crate::clear_broadcast_hook();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn system_role_span_populates_system_alias() {
+        let _subscriber_guard = TEST_LOCK.lock();
+        let _writer_guard = crate::writer::WRITER_TEST_LOCK.lock();
+        let _hook_guard = crate::broadcast::HOOK_TEST_LOCK.lock();
+
+        try_install_capture_subscriber();
+        let mut rx = subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let thing = FakeSystemSurface {
+            alias: "config".into(),
+        };
+
+        {
+            use zeroclaw_log::Instrument;
+            async {
+                zeroclaw_log::record!(
+                    INFO,
+                    Event::new(module_path!(), Action::Note).with_outcome(EventOutcome::Success),
+                    "system-role attribution e2e test"
+                );
+            }
+            .instrument(zeroclaw_log::attribution_span!(&thing))
+            .await;
+        }
+
+        let mut found = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !found && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.contains("system-role attribution e2e test"))
+                        .unwrap_or(false)
+                    {
+                        let zc = value.get("zeroclaw").expect("zeroclaw block present");
+                        assert_eq!(
+                            zc.get("system_alias").and_then(|v| v.as_str()),
+                            Some("config"),
+                            "expected system_alias, got: {zc:?}"
+                        );
+                        assert_eq!(zc.get("zc_role").and_then(|v| v.as_str()), Some("system"),);
+                        found = true;
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_elapsed) => {}
+            }
+        }
+        assert!(
+            found,
+            "did not find the test event with system_alias attribution",
+        );
+
+        crate::clear_broadcast_hook();
+    }
+
+    /// Ephemeral attrs attached at the call site must reach the broadcast
+    /// copy (deep-merged into `attributes`) through the full `record!` →
+    /// layer → writer pipeline. The at-rest exclusion is covered by
+    /// `writer::tests::ephemeral_attributes_reach_broadcast_but_never_disk`.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn with_ephemeral_attrs_reaches_broadcast_merged() {
+        let _subscriber_guard = TEST_LOCK.lock();
+        let _writer_guard = crate::writer::WRITER_TEST_LOCK.lock();
+        let _hook_guard = crate::broadcast::HOOK_TEST_LOCK.lock();
+
+        try_install_capture_subscriber();
+        let mut rx = subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        zeroclaw_log::record!(
+            INFO,
+            Event::new(module_path!(), Action::Note)
+                .with_attrs(::serde_json::json!({"login": {"state": "qr"}}))
+                .with_ephemeral_attrs(
+                    ::serde_json::json!({"login": {"qr_payload": "EPHEMERAL-QR"}})
+                ),
+            "ephemeral-attrs e2e test"
+        );
+
+        let mut found = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !found && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.contains("ephemeral-attrs e2e test"))
+                        .unwrap_or(false)
+                    {
+                        let login = &value["attributes"]["login"];
+                        assert_eq!(
+                            login.get("qr_payload").and_then(|v| v.as_str()),
+                            Some("EPHEMERAL-QR"),
+                            "broadcast copy must carry ephemeral attrs, got: {value:?}"
+                        );
+                        assert_eq!(login.get("state").and_then(|v| v.as_str()), Some("qr"));
+                        found = true;
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_elapsed) => {}
+            }
+        }
+        assert!(found, "did not find the ephemeral-attrs test event");
+
+        crate::clear_broadcast_hook();
+    }
+
+    /// A `trace_id` carried in the call site's `with_attrs` payload must be
+    /// promoted by the layer into the native top-level `trace_id` field (so
+    /// `?trace_id=` filters match), while ALSO remaining inside `attributes`
+    /// for the observer bridge.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn with_attrs_trace_id_promoted_to_native_field() {
+        let _subscriber_guard = TEST_LOCK.lock();
+        let _writer_guard = crate::writer::WRITER_TEST_LOCK.lock();
+        let _hook_guard = crate::broadcast::HOOK_TEST_LOCK.lock();
+
+        try_install_capture_subscriber();
+        let mut rx = subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        zeroclaw_log::record!(
+            INFO,
+            Event::new(module_path!(), Action::Receive)
+                .with_outcome(EventOutcome::Success)
+                .with_attrs(::serde_json::json!({"trace_id": "trace-abc-123"})),
+            "trace-id promotion e2e test"
+        );
+
+        let mut found = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !found && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.contains("trace-id promotion e2e test"))
+                        .unwrap_or(false)
+                    {
+                        // Native top-level field is now populated.
+                        assert_eq!(
+                            value.get("trace_id").and_then(|v| v.as_str()),
+                            Some("trace-abc-123"),
+                            "trace_id should be promoted to the native field, got: {value:?}"
+                        );
+                        // And the attributes mirror is preserved (observer bridge reads it).
+                        assert_eq!(
+                            value
+                                .get("attributes")
+                                .and_then(|a| a.get("trace_id"))
+                                .and_then(|v| v.as_str()),
+                            Some("trace-abc-123"),
+                            "attributes.trace_id copy must remain"
+                        );
+                        found = true;
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_elapsed) => {}
+            }
+        }
+        assert!(found, "did not find the trace-id promotion test event");
+
         crate::clear_broadcast_hook();
     }
 }

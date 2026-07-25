@@ -1,0 +1,53 @@
+# Canonical container base-image pins for the generated container surfaces
+# (Dockerfile, Dockerfile.debian). Edit registry/repo/image_ref/tag here; `tag`
+# records the intended policy and `digest` is rewritten live by `cargo generate
+# installers`. A row with discover=true refreshes the digest for its declared
+# tag from the registry; Node discover rows must use a plain
+# <major>-bookworm-slim tag. StageX pins in the Containerfile are excluded on
+# purpose: digest-only, reproducible-build intent, no tag to follow.
+
+[[image]]
+zone = "base-arg-node"
+arg = "ZEROCLAW_BASE_NODE"
+registry = "dockerhub"
+repo = "library/node"
+image_ref = "node"
+discover = true
+tag = "24-bookworm-slim"
+digest = "sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d"
+
+[[image]]
+zone = "base-arg-rust-slim"
+arg = "ZEROCLAW_BASE_RUST_SLIM"
+registry = "dockerhub"
+repo = "library/rust"
+image_ref = "rust"
+tag = "1.96-slim"
+digest = "sha256:31ee7fc65186be7e0e0ccb3f2ca305f14e4739e7642a1ae65753aa5d7b874523"
+
+[[image]]
+zone = "base-arg-rust-bookworm"
+arg = "ZEROCLAW_BASE_RUST_BOOKWORM"
+registry = "dockerhub"
+repo = "library/rust"
+image_ref = "rust"
+tag = "1.96-bookworm"
+digest = "sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663"
+
+[[image]]
+zone = "base-arg-debian"
+arg = "ZEROCLAW_BASE_DEBIAN"
+registry = "dockerhub"
+repo = "library/debian"
+image_ref = "debian"
+tag = "trixie-slim"
+digest = "sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd"
+
+[[image]]
+zone = "base-arg-distroless"
+arg = "ZEROCLAW_BASE_DISTROLESS"
+registry = "gcr"
+repo = "distroless/cc-debian13"
+image_ref = "gcr.io/distroless/cc-debian13"
+tag = "nonroot"
+digest = "sha256:d97bc0a941b8d4be647dc0ee75b264ddbb772f1ac5ba690a4309c00723b23775"

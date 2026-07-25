@@ -1,6 +1,6 @@
 # Service Management
 
-ZeroClaw ships with first-class service integration for systemd (Linux), launchctl (macOS), and Task Scheduler / Windows Service (Windows). All three are driven by one CLI surface:
+ZeroClaw ships with first-class service integration for systemd (Linux), launchctl (macOS), and Task Scheduler (Windows). All three are driven by one CLI surface:
 
 <div class="os-tabs-src">
 
@@ -58,6 +58,43 @@ journalctl --user -u zeroclaw --since "1h ago"
 ```
 
 </div>
+
+### Environment overrides (systemd)
+
+Use a user-service override when the daemon needs environment variables that are not present in your interactive shell:
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+systemctl --user edit zeroclaw.service
+```
+
+</div>
+
+For example, a Bedrock profile that uses `credential_process` needs `AWS_PROFILE` in the service environment:
+
+```ini
+[Service]
+Environment=AWS_PROFILE=zeroclaw-bedrock
+```
+
+After saving the override, reload and restart the user service:
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+systemctl --user daemon-reload
+systemctl --user restart zeroclaw
+journalctl --user -u zeroclaw -f
+```
+
+</div>
+
+The generated user service sets `HOME=%h`, so provider code that reads files under the service user's home directory can resolve paths such as `~/.aws/config`. If an override references an executable, use an absolute path; systemd services often run with a smaller `PATH` than an interactive shell.
 
 ### Starting before user login
 

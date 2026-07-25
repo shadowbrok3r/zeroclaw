@@ -1,5 +1,4 @@
 //! Report template engine for project delivery intelligence.
-//!
 //! Provides built-in templates for weekly status, sprint review, risk register,
 //! and milestone reports with multi-language support (EN, DE, FR, IT).
 
@@ -59,12 +58,6 @@ impl ReportTemplate {
     }
 }
 
-/// Single-pass placeholder substitution.
-///
-/// Scans `template` left-to-right for `{{key}}` tokens and replaces them with
-/// the corresponding value from `vars`.  Because the scan is single-pass,
-/// values that themselves contain `{{...}}` sequences are emitted literally
-/// and never re-expanded, preventing injection of new placeholders.
 fn substitute(template: &str, vars: &HashMap<String, String>) -> String {
     let mut result = String::with_capacity(template.len());
     let bytes = template.as_bytes();
@@ -476,7 +469,6 @@ pub fn milestone_report_template(lang: &str) -> ReportTemplate {
 }
 
 /// High-level template rendering function.
-///
 /// Returns the rendered template as a string or an error if the template
 /// or language is not supported.
 #[allow(clippy::implicit_hasher)]
@@ -598,5 +590,32 @@ mod tests {
         vars.insert("x".into(), "1".into());
         let result = substitute("{{x}} and {{x}}", &vars);
         assert_eq!(result, "1 and 1");
+    }
+
+    #[test]
+    fn substitute_does_not_re_expand_injected_placeholders() {
+        // A value that itself contains "{{...}}" is emitted literally and is
+        // NOT treated as a new placeholder (single pass prevents injection).
+        let mut vars = HashMap::new();
+        vars.insert("a".to_string(), "{{b}}".to_string());
+        vars.insert("b".to_string(), "SECRET".to_string());
+        assert_eq!(substitute("{{a}}", &vars), "{{b}}");
+    }
+
+    #[test]
+    fn substitute_leaves_unclosed_placeholder_literal() {
+        let vars = HashMap::new();
+        assert_eq!(substitute("a {{ b", &vars), "a {{ b");
+        assert_eq!(substitute("{{unterminated", &vars), "{{unterminated");
+    }
+
+    #[test]
+    fn escape_html_encodes_all_entities_ampersand_first() {
+        // `&` must be encoded first so the entities it introduces are not
+        // re-escaped; quotes and apostrophes are encoded too.
+        assert_eq!(
+            escape_html("<a href=\"x\">&'"),
+            "&lt;a href=&quot;x&quot;&gt;&amp;&#x27;"
+        );
     }
 }

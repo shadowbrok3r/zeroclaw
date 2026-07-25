@@ -1,14 +1,8 @@
 //! End-to-end tests for memory–loop–heartbeat continuity.
-//!
-//! Validates that:
-//! - Memory persists across agent turns and sessions
-//! - The agent loop maintains context awareness through tool iterations
-//! - Memory recall enriches prompts so the agent "remembers" prior work
-//! - Context compression preserves facts to memory before discarding
-//! - Multi-step tasks complete without the agent stopping prematurely
 
 use std::sync::Arc;
 
+use zeroclaw::config::MemoryConfig;
 use zeroclaw::memory::sqlite::SqliteMemory;
 use zeroclaw::memory::traits::{Memory, MemoryCategory};
 use zeroclaw::providers::ToolCall;
@@ -20,7 +14,6 @@ use crate::support::{CountingTool, EchoTool, MockModelProvider};
 // 1. Memory Store + Recall Persistence
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Store a fact, then recall it in a fresh memory instance (same DB).
 #[tokio::test]
 async fn memory_persists_across_instances() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -54,7 +47,6 @@ async fn memory_persists_across_instances() {
     }
 }
 
-/// Store multiple facts across categories and recall by relevance.
 #[tokio::test]
 async fn memory_recall_returns_relevant_entries() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -97,7 +89,6 @@ async fn memory_recall_returns_relevant_entries() {
 // 2. Agent Loop Multi-Step Completion
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Agent completes a 5-step tool chain without stopping.
 #[tokio::test]
 async fn agent_completes_five_step_tool_chain() {
     let (counting_tool, count) = CountingTool::new();
@@ -149,7 +140,6 @@ async fn agent_completes_five_step_tool_chain() {
     );
 }
 
-/// Agent handles a multi-turn conversation, maintaining history.
 #[tokio::test]
 async fn agent_maintains_history_across_turns() {
     let model_provider = Box::new(MockModelProvider::new(vec![
@@ -175,7 +165,6 @@ async fn agent_maintains_history_across_turns() {
 // 3. Memory-Enriched Agent Turns
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Agent with SqliteMemory stores and recalls across turns.
 #[tokio::test]
 async fn agent_auto_saves_and_recalls_memory() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -207,80 +196,9 @@ async fn agent_auto_saves_and_recalls_memory() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 4. Context Compressor Memory Preservation
-// ═════════════════════════════════════════════════════════════════════════════
-
-/// Verify ContextCompressor.with_memory saves summary to memory before splice.
-#[tokio::test]
-async fn compressor_with_memory_saves_summary() {
-    use zeroclaw::agent::context_compressor::{ContextCompressionConfig, ContextCompressor};
-    use zeroclaw::providers::traits::ChatMessage;
-
-    let tmp = tempfile::TempDir::new().unwrap();
-    let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new("test", tmp.path()).unwrap());
-
-    let config = ContextCompressionConfig {
-        enabled: true,
-        threshold_ratio: 0.01, // Very low threshold to force compression
-        protect_first_n: 1,
-        protect_last_n: 1,
-        max_passes: 1,
-        summary_max_chars: 4000,
-        source_max_chars: 50000,
-        timeout_secs: 60,
-        identifier_policy: "strict".to_string(),
-        ..Default::default()
-    };
-
-    // Create compressor with memory handle
-    let compressor = ContextCompressor::new(config, 100) // Tiny context window
-        .with_memory(mem.clone());
-
-    // Build a long history that will trigger compression
-    let mut history: Vec<ChatMessage> = vec![ChatMessage::system(
-        "You are a helpful assistant.".to_string(),
-    )];
-    for i in 0..20 {
-        history.push(ChatMessage::user(format!("Question {i}: What is {i} * 2?")));
-        history.push(ChatMessage::assistant(format!(
-            "Answer: {} * 2 = {}",
-            i,
-            i * 2
-        )));
-    }
-    history.push(ChatMessage::user("Final question".to_string()));
-
-    // Create a mock model_provider for summarization
-    let mock_model_provider = MockModelProvider::new(vec![text_response(
-        "Summary: User asked 20 multiplication questions. All answered correctly.",
-    )]);
-
-    let result = compressor
-        .compress_if_needed(&mut history, &mock_model_provider, "test-model", None)
-        .await;
-
-    // Check if compression happened (it should with threshold_ratio=0.01)
-    if let Ok(compressed) = result {
-        if compressed.compressed {
-            // Verify the summary was saved to memory
-            let entries = mem
-                .recall("multiplication", 10, None, None, None)
-                .await
-                .unwrap();
-            assert!(
-                !entries.is_empty(),
-                "Compression summary should have been saved to memory"
-            );
-        }
-    }
-    // Even if compression didn't trigger, the test validates the wiring
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
 // 5. Battle-Tested Loop Scenarios
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Agent handles interleaved tool calls and text responses without stopping.
 #[tokio::test]
 async fn agent_handles_interleaved_tools_and_text() {
     let model_provider = Box::new(MockModelProvider::new(vec![
@@ -313,7 +231,6 @@ async fn agent_handles_interleaved_tools_and_text() {
     );
 }
 
-/// Agent survives large tool output (truncation should kick in).
 #[tokio::test]
 async fn agent_survives_large_tool_output() {
     use zeroclaw::tools::{Tool, ToolResult};
@@ -346,7 +263,7 @@ async fn agent_survives_large_tool_output() {
             let output = "x".repeat(100_000);
             Ok(ToolResult {
                 success: true,
-                output,
+                output: output.into(),
                 error: None,
             })
         }
@@ -373,7 +290,6 @@ async fn agent_survives_large_tool_output() {
     );
 }
 
-/// Agent handles parallel tool calls in a single iteration.
 #[tokio::test]
 async fn agent_handles_parallel_tool_calls() {
     let (counting_tool, count) = CountingTool::new();
@@ -415,7 +331,6 @@ async fn agent_handles_parallel_tool_calls() {
     );
 }
 
-/// Multi-turn with tools: each turn builds on the previous.
 #[tokio::test]
 async fn agent_multi_turn_with_tools_builds_context() {
     let (counting_tool, count) = CountingTool::new();
@@ -465,7 +380,6 @@ async fn agent_multi_turn_with_tools_builds_context() {
 // 6. Memory Consolidation Integration
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Direct test of consolidate_turn saving to memory.
 #[tokio::test]
 async fn consolidation_extracts_facts_to_memory() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -480,6 +394,7 @@ async fn consolidation_extracts_facts_to_memory() {
         "test-model",
         None,
         mem.as_ref(),
+        &MemoryConfig::default(),
         "The project deadline is April 15th 2026",
         "Got it, I'll remember the deadline is April 15th.",
     )
@@ -495,7 +410,6 @@ async fn consolidation_extracts_facts_to_memory() {
     );
 }
 
-/// Memory survives multiple consolidation rounds without corruption.
 #[tokio::test]
 async fn memory_survives_rapid_consolidation() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -512,6 +426,7 @@ async fn memory_survives_rapid_consolidation() {
             "test-model",
             None,
             mem.as_ref(),
+            &MemoryConfig::default(),
             &format!("User message {i}"),
             &format!("Assistant response {i}"),
         )
@@ -534,7 +449,6 @@ async fn memory_survives_rapid_consolidation() {
 // 7. Session Persistence End-to-End
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// SQLite session backend stores and loads messages correctly.
 #[tokio::test]
 async fn session_backend_persists_messages() {
     use zeroclaw::channels::session_backend::SessionBackend;
@@ -556,7 +470,6 @@ async fn session_backend_persists_messages() {
     assert_eq!(messages.len(), 2, "Both messages should persist");
 }
 
-/// Session state transitions work correctly.
 #[tokio::test]
 async fn session_state_transitions() {
     use zeroclaw::channels::session_backend::SessionBackend;

@@ -1,8 +1,4 @@
 //! Heuristic importance scorer for non-LLM paths.
-//!
-//! Assigns importance scores (0.0–1.0) based on memory category and keyword
-//! signals. Used when LLM-based consolidation is unavailable or as a fast
-//! first-pass scorer.
 
 use super::traits::MemoryCategory;
 
@@ -48,11 +44,6 @@ pub fn compute_importance(content: &str, category: &MemoryCategory) -> f64 {
     (base + boost).min(1.0)
 }
 
-/// Compute final retrieval score incorporating importance and recency.
-///
-/// `hybrid_score`: raw retrieval score from FTS/vector (0.0–1.0)
-/// `importance`: importance score (0.0–1.0)
-/// `recency_decay`: recency factor (0.0–1.0, 1.0 = very recent)
 pub fn weighted_final_score(hybrid_score: f64, importance: f64, recency_decay: f64) -> f64 {
     hybrid_score * 0.7 + importance * 0.2 + recency_decay * 0.1
 }
@@ -103,5 +94,33 @@ mod tests {
 
         let score = weighted_final_score(0.5, 0.5, 0.5);
         assert!((score - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn daily_and_custom_category_base_scores() {
+        // Daily and Custom were uncovered; a no-keyword content isolates the base.
+        assert!((compute_importance("note", &MemoryCategory::Daily) - 0.3).abs() < f64::EPSILON);
+        assert!(
+            (compute_importance("note", &MemoryCategory::Custom("x".to_string())) - 0.4).abs()
+                < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn weighted_final_score_weights_each_signal_independently() {
+        // Symmetric inputs (as above) can't catch a weight swap; isolate each term.
+        assert!((weighted_final_score(1.0, 0.0, 0.0) - 0.7).abs() < f64::EPSILON);
+        assert!((weighted_final_score(0.0, 1.0, 0.0) - 0.2).abs() < f64::EPSILON);
+        assert!((weighted_final_score(0.0, 0.0, 1.0) - 0.1).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn keyword_boost_is_case_insensitive_and_zero_without_signals() {
+        // Uppercase keywords still boost (the content is lowercased first).
+        let upper = compute_importance("CRITICAL DECISION", &MemoryCategory::Conversation);
+        assert!((upper - 0.4).abs() < f64::EPSILON); // base 0.2 + 2 keywords * 0.1
+        // No high-signal keywords -> pure base score.
+        let plain = compute_importance("just a casual note", &MemoryCategory::Daily);
+        assert!((plain - 0.3).abs() < f64::EPSILON);
     }
 }

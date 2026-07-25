@@ -4,7 +4,7 @@ use futures_util::StreamExt;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::FirecrawlConfig;
 
@@ -12,15 +12,6 @@ use zeroclaw_config::schema::FirecrawlConfig;
 /// Bodies shorter than this are treated as JS-only pages that need Firecrawl.
 const FIRECRAWL_MIN_BODY_LEN: usize = 100;
 
-/// Web fetch tool: fetches a web page and converts HTML to plain text for LLM consumption.
-///
-/// Unlike `http_request` (an API client returning raw responses), this tool:
-/// - Only supports GET
-/// - Follows redirects (up to 10)
-/// - Converts HTML to clean plain text via `nanohtml2text`
-/// - Passes through text/plain, text/markdown, and application/json as-is
-/// - Sets a descriptive User-Agent
-/// - Falls back to Firecrawl API when standard fetch fails (if enabled)
 pub struct WebFetchTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
@@ -72,12 +63,6 @@ impl WebFetchTool {
     }
 
     fn truncate_response(&self, text: &str) -> String {
-        // max_response_size == 0 means "unlimited" (matches the
-        // http_request tool's documented semantics + tests at
-        // crates/zeroclaw-tools/src/http_request.rs:151). Without this
-        // branch, the unsigned-arithmetic path below would truncate
-        // every response to zero bytes, then append the truncation
-        // marker — useless content + spurious Firecrawl fallback.
         if self.max_response_size == 0 {
             return text.to_string();
         }
@@ -98,11 +83,6 @@ impl WebFetchTool {
         response: reqwest::Response,
     ) -> anyhow::Result<String> {
         let mut bytes_stream = response.bytes_stream();
-        // max_response_size == 0 → unlimited. Without this branch, the
-        // existing saturating_add(1) made hard_cap = 1 byte, so the
-        // entire stream was truncated after one byte. Use usize::MAX as
-        // the effective hard_cap when unlimited so append_chunk_with_cap
-        // never stops early on size grounds.
         let hard_cap = if self.max_response_size == 0 {
             usize::MAX
         } else {
@@ -201,7 +181,7 @@ impl WebFetchTool {
             let error_body = response.text().await.unwrap_or_default();
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Firecrawl API error: HTTP {} - {}",
                     status.as_u16(),
@@ -233,7 +213,7 @@ impl WebFetchTool {
         if markdown.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Firecrawl returned empty markdown content".into()),
             });
         }
@@ -242,7 +222,7 @@ impl WebFetchTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }
@@ -254,7 +234,7 @@ impl WebFetchTool {
             Err(e) => {
                 return ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("HTTP request failed: {e}")),
                 };
             }
@@ -264,7 +244,7 @@ impl WebFetchTool {
         if !status.is_success() {
             return ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "HTTP {} {}",
                     status.as_u16(),
@@ -291,7 +271,7 @@ impl WebFetchTool {
         } else {
             return ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unsupported content type: {content_type}. \
                      web_fetch supports text/html, text/plain, text/markdown, and application/json."
@@ -304,7 +284,7 @@ impl WebFetchTool {
             Err(e) => {
                 return ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to read response body: {e}")),
                 };
             }
@@ -320,7 +300,7 @@ impl WebFetchTool {
 
         ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         }
     }
@@ -369,7 +349,7 @@ impl Tool for WebFetchTool {
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
             });
         }
@@ -382,7 +362,7 @@ impl Tool for WebFetchTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(e.to_string()),
                 });
             }
@@ -437,7 +417,7 @@ impl Tool for WebFetchTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to build HTTP client: {e}")),
                 });
             }
@@ -542,17 +522,24 @@ fn validate_target_url_with_dns_check(
     }
 
     let host_is_private_or_local = domain_guard::is_private_or_local_host(&host);
-    let private_host_allowed =
-        host_matches_private_allowlist(&host, allowed_private_hosts, host_is_private_or_local);
+    let private_match = private_allowlist_match(&host, allowed_private_hosts);
+    // An explicit entry (a specific host/IP or suffix) is a deliberate per-host
+    // carve-out; the "*" wildcard blanket-tolerates a private/internal
+    // resolution for any host. The distinction only affects the WARN below.
+    let private_explicit = matches!(private_match, PrivateAllow::Explicit);
+    // Either an explicit entry or "*" tolerates a private/internal host: it lifts
+    // the literal private-host block and skips the resolved-IP public check.
+    let private_tolerated = !matches!(private_match, PrivateAllow::None);
 
-    if host_is_private_or_local && !private_host_allowed {
+    if host_is_private_or_local && !private_tolerated {
         anyhow::bail!(
             "Blocked local/private host: {host}. \
-             To allow this host, add it to {tool_name}.allowed_private_hosts in config.toml"
+             To allow this host, add it (or \"*\") to \
+             {tool_name}.allowed_private_hosts in config.toml"
         );
     }
 
-    if private_host_allowed {
+    if private_explicit || (private_tolerated && host_is_private_or_local) {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -562,16 +549,16 @@ fn validate_target_url_with_dns_check(
         );
     }
 
-    // Private hosts in the allowlist skip the allowed_domains check.
-    // Non-private hosts still require allowed_domains approval even when
-    // listed in allowed_private_hosts (e.g. explicit internal DNS names).
-    let skip_allowed_domains = host_is_private_or_local && private_host_allowed;
+    let skip_allowed_domains = host_is_private_or_local && private_tolerated;
 
     if !skip_allowed_domains && !domain_guard::host_matches_allowlist(&host, allowed_domains) {
         anyhow::bail!("Host '{host}' is not in {tool_name}.allowed_domains");
     }
 
-    if !private_host_allowed {
+    // Skip the resolved-IP public check only when the host is covered by the
+    // private allowlist (explicit OR "*"). This is what lets a domain that
+    // resolves to a private IP through under allowed_private_hosts = ["*"].
+    if !private_tolerated {
         validate_dns(&host)?;
     }
 
@@ -646,15 +633,32 @@ fn extract_host(url: &str) -> anyhow::Result<String> {
     Ok(host)
 }
 
-fn host_matches_private_allowlist(
-    host: &str,
-    allowed_private_hosts: &[String],
-    host_is_private_or_local: bool,
-) -> bool {
-    if allowed_private_hosts.iter().any(|d| d == "*") {
-        return host_is_private_or_local;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivateAllow {
+    /// Not covered by the private allowlist.
+    None,
+    /// Covered only by a `*` wildcard entry.
+    Wildcard,
+    /// Covered by a specific host/IP or suffix entry.
+    Explicit,
+}
+
+fn private_allowlist_match(host: &str, allowed_private_hosts: &[String]) -> PrivateAllow {
+    let mut wildcard = false;
+    for entry in allowed_private_hosts {
+        if entry == "*" {
+            // Record the wildcard but keep scanning: a later explicit entry
+            // should still win, since it is a deliberate per-host carve-out.
+            wildcard = true;
+        } else if domain_guard::host_matches_allowlist(host, std::slice::from_ref(entry)) {
+            return PrivateAllow::Explicit;
+        }
     }
-    domain_guard::host_matches_allowlist(host, allowed_private_hosts)
+    if wildcard {
+        PrivateAllow::Wildcard
+    } else {
+        PrivateAllow::None
+    }
 }
 
 #[cfg(not(test))]
@@ -699,7 +703,11 @@ fn validate_resolved_ips_are_public(host: &str, ips: &[std::net::IpAddr]) -> any
             std::net::IpAddr::V6(v6) => domain_guard::is_non_global_v6(*v6),
         };
         if non_global {
-            anyhow::bail!("Blocked host '{host}' resolved to non-global address {ip}");
+            anyhow::bail!(
+                "Blocked host '{host}' resolved to non-global address {ip}. \
+                 To allow hosts that resolve to private/internal IPs, add '{host}' \
+                 (or \"*\") to web_fetch.allowed_private_hosts in config.toml"
+            );
         }
     }
 
@@ -1021,13 +1029,6 @@ mod tests {
         );
     }
 
-    /// Drives the actual streamed-read path (standard_fetch +
-    /// read_response_text_limited) via wiremock to lock in the
-    /// max_response_size=0 behaviour. Audacity88 review (PR #6884)
-    /// flagged the direct-helper test as insufficient because it
-    /// did not exercise the saturating_add(1) cap that previously
-    /// stopped streaming after 1 byte and triggered spurious
-    /// Firecrawl fallback.
     #[tokio::test]
     async fn standard_fetch_with_zero_limit_returns_full_body_and_skips_firecrawl_fallback() {
         use wiremock::matchers::method;
@@ -1245,7 +1246,7 @@ mod tests {
         let tool = test_tool_with_firecrawl(FirecrawlConfig::default());
         let result = ToolResult {
             success: false,
-            output: String::new(),
+            output: ToolOutput::default(),
             error: Some("HTTP 403 Forbidden".into()),
         };
         assert!(!tool.should_fallback_to_firecrawl(&result));
@@ -1259,7 +1260,7 @@ mod tests {
         });
         let result = ToolResult {
             success: false,
-            output: String::new(),
+            output: ToolOutput::default(),
             error: Some("HTTP 403 Forbidden".into()),
         };
         assert!(tool.should_fallback_to_firecrawl(&result));
@@ -1273,7 +1274,7 @@ mod tests {
         });
         let result = ToolResult {
             success: true,
-            output: String::new(),
+            output: ToolOutput::default(),
             error: None,
         };
         assert!(tool.should_fallback_to_firecrawl(&result));
@@ -1301,7 +1302,7 @@ mod tests {
         });
         let result = ToolResult {
             success: true,
-            output: "A".repeat(200), // well above 100 chars
+            output: "A".repeat(200).into(), // well above 100 chars
             error: None,
         };
         assert!(!tool.should_fallback_to_firecrawl(&result));
@@ -1367,7 +1368,7 @@ mod tests {
         });
         let result = ToolResult {
             success: true,
-            output: "A".repeat(99),
+            output: "A".repeat(99).into(),
             error: None,
         };
         assert!(
@@ -1384,7 +1385,7 @@ mod tests {
         });
         let result = ToolResult {
             success: true,
-            output: "A".repeat(100),
+            output: "A".repeat(100).into(),
             error: None,
         };
         assert!(
@@ -1609,13 +1610,87 @@ mod tests {
     }
 
     #[test]
+    fn private_wildcard_allows_domain_resolving_to_private_ip() {
+        // allowed_private_hosts = ["*"] must permit a
+        // regular domain that resolves to a private/internal IP, as long as the
+        // name itself passes allowed_domains. The DNS public check must be
+        // skipped (closure panics if reached).
+        let allowed_domains = vec!["example.com".to_string()];
+        let blocked_domains = vec![];
+        let allowed_private_hosts = vec!["*".to_string()];
+
+        let result = validate_target_url_with_dns_check(
+            "https://internal.example.com/api",
+            &allowed_domains,
+            &blocked_domains,
+            &allowed_private_hosts,
+            "web_fetch",
+            |_| panic!("DNS public-host validation should be skipped under private wildcard"),
+        );
+
+        assert!(
+            result.is_ok(),
+            "private wildcard should allow subdomain of allowed_domains: {result:?}"
+        );
+    }
+
+    #[test]
+    fn private_wildcard_allows_literal_private_ip_without_allowed_domains_entry() {
+        // The "*" wildcard must keep its historical scope for *literal* private
+        // hosts: an IP literal (or localhost/.local) is allowed even when it is
+        // not listed in allowed_domains. Only ordinary domain names stay gated
+        // on allowed_domains under "*".
+        let allowed_domains = vec!["example.com".to_string()];
+        let blocked_domains = vec![];
+        let allowed_private_hosts = vec!["*".to_string()];
+
+        let result = validate_target_url_with_dns_check(
+            "https://10.0.0.1/api",
+            &allowed_domains,
+            &blocked_domains,
+            &allowed_private_hosts,
+            "web_fetch",
+            |_| panic!("DNS public-host validation should be skipped for a literal private IP"),
+        );
+
+        assert!(
+            result.is_ok(),
+            "private wildcard should allow a literal private IP: {result:?}"
+        );
+    }
+
+    #[test]
     fn private_allowlist_explicit_entry_must_pass_allowed_domains() {
+        // An explicit (non-private) entry in allowed_private_hosts is NOT a free
+        // pass: a non-private host still has to be in allowed_domains.
         let allowed_domains = vec!["example.com".to_string()];
         let blocked_domains = vec![];
         let allowed_private_hosts = vec!["unrelated.com".to_string()];
 
         let err = validate_target_url_with_dns_check(
             "https://unrelated.com/api",
+            &allowed_domains,
+            &blocked_domains,
+            &allowed_private_hosts,
+            "web_fetch",
+            |_| anyhow::Ok(()),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("allowed_domains"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn private_wildcard_still_requires_allowed_domains() {
+        // The "*" private wildcard must NOT widen the name allowlist: a public
+        // domain that is not in allowed_domains stays blocked.
+        let allowed_domains = vec!["example.com".to_string()];
+        let blocked_domains = vec![];
+        let allowed_private_hosts = vec!["*".to_string()];
+
+        let err = validate_target_url_with_dns_check(
+            "https://evil.com/api",
             &allowed_domains,
             &blocked_domains,
             &allowed_private_hosts,

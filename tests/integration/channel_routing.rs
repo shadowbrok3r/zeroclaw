@@ -1,11 +1,4 @@
 //! TG3: Channel Message Identity & Routing Tests
-//!
-//! Prevents: Pattern 3 — Channel message routing & identity bugs (17% of user bugs).
-//! Issues: #496, #483, #620, #415, #503
-//!
-//! Tests that ChannelMessage fields are used consistently and that the
-//! SendMessage → Channel trait contract preserves correct identity semantics.
-//! Verifies sender/reply_target field contracts to prevent field swaps.
 
 use async_trait::async_trait;
 use zeroclaw::channels::{Channel, ChannelMessage, SendMessage};
@@ -29,6 +22,8 @@ fn channel_message_sender_field_holds_platform_user_id() {
         interruption_scope_id: None,
         attachments: vec![],
         subject: None,
+
+        ..Default::default()
     };
 
     assert_eq!(msg.sender, "123456789");
@@ -55,6 +50,8 @@ fn channel_message_reply_target_distinct_from_sender() {
         interruption_scope_id: None,
         attachments: vec![],
         subject: None,
+
+        ..Default::default()
     };
 
     assert_ne!(
@@ -66,7 +63,7 @@ fn channel_message_reply_target_distinct_from_sender() {
 
 #[test]
 fn channel_message_fields_not_swapped() {
-    // Guards against #496 (Telegram) and #483 (Discord) field swap bugs
+    // Guards against(Telegram) and(Discord) field swap bugs
     let msg = ChannelMessage {
         id: "msg_42".into(),
         sender: "sender_value".into(),
@@ -79,6 +76,8 @@ fn channel_message_fields_not_swapped() {
         interruption_scope_id: None,
         attachments: vec![],
         subject: None,
+
+        ..Default::default()
     };
 
     assert_eq!(
@@ -109,6 +108,8 @@ fn channel_message_preserves_all_fields_on_clone() {
         interruption_scope_id: None,
         attachments: vec![],
         subject: None,
+
+        ..Default::default()
     };
 
     let cloned = original.clone();
@@ -217,6 +218,8 @@ impl Channel for CapturingChannel {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         })
         .await
         .map_err(|e| anyhow::Error::msg(e.to_string()))
@@ -315,7 +318,7 @@ async fn channel_draft_defaults() {
     );
     assert!(
         channel
-            .finalize_draft("target", "msg_1", "final")
+            .finalize_draft("target", "msg_1", "final", false)
             .await
             .is_ok()
     );

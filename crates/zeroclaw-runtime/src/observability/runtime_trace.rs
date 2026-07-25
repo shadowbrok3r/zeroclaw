@@ -1,10 +1,4 @@
 //! Compatibility shim for the doctor command's log-reading utilities.
-//!
-//! The legacy positional-arg `record_event` shim was retired in favor of
-//! direct `zeroclaw_log::record!` invocations carrying typed attribution
-//! via `attribution_span!`. This module survives only as the doctor
-//! command's path-resolution + load surface; new emission code goes
-//! directly to `zeroclaw_log::record!`.
 
 use std::path::Path;
 
@@ -17,9 +11,14 @@ fn to_log_config(config: &zeroclaw_config::schema::ObservabilityConfig) -> zeroc
         log_persistence: config.log_persistence.as_wire().to_string(),
         log_persistence_path: config.log_persistence_path.clone(),
         log_persistence_max_entries: config.log_persistence_max_entries,
+        log_persistence_max_bytes: config.log_persistence_max_bytes,
+        log_persistence_rotate_daily: config.log_persistence_rotate_daily,
+        log_persistence_retention_max_files: config.log_persistence_retention_max_files,
+        log_persistence_retention_max_age_days: config.log_persistence_retention_max_age_days,
         log_tool_io: config.log_tool_io.as_wire().to_string(),
         log_tool_io_truncate_bytes: config.log_tool_io_truncate_bytes,
         log_tool_io_denylist: config.log_tool_io_denylist.clone(),
+        log_llm_request_payload: config.log_llm_request_payload.as_wire().to_string(),
     }
 }
 

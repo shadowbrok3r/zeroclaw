@@ -1,20 +1,4 @@
 //! SubprocessTool — wraps any external binary as a [`Tool`].
-//!
-//! Plugins do not need to be written in Rust. Any executable that follows the
-//! ZeroClaw subprocess protocol is a valid tool:
-//!
-//! **Protocol (stdin/stdout, one line each):**
-//! ```text
-//! Host → binary stdin:  {"device":"pico0","pin":5}\n
-//! Binary → stdout:      {"success":true,"output":"done","error":null}\n
-//! ```
-//!
-//! Error protocol:
-//! - **Timeout (10 s)** — process is killed; `ToolResult::error` contains timeout message.
-//! - **Non-zero exit** — process is killed; `ToolResult::error` contains stderr.
-//! - **Empty / unparseable stdout** — `ToolResult::error` describes the failure.
-//!
-//! The schema advertised to the LLM is auto-generated from [`ToolManifest::parameters`].
 
 use super::manifest::ToolManifest;
 use async_trait::async_trait;
@@ -24,7 +8,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 use zeroclaw_api::attribution::ToolKind;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_api::tool_attribution;
 
 tool_attribution!(SubprocessTool, ToolKind::Plugin);
@@ -36,11 +20,6 @@ const SUBPROCESS_TIMEOUT_SECS: u64 = 10;
 /// Prevents a hung cleanup phase from blocking indefinitely.
 const PROCESS_EXIT_TIMEOUT_SECS: u64 = 5;
 
-/// A tool backed by an external subprocess.
-///
-/// The binary receives the LLM-supplied JSON arguments on stdin (one line,
-/// `\n`-terminated) and must write a single `ToolResult`-compatible JSON
-/// object to stdout before exiting.
 pub struct SubprocessTool {
     /// Parsed plugin manifest (tool metadata + parameter definitions).
     manifest: ToolManifest,
@@ -108,16 +87,6 @@ impl Tool for SubprocessTool {
         })
     }
 
-    /// Spawn the binary, write args to stdin, read `ToolResult` from stdout.
-    ///
-    /// Steps:
-    /// 1. Serialize `args` to a JSON string.
-    /// 2. Spawn `binary_path` with piped stdin/stdout/stderr.
-    /// 3. Write `<json>\n` to child stdin; close stdin (signal EOF).
-    /// 4. Read one line from child stdout (10 s timeout).
-    /// 5. Kill the child process.
-    /// 6. Deserialize the line to `ToolResult`.
-    /// 7. On timeout → return error `ToolResult`; on empty/bad output → error.
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let args_json = serde_json::to_string(&args).map_err(|e| {
             ::zeroclaw_log::record!(
@@ -202,7 +171,7 @@ impl Tool for SubprocessTool {
                 let _ = child.kill().await;
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "plugin '{}': could not attach stdout pipe",
                         self.manifest.tool.name
@@ -231,7 +200,7 @@ impl Tool for SubprocessTool {
                 let stderr_msg = collect_stderr(stderr_handle).await;
                 Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "plugin '{}' timed out after {}s{}",
                         self.manifest.tool.name,
@@ -252,7 +221,7 @@ impl Tool for SubprocessTool {
                 let stderr_msg = collect_stderr(stderr_handle).await;
                 Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "plugin '{}': I/O error reading stdout: {}{}",
                         self.manifest.tool.name,
@@ -281,7 +250,7 @@ impl Tool for SubprocessTool {
                 if line.is_empty() {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "plugin '{}': empty stdout{}",
                             self.manifest.tool.name,
@@ -303,7 +272,7 @@ impl Tool for SubprocessTool {
                         {
                             return Ok(ToolResult {
                                 success: false,
-                                output: String::new(),
+                                output: ToolOutput::default(),
                                 error: Some(format!(
                                     "plugin '{}' exited with {}{}",
                                     self.manifest.tool.name,
@@ -320,7 +289,7 @@ impl Tool for SubprocessTool {
                     }
                     Err(parse_err) => Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "plugin '{}': failed to parse output as ToolResult: {} (got: {:?})",
                             self.manifest.tool.name,
@@ -424,31 +393,18 @@ mod tests {
         assert!(required.is_empty());
     }
 
-    /// Verify that a binary which exits 0 with valid ToolResult JSON on stdout
-    /// is deserialised correctly.
     #[tokio::test]
     async fn execute_successful_subprocess() {
         // Use `echo` to emit a valid ToolResult on stdout.
         // `echo` prints its argument + newline and exits 0.
         let result_json = r#"{"success":true,"output":"ok","error":null}"#;
 
-        // Build a manifest pointing at `echo`.
+        // Build a manifest pointing at a tiny protocol helper.
         let m = make_manifest("echo_tool", vec![]);
 
-        // Construct an `echo` invocation as the binary with the JSON pre-set.
-        // We use `sh -c 'echo <json>'` because the SubprocessTool feeds the
-        // manifest binary with args on stdin — echo just ignores stdin.
-        let script = format!("echo '{}'", result_json);
-        let binary = PathBuf::from("sh");
-        // Override binary to `sh` and pass `-c` + script via a wrapper.
-        // Simpler: write a temp script.
         let dir = tempfile::tempdir().unwrap();
-        let script_path = dir.path().join("tool.sh");
-        std::fs::write(
-            &script_path,
-            format!("#!/bin/sh\ncat > /dev/null\necho '{}'\n", result_json),
-        )
-        .unwrap();
+        let script_path = protocol_helper_path(dir.path());
+        std::fs::write(&script_path, protocol_helper_script(result_json)).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -464,12 +420,28 @@ mod tests {
         assert!(result.success, "expected success=true, got: {:?}", result);
         assert_eq!(result.output, "ok");
         assert!(result.error.is_none());
-
-        let _ = script;
-        let _ = binary;
     }
 
-    /// A binary that hangs forever should be killed and return a timeout error.
+    #[cfg(windows)]
+    fn protocol_helper_path(dir: &std::path::Path) -> PathBuf {
+        dir.join("tool.cmd")
+    }
+
+    #[cfg(not(windows))]
+    fn protocol_helper_path(dir: &std::path::Path) -> PathBuf {
+        dir.join("tool.sh")
+    }
+
+    #[cfg(windows)]
+    fn protocol_helper_script(result_json: &str) -> String {
+        format!("@echo off\r\nset /p _zc_args=\r\necho {result_json}\r\n")
+    }
+
+    #[cfg(not(windows))]
+    fn protocol_helper_script(result_json: &str) -> String {
+        format!("#!/bin/sh\ncat > /dev/null\necho '{}'\n", result_json)
+    }
+
     #[tokio::test]
     #[ignore = "slow: waits SUBPROCESS_TIMEOUT_SECS (~10 s) to elapse — run manually"]
     async fn execute_timeout_kills_process_and_returns_error() {

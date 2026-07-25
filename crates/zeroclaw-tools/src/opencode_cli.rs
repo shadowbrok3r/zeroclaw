@@ -3,7 +3,7 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_config::schema::OpenCodeCliConfig;
@@ -13,14 +13,6 @@ const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
-/// Delegates coding tasks to the OpenCode CLI (`opencode run`).
-///
-/// This creates a two-tier agent architecture: ZeroClaw orchestrates high-level
-/// tasks and delegates complex coding work to OpenCode, which has its own
-/// agent loop with file editing and shell tools.
-///
-/// Authentication uses the `opencode` binary's own session by default. No API
-/// key is needed unless `env_passthrough` includes provider-specific keys.
 pub struct OpenCodeCliTool {
     security: Arc<SecurityPolicy>,
     config: OpenCodeCliConfig,
@@ -70,7 +62,7 @@ impl Tool for OpenCodeCliTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -93,13 +85,18 @@ impl Tool for OpenCodeCliTool {
         // specially-crafted path components).
         let work_dir = if let Some(wd) = args.get("working_directory").and_then(|v| v.as_str()) {
             let wd_path = std::path::PathBuf::from(wd);
+            let wd_path = if wd_path.is_relative() {
+                self.security.workspace_dir.join(&wd_path)
+            } else {
+                wd_path
+            };
             let workspace = &self.security.workspace_dir;
             let canonical_wd = match wd_path.canonicalize() {
                 Ok(p) => p,
                 Err(_) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "working_directory '{}' does not exist or is not accessible",
                             wd
@@ -112,7 +109,7 @@ impl Tool for OpenCodeCliTool {
                 Err(_) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "workspace directory '{}' does not exist or is not accessible",
                             workspace.display()
@@ -123,7 +120,7 @@ impl Tool for OpenCodeCliTool {
             if !canonical_wd.starts_with(&canonical_ws) {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "working_directory '{}' is outside the workspace '{}'",
                         wd,
@@ -182,7 +179,7 @@ impl Tool for OpenCodeCliTool {
 
                 Ok(ToolResult {
                     success: output.status.success(),
-                    output: stdout,
+                    output: stdout.into(),
                     error: if stderr.is_empty() {
                         None
                     } else {
@@ -202,7 +199,7 @@ impl Tool for OpenCodeCliTool {
                 };
                 Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(msg),
                 })
             }
@@ -211,7 +208,7 @@ impl Tool for OpenCodeCliTool {
                 // when the future is dropped.
                 Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "OpenCode CLI timed out after {}s and was killed",
                         self.config.timeout_secs

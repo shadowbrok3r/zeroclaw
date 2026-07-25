@@ -2,8 +2,6 @@
 //! source per-user, so it must expose feature selection (overridable), not a
 //! fixed set. We generate a sentinel-delimited zone defining the zeroclaw +
 //! zerocode packages with the canonical Dist feature list as the default
-//! `buildFeatures`, overridable via `.override { features = [...]; }`. The
-//! feature list and version come from the spec; nothing is typed.
 
 use super::spec::{self, Selection};
 use std::path::Path;
@@ -34,7 +32,7 @@ pub fn render_zone(root: &Path) -> anyhow::Result<String> {
     // building each binary with --no-default-features --features <list>. Users
     // override with `.override { features = [ ... ]; }`.
     let lines = [
-        "        # Default feature set: canonical Dist (all channels, no heavyweight).".to_string(),
+        "        # Default feature set: canonical lean Dist.".to_string(),
         "        # Override with `packages.zeroclaw.override { features = [ ... ]; }`.".to_string(),
         format!("        zeroclawDefaultFeatures = [ {feature_list} ];"),
         "        buildZeroclaw = { pname, cargoPkg, features ? zeroclawDefaultFeatures }:"
@@ -46,13 +44,18 @@ pub fn render_zone(root: &Path) -> anyhow::Result<String> {
         "            inherit pname;".to_string(),
         format!("            version = \"{version}\";"),
         "            src = ./.;".to_string(),
-        "            cargoLock.lockFile = ./Cargo.lock;".to_string(),
+        "            cargoLock = {".to_string(),
+        "              lockFile = ./Cargo.lock;".to_string(),
+        "              outputHashes = builtins.fromJSON (builtins.readFile ./nix/hashes.json);"
+            .to_string(),
+        "            };".to_string(),
         "            cargoBuildFlags =".to_string(),
         "              [ \"-p\" cargoPkg \"--no-default-features\" ]".to_string(),
         "              ++ pkgs.lib.optionals (features != [])".to_string(),
         "                [ \"--features\" (pkgs.lib.concatStringsSep \",\" features) ];"
             .to_string(),
         "            doCheck = false;".to_string(),
+        "            buildInputs = [ pkgs.stdenv.cc.cc ];".to_string(),
         "          };".to_string(),
     ];
     let body = lines.join("\n");
@@ -112,10 +115,11 @@ mod tests {
     }
 
     #[test]
-    fn zone_default_is_dist_channels_no_heavyweight() {
+    fn zone_default_is_lean_dist() {
         let z = render_zone(&root()).unwrap();
-        assert!(z.contains("\"channel-discord\""), "dist ships all channels");
-        assert!(!z.contains("\"hardware\""), "dist excludes heavyweight");
+        assert!(z.contains("\"channel-matrix\""));
+        assert!(z.contains("\"whatsapp-web\""));
+        assert!(!z.contains("\"channel-slack\""));
     }
 
     #[test]
@@ -123,5 +127,16 @@ mod tests {
         let v = spec::resolve_version(&root()).unwrap();
         let z = render_zone(&root()).unwrap();
         assert!(z.contains(&format!("version = \"{v}\"")));
+    }
+
+    #[test]
+    fn zone_loads_hashes_via_nix_expression() {
+        let z = render_zone(&root()).unwrap();
+        assert!(
+            z.contains("builtins.fromJSON"),
+            "hashes loaded at eval time, not baked at generate time"
+        );
+        assert!(z.contains("outputHashes"), "outputHashes attribute present");
+        assert!(z.contains("buildInputs"), "buildInputs attribute present");
     }
 }

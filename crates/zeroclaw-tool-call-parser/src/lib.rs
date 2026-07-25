@@ -1,12 +1,4 @@
 //! Tool call parsing for LLM responses.
-//!
-//! Extracts structured tool calls from free-text LLM output. Handles a dozen
-//! different formats: JSON, XML `<tool_call>` tags, GLM-style shortened syntax,
-//! MiniMax `<invoke>` blocks, Perl-style `[TOOL_CALL]` blocks, markdown fences,
-//! OpenAI native format, and more.
-//!
-//! This crate has no dependency on agent state, memory, model_providers, or channels.
-//! It is pure text transformation.
 
 use regex::Regex;
 use std::{collections::HashSet, sync::LazyLock};
@@ -574,8 +566,9 @@ fn malformed_text_mentions_known_tool(text: &str, known_tool_names: &HashSet<Str
         return false;
     }
 
-    static JSON_NAME_FIELD_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#""name"\s*:\s*"([^"]+)""#).unwrap());
+    static JSON_NAME_FIELD_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#""name"\s*:\s*"([^"]+)""#).expect("JSON_NAME_FIELD_RE regex must compile")
+    });
 
     JSON_NAME_FIELD_RE.captures_iter(text).any(|cap| {
         cap.get(1)
@@ -738,21 +731,22 @@ fn is_xml_meta_tag(tag: &str) -> bool {
 }
 
 /// Match opening XML tags: `<tag_name>`.  Does NOT use backreferences.
-static XML_OPEN_TAG_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<([a-zA-Z_][a-zA-Z0-9_-]*)>").unwrap());
+static XML_OPEN_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"<([a-zA-Z_][a-zA-Z0-9_-]*)>").expect("XML_OPEN_TAG_RE regex must compile")
+});
 
 /// MiniMax XML invoke format:
 /// `<invoke name="shell"><parameter name="command">pwd</parameter></invoke>`
 static MINIMAX_INVOKE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?is)<invoke\b[^>]*\bname\s*=\s*(?:"([^"]+)"|'([^']+)')[^>]*>(.*?)</invoke>"#)
-        .unwrap()
+        .expect("MINIMAX_INVOKE_RE regex must compile")
 });
 
 static MINIMAX_PARAMETER_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?is)<parameter\b[^>]*\bname\s*=\s*(?:"([^"]+)"|'([^']+)')[^>]*>(.*?)</parameter>"#,
     )
-    .unwrap()
+    .expect("MINIMAX_PARAMETER_RE regex must compile")
 });
 
 /// Extracts all `<tag>…</tag>` pairs from `input`, returning `(tag_name, inner_content)`.
@@ -998,15 +992,6 @@ fn strip_leading_close_tags(mut input: &str) -> &str {
     }
 }
 
-/// Extract JSON values from a string.
-///
-/// # Security Warning
-///
-/// This function extracts ANY JSON objects/arrays from the input. It MUST only
-/// be used on content that is already trusted to be from the LLM, such as
-/// content inside `<invoke>` tags where the LLM has explicitly indicated intent
-/// to make a tool call. Do NOT use this on raw user input or content that
-/// could contain prompt injection payloads.
 fn extract_json_values(input: &str) -> Vec<serde_json::Value> {
     let mut values = Vec::new();
     let trimmed = input.trim();
@@ -1045,6 +1030,265 @@ fn extract_json_values(input: &str) -> Vec<serde_json::Value> {
     values
 }
 
+fn skip_json_ws(input: &str, mut idx: usize) -> usize {
+    while let Some(ch) = input[idx..].chars().next() {
+        if !ch.is_whitespace() {
+            break;
+        }
+        idx += ch.len_utf8();
+    }
+    idx
+}
+
+fn find_json_field_value_start(input: &str, field: &str, start: usize) -> Option<usize> {
+    let pattern = format!("\"{field}\"");
+    let mut search_start = start;
+    while let Some(relative) = input[search_start..].find(&pattern) {
+        let key_start = search_start + relative;
+        let after_key = key_start + pattern.len();
+        let colon = skip_json_ws(input, after_key);
+        if input[colon..].starts_with(':') {
+            return Some(colon + 1);
+        }
+        search_start = after_key;
+    }
+    None
+}
+
+fn find_json_string_end(input: &str, quote_start: usize) -> Option<usize> {
+    if !input[quote_start..].starts_with('"') {
+        return None;
+    }
+
+    let mut escaped = false;
+    for (relative, ch) in input[quote_start + 1..].char_indices() {
+        let idx = quote_start + 1 + relative;
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some(idx),
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn parse_json_string_field_after(
+    input: &str,
+    field: &str,
+    start: usize,
+) -> Option<(String, usize)> {
+    let value_start = skip_json_ws(input, find_json_field_value_start(input, field, start)?);
+    let value_end = find_json_string_end(input, value_start)?;
+    let value = serde_json::from_str::<String>(&input[value_start..=value_end]).ok()?;
+    Some((value, value_end + 1))
+}
+
+// Narrow recovery for malformed file_write calls whose content string contains
+// model-emitted unescaped quotes. This is deliberately not a general JSON
+// repair path: content must be the final argument field and the remaining tail
+// must only close the surrounding tool-call protocol envelope.
+fn decode_recovered_json_string_fragment(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+
+        match chars.next() {
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('/') => out.push('/'),
+            Some('b') => out.push('\u{0008}'),
+            Some('f') => out.push('\u{000c}'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('u') => {
+                let mut value = 0u32;
+                let mut valid = true;
+                let mut consumed = String::with_capacity(4);
+                for _ in 0..4 {
+                    let Some(hex) = chars.next() else {
+                        valid = false;
+                        break;
+                    };
+                    consumed.push(hex);
+                    if let Some(digit) = hex.to_digit(16) {
+                        value = (value << 4) | digit;
+                    } else {
+                        valid = false;
+                    }
+                }
+                if valid && consumed.len() == 4 {
+                    if let Some(decoded) = char::from_u32(value) {
+                        out.push(decoded);
+                    } else {
+                        out.push_str("\\u");
+                        out.push_str(&consumed);
+                    }
+                } else {
+                    out.push_str("\\u");
+                    out.push_str(&consumed);
+                }
+            }
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+
+    out
+}
+
+fn file_write_content_tail_is_unambiguous(input: &str, after_quote: usize) -> bool {
+    let mut idx = skip_json_ws(input, after_quote);
+    if !input[idx..].starts_with('}') {
+        return false;
+    }
+    idx += '}'.len_utf8();
+    idx = skip_json_ws(input, idx);
+
+    while let Some(ch) = input[idx..].chars().next() {
+        match ch {
+            '}' | ']' => {
+                idx += ch.len_utf8();
+                idx = skip_json_ws(input, idx);
+            }
+            _ => break,
+        }
+    }
+
+    let tail = input[idx..].trim_start();
+    tail.is_empty()
+        || tail.starts_with("</tool_call>")
+        || tail.starts_with("</tool_calls>")
+        || tail.starts_with("</toolcall>")
+        || tail.starts_with("</tool-call>")
+        || tail.starts_with("</invoke>")
+        || tail.starts_with("</minimax:tool_call>")
+        || tail.starts_with("</minimax:toolcall>")
+        || tail.starts_with("```")
+}
+
+fn file_write_content_quote_starts_additional_final_field(input: &str, after_quote: usize) -> bool {
+    let mut idx = skip_json_ws(input, after_quote);
+    if !input[idx..].starts_with(',') {
+        return false;
+    }
+
+    idx += ','.len_utf8();
+    idx = skip_json_ws(input, idx);
+
+    let Some(field_end) = find_json_string_end(input, idx) else {
+        return false;
+    };
+
+    idx = skip_json_ws(input, field_end + 1);
+    if !input[idx..].starts_with(':') {
+        return false;
+    }
+
+    idx += ':'.len_utf8();
+    idx = skip_json_ws(input, idx);
+
+    let mut stream =
+        serde_json::Deserializer::from_str(&input[idx..]).into_iter::<serde_json::Value>();
+    let Some(Ok(_)) = stream.next() else {
+        return false;
+    };
+
+    let consumed = stream.byte_offset();
+    consumed > 0 && file_write_content_tail_is_unambiguous(input, idx + consumed)
+}
+
+fn parse_malformed_file_write_content_after(input: &str, start: usize) -> Option<String> {
+    let value_start = skip_json_ws(input, find_json_field_value_start(input, "content", start)?);
+    if !input[value_start..].starts_with('"') {
+        return None;
+    }
+
+    let mut escaped = false;
+    for (relative, ch) in input[value_start + 1..].char_indices() {
+        let idx = value_start + 1 + relative;
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escaped = true,
+            '"' if file_write_content_tail_is_unambiguous(input, idx + 1) => {
+                let raw = &input[value_start + 1..idx];
+                return Some(decode_recovered_json_string_fragment(raw));
+            }
+            '"' if file_write_content_quote_starts_additional_final_field(input, idx + 1) => {
+                return None;
+            }
+            '"' => {}
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn parse_malformed_file_write_arguments(input: &str) -> Option<serde_json::Value> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let object_start = skip_json_ws(trimmed, 0);
+    if !trimmed[object_start..].starts_with('{') {
+        return None;
+    }
+
+    let (path, path_end) = parse_json_string_field_after(trimmed, "path", object_start)?;
+    if path.trim().is_empty() {
+        return None;
+    }
+
+    let content = parse_malformed_file_write_content_after(trimmed, path_end)?;
+    Some(serde_json::json!({
+        "path": path,
+        "content": content,
+    }))
+}
+
+fn parse_malformed_file_write_call(input: &str) -> Option<ParsedToolCall> {
+    let trimmed = input.trim();
+    let body = json_fence_body(trimmed).unwrap_or(trimmed).trim();
+    if body.is_empty() || !(body.starts_with('{') || body.starts_with('[')) {
+        return None;
+    }
+
+    let (name, name_end) = parse_json_string_field_after(body, "name", 0)?;
+    if map_tool_name_alias(name.trim()) != "file_write" {
+        return None;
+    }
+
+    let arguments_start = find_json_field_value_start(body, "arguments", name_end)
+        .or_else(|| find_json_field_value_start(body, "parameters", name_end))?;
+    let arguments = parse_malformed_file_write_arguments(&body[arguments_start..])?;
+
+    Some(ParsedToolCall {
+        name: "file_write".to_string(),
+        arguments,
+        tool_call_id: None,
+    })
+}
+
 /// Find the end position of a JSON object by tracking balanced braces.
 fn find_json_end(input: &str) -> Option<usize> {
     let trimmed = input.trim_start();
@@ -1081,26 +1325,19 @@ fn find_json_end(input: &str) -> Option<usize> {
     None
 }
 
-/// Parse XML attribute-style tool calls from response text.
-/// This handles MiniMax and similar model_providers that output:
-/// ```xml
-/// <minimax:toolcall>
-/// <invoke name="shell">
-/// <parameter name="command">ls</parameter>
-/// </invoke>
-/// </minimax:toolcall>
-/// ```
 fn parse_xml_attribute_tool_calls(response: &str) -> Vec<ParsedToolCall> {
     let mut calls = Vec::new();
 
     // Regex to find <invoke name="toolname">...</invoke> blocks
     static INVOKE_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?s)<invoke\s+name="([^"]+)"[^>]*>(.*?)</invoke>"#).unwrap()
+        Regex::new(r#"(?s)<invoke\s+name="([^"]+)"[^>]*>(.*?)</invoke>"#)
+            .expect("INVOKE_RE regex must compile")
     });
 
     // Regex to find <parameter name="paramname">value</parameter>
     static PARAM_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"<parameter\s+name="([^"]+)"[^>]*>([^<]*)</parameter>"#).unwrap()
+        Regex::new(r#"<parameter\s+name="([^"]+)"[^>]*>([^<]*)</parameter>"#)
+            .expect("PARAM_RE regex must compile")
     });
 
     for cap in INVOKE_RE.captures_iter(response) {
@@ -1137,20 +1374,6 @@ fn parse_xml_attribute_tool_calls(response: &str) -> Vec<ParsedToolCall> {
     calls
 }
 
-/// Parse Perl/hash-ref style tool calls from response text.
-/// This handles formats like:
-/// ```text
-/// TOOL_CALL
-/// {tool => "shell", args => {
-///   --command "ls -la"
-///   --description "List current directory contents"
-/// }}
-/// /TOOL_CALL
-/// ```
-/// Also handles the square bracket variant emitted by models like MiniMax 2.7:
-/// ```text
-/// [TOOL_CALL]{tool => "shell", args => {--command "echo hello"}}[/TOOL_CALL]
-/// ```
 fn parse_perl_style_tool_calls(response: &str) -> Vec<ParsedToolCall> {
     let mut calls = Vec::new();
 
@@ -1158,22 +1381,24 @@ fn parse_perl_style_tool_calls(response: &str) -> Vec<ParsedToolCall> {
     // Matches both `TOOL_CALL { ... }} /TOOL_CALL` and `[TOOL_CALL]{ ... }}[/TOOL_CALL]`
     static PERL_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?s)(?:\[TOOL_CALL\]|TOOL_CALL)\s*\{(.+?)\}\}\s*(?:\[/TOOL_CALL\]|/TOOL_CALL)")
-            .unwrap()
+            .expect("PERL_RE regex must compile")
     });
 
     // Regex to find tool => "name" in the content
-    static TOOL_NAME_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#"tool\s*=>\s*"([^"]+)""#).unwrap());
+    static TOOL_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"tool\s*=>\s*"([^"]+)""#).expect("TOOL_NAME_RE regex must compile")
+    });
 
     // Regex to find args => { ... } block.
     // The closing brace is optional: in the square bracket variant [TOOL_CALL]{...}}[/TOOL_CALL]
     // the outer regex may consume the inner closing brace, so the args content may run to end of string.
-    static ARGS_BLOCK_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?s)args\s*=>\s*\{(.+?)(?:\}|$)").unwrap());
+    static ARGS_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)args\s*=>\s*\{(.+?)(?:\}|$)").expect("ARGS_BLOCK_RE regex must compile")
+    });
 
     // Regex to find --key "value" pairs
     static ARGS_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#"--(\w+)\s+"([^"]+)""#).unwrap());
+        LazyLock::new(|| Regex::new(r#"--(\w+)\s+"([^"]+)""#).expect("ARGS_RE regex must compile"));
 
     for cap in PERL_RE.captures_iter(response) {
         let content = cap.get(1).map(|m| m.as_str()).unwrap_or("");
@@ -1222,20 +1447,13 @@ fn parse_perl_style_tool_calls(response: &str) -> Vec<ParsedToolCall> {
     calls
 }
 
-/// Parse FunctionCall-style tool calls from response text.
-/// This handles formats like:
-/// ```text
-/// <FunctionCall>
-/// file_read
-/// <code>path>/Users/kylelampa/Documents/zeroclaw/README.md</code>
-/// </FunctionCall>
-/// ```
 fn parse_function_call_tool_calls(response: &str) -> Vec<ParsedToolCall> {
     let mut calls = Vec::new();
 
     // Regex to find <FunctionCall> blocks
     static FUNC_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?s)<FunctionCall>\s*(\w+)\s*<code>([^<]+)</code>\s*</FunctionCall>").unwrap()
+        Regex::new(r"(?s)<FunctionCall>\s*(\w+)\s*<code>([^<]+)</code>\s*</FunctionCall>")
+            .expect("FUNC_RE regex must compile")
     });
 
     for cap in FUNC_RE.captures_iter(response) {
@@ -1278,12 +1496,6 @@ fn parse_function_call_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 /// Map tool name aliases from various LLM model_providers to ZeroClaw tool names.
 /// This handles variations like "fileread" -> "file_read", "bash" -> "shell", etc.
 fn map_tool_name_alias(tool_name: &str) -> &str {
-    // Strip any dotted namespace prefix (keep only the final segment).
-    // Covers Gemini-emitted `default_api.<name>` and `tools.<name>`, plus
-    // MCP-server-name prefixes like `google_workspace.search_gmail_messages`
-    // that Gemini-via-OpenRouter also emits when the tool originates from
-    // an MCP server. The registry is indexed by bare tool name, so we
-    // normalize by taking the last segment.
     let tool_name = tool_name
         .rsplit_once('.')
         .map(|(_, suffix)| suffix)
@@ -1382,11 +1594,6 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
     calls
 }
 
-/// Return the canonical default parameter name for a tool.
-///
-/// When a model emits a shortened call like `shell>uname -a` (without an
-/// explicit `/param_name`), we need to infer which parameter the value maps
-/// to. This function encodes the mapping for known ZeroClaw tools.
 fn default_param_for_tool(tool: &str) -> &'static str {
     match tool {
         "shell" | "bash" | "sh" | "exec" | "command" | "cmd" => "command",
@@ -1405,17 +1612,6 @@ fn default_param_for_tool(tool: &str) -> &'static str {
     }
 }
 
-/// Parse GLM-style shortened tool call bodies found inside `<tool_call>` tags.
-///
-/// Handles three sub-formats that GLM-4.7 emits:
-///
-/// 1. **Shortened**: `tool_name>value` — single value mapped via
-///    [`default_param_for_tool`].
-/// 2. **YAML-like multi-line**: `tool_name>\nkey: value\nkey: value` — each
-///    subsequent `key: value` line becomes a parameter.
-/// 3. **Attribute-style**: `tool_name key="value" [/]>` — XML-like attributes.
-///
-/// Returns `None` if the body does not match any of these formats.
 fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
     let body = body.trim();
     if body.is_empty() {
@@ -1560,30 +1756,6 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
     None
 }
 
-// ── Tool-Call Parsing ─────────────────────────────────────────────────────
-// LLM responses may contain tool calls in multiple formats depending on
-// the model_provider. Parsing follows a priority chain:
-//   1. OpenAI-style JSON with `tool_calls` array (native API)
-//   2. XML tags: <tool_call>, <toolcall>, <tool-call>, <invoke>
-//   3. Markdown code blocks with `tool_call` language
-//   4. GLM-style line-based format (e.g. `shell/command>ls`)
-// SECURITY: We never fall back to extracting arbitrary JSON from the
-// response body, because that would enable prompt-injection attacks where
-// malicious content in emails/files/web pages mimics a tool call.
-
-/// Parse tool calls from an LLM response that uses XML-style function calling.
-///
-/// Expected format (common with system-prompt-guided tool use):
-/// ```text
-/// <tool_call>
-/// {"name": "shell", "arguments": {"command": "ls"}}
-/// </tool_call>
-/// ```
-///
-/// Also accepts common tag variants (`<toolcall>`, `<tool-call>`) for model
-/// compatibility.
-///
-/// Also supports JSON with `tool_calls` array from OpenAI-format responses.
 pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // Strip `<think>...</think>` blocks before parsing.  Qwen and other
     // reasoning models embed chain-of-thought inline in the response text;
@@ -1609,6 +1781,9 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             }
             return (text_parts.join("\n"), calls);
         }
+    }
+    if let Some(call) = parse_malformed_file_write_call(response.trim()) {
+        return (String::new(), vec![call]);
     }
 
     if let Some((minimax_text, minimax_calls)) = parse_minimax_invoke_calls(response)
@@ -1653,6 +1828,11 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 }
             }
 
+            if !parsed_any && let Some(call) = parse_malformed_file_write_call(inner) {
+                calls.push(call);
+                parsed_any = true;
+            }
+
             // If JSON parsing failed, try XML format (DeepSeek/GLM style)
             if !parsed_any && let Some(xml_calls) = parse_xml_tool_calls(inner) {
                 calls.extend(xml_calls);
@@ -1694,6 +1874,11 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                         parsed_any = true;
                         calls.extend(parsed_calls);
                     }
+                }
+
+                if !parsed_any && let Some(call) = parse_malformed_file_write_call(inner) {
+                    calls.push(call);
+                    parsed_any = true;
                 }
 
                 // Try XML
@@ -1741,6 +1926,12 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 }
             }
 
+            if let Some(call) = parse_malformed_file_write_call(after_open) {
+                calls.push(call);
+                remaining = "";
+                continue;
+            }
+
             // Last resort: try GLM shortened body on everything after the open tag.
             // The model may have emitted `<tool_call>shell>ls` with no close tag at all.
             let glm_input = after_open.trim();
@@ -1763,7 +1954,7 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             Regex::new(
                 r"(?s)```(?:tool[_-]?call|invoke)\s*\n(.*?)(?:```|</tool[_-]?call>|</toolcall>|</invoke>|</minimax:toolcall>)",
             )
-            .unwrap()
+            .expect("MD_TOOL_CALL_RE regex must compile")
         });
         let mut md_text_parts: Vec<String> = Vec::new();
         let mut last_end = 0;
@@ -1779,6 +1970,11 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             for value in json_values {
                 let parsed_calls = parse_tool_calls_from_json_value(&value);
                 calls.extend(parsed_calls);
+            }
+            if calls.is_empty()
+                && let Some(call) = parse_malformed_file_write_call(inner)
+            {
+                calls.push(call);
             }
             last_end = full_match.end();
         }
@@ -1796,8 +1992,10 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // Try ```tool <name> format used by some model_providers (e.g., xAI grok)
     // Example: ```tool file_write\n{"path": "...", "content": "..."}\n```
     if calls.is_empty() {
-        static MD_TOOL_NAME_RE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"(?s)```tool\s+(\w+)\s*\n(.*?)(?:```|$)").unwrap());
+        static MD_TOOL_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"(?s)```tool\s+(\w+)\s*\n(.*?)(?:```|$)")
+                .expect("MD_TOOL_NAME_RE regex must compile")
+        });
         let mut md_text_parts: Vec<String> = Vec::new();
         let mut last_end = 0;
 
@@ -1813,8 +2011,18 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             // Try to parse the inner content as JSON arguments
             let json_values = extract_json_values(inner);
             if json_values.is_empty() {
-                // Log a warning if we found a tool block but couldn't parse arguments
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"tool_name": tool_name, "inner": inner.chars().take(100).collect::<String>()})), "Found ```tool <name> block but could not parse JSON arguments");
+                if map_tool_name_alias(tool_name) == "file_write"
+                    && let Some(arguments) = parse_malformed_file_write_arguments(inner)
+                {
+                    calls.push(ParsedToolCall {
+                        name: "file_write".to_string(),
+                        arguments,
+                        tool_call_id: None,
+                    });
+                } else {
+                    // Log a warning if we found a tool block but couldn't parse arguments
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"tool_name": tool_name, "inner": inner.chars().take(100).collect::<String>()})), "Found ```tool <name> block but could not parse JSON arguments");
+                }
             } else {
                 for value in json_values {
                     let arguments = if value.is_object() {
@@ -1842,12 +2050,6 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         }
     }
 
-    // XML attribute-style tool calls:
-    // <minimax:toolcall>
-    // <invoke name="shell">
-    // <parameter name="command">ls</parameter>
-    // </invoke>
-    // </minimax:toolcall>
     if calls.is_empty() {
         let xml_calls = parse_xml_attribute_tool_calls(remaining);
         if !xml_calls.is_empty() {
@@ -1872,13 +2074,6 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         }
     }
 
-    // Perl/hash-ref style tool calls:
-    // TOOL_CALL
-    // {tool => "shell", args => {
-    //   --command "ls -la"
-    //   --description "List current directory contents"
-    // }}
-    // /TOOL_CALL
     if calls.is_empty() {
         let perl_calls = parse_perl_style_tool_calls(remaining);
         if !perl_calls.is_empty() {
@@ -1957,16 +2152,6 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         }
     }
 
-    // SECURITY: We do NOT fall back to extracting arbitrary JSON from the response
-    // here. That would enable prompt injection attacks where malicious content
-    // (e.g., in emails, files, or web pages) could include JSON that mimics a
-    // tool call. Tool calls MUST be explicitly wrapped in either:
-    // 1. OpenAI-style JSON with a "tool_calls" array
-    // 2. ZeroClaw tool-call tags (<tool_call>, <toolcall>, <tool-call>)
-    // 3. Markdown code blocks with tool_call/toolcall/tool-call language
-    // 4. Explicit GLM line-based call formats (e.g. `shell/command>...`)
-    // This ensures only the LLM's intentional tool calls are executed.
-
     // Remaining text after last tool call
     if !remaining.trim().is_empty() {
         text_parts.push(remaining.trim().to_string());
@@ -2002,16 +2187,22 @@ pub fn strip_think_tags(s: &str) -> String {
 /// Strip prompt-guided tool artifacts from visible output while preserving
 /// raw model text in history for future turns.
 pub fn strip_tool_result_blocks(text: &str) -> String {
-    static TOOL_RESULT_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?s)<tool_result[^>]*>.*?</tool_result>").unwrap());
-    static THINKING_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?s)<thinking>.*?</thinking>").unwrap());
-    static THINK_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?s)<think>.*?</think>").unwrap());
-    static TOOL_RESULTS_PREFIX_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?m)^\[Tool results\]\s*\n?").unwrap());
+    static TOOL_RESULT_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)<tool_result[^>]*>.*?</tool_result>")
+            .expect("TOOL_RESULT_RE regex must compile")
+    });
+    static THINKING_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)<thinking>.*?</thinking>").expect("THINKING_RE regex must compile")
+    });
+    static THINK_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)<think>.*?</think>").expect("THINK_RE regex must compile")
+    });
+    static TOOL_RESULTS_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?m)^\[Tool results\]\s*\n?")
+            .expect("TOOL_RESULTS_PREFIX_RE regex must compile")
+    });
     static EXCESS_BLANK_LINES_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\n{3,}").unwrap());
+        LazyLock::new(|| Regex::new(r"\n{3,}").expect("EXCESS_BLANK_LINES_RE regex must compile"));
 
     let result = TOOL_RESULT_RE.replace_all(text, "");
     let result = THINKING_RE.replace_all(&result, "");
@@ -2109,7 +2300,7 @@ pub fn build_native_assistant_history_from_parsed_calls(
     // Strict provider validators (DeepSeek V4, NVIDIA NIM, ...) reject
     // assistant messages that carry `tool_calls: []`. When there are no
     // parsed calls, return None so the caller falls through to a plain
-    // text assistant message. See #6298.
+    // text assistant message.
     if tool_calls.is_empty() {
         return None;
     }
@@ -2155,7 +2346,6 @@ mod tests {
         // Regression: strict providers (DeepSeek V4, NVIDIA NIM) reject
         // assistant messages carrying `tool_calls: []`. Empty input must
         // not produce a serialised assistant message with an empty array.
-        // See #6298.
         let result = build_native_assistant_history_from_parsed_calls("answer text", &[], None);
         assert!(
             result.is_none(),
@@ -2444,7 +2634,7 @@ I will now call the tool with this payload:
     fn parse_tool_calls_handles_plural_tool_calls_wrapper() {
         // Regression: Llama 4 Scout (via Groq) emits a plural `<tool_calls>`
         // wrapper rather than the singular `<tool_call>`. The parser must
-        // enter it and execute the call instead of exposing raw XML. See #6875.
+        // enter it and execute the call instead of exposing raw XML.
         let (text, calls) = parse_tool_calls(
             "<tool_calls>\n{\"name\":\"myserver__some_tool\",\"arguments\":{\"key\":\"value\"}}\n</tool_calls>",
         );
@@ -2569,6 +2759,88 @@ Done."#;
         );
         assert!(text.contains("I'll write a test file."));
         assert!(text.contains("Done."));
+    }
+
+    #[test]
+    fn parse_tool_calls_recovers_malformed_file_write_content_quotes() {
+        let response = r#"<tool_call>
+{"name":"file_write","arguments":{"path":"index.html","content":"<section class="hero"><script>const msg = "ok";</script></section>"}}
+</tool_call>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_write");
+        assert_eq!(
+            calls[0].arguments.get("path").unwrap().as_str().unwrap(),
+            "index.html"
+        );
+        assert_eq!(
+            calls[0].arguments.get("content").unwrap().as_str().unwrap(),
+            r#"<section class="hero"><script>const msg = "ok";</script></section>"#
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_recovers_malformed_file_write_tool_name_fence() {
+        let response = r#"```tool file_write
+{"path":"index.html","content":"<div data-kind="card">ok</div>"}
+```"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_write");
+        assert_eq!(
+            calls[0].arguments.get("content").unwrap().as_str().unwrap(),
+            r#"<div data-kind="card">ok</div>"#
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_recovers_malformed_file_write_non_ascii_safely() {
+        let response = r#"说明:
+<tool_call>
+{"name":"file_write","arguments":{"path":"页面.html","content":"<p title="问候">你好，世界 🌏</p>"}}
+</tool_call>
+完成"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.contains("说明"));
+        assert!(text.contains("完成"));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments.get("path").unwrap().as_str().unwrap(),
+            "页面.html"
+        );
+        assert_eq!(
+            calls[0].arguments.get("content").unwrap().as_str().unwrap(),
+            r#"<p title="问候">你好，世界 🌏</p>"#
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_rejects_ambiguous_malformed_file_write() {
+        let response = r#"<tool_call>
+{"name":"file_write","arguments":{"path":"index.html","content":"<section class="hero">","mode":"append"}}
+</tool_call>"#;
+
+        let (_text, calls) = parse_tool_calls(response);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_valid_file_write_json_unchanged() {
+        let response = r#"{"name":"file_write","arguments":{"path":"index.html","content":"<section class=\"hero\">ok</section>"}}"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_write");
+        assert_eq!(
+            calls[0].arguments.get("content").unwrap().as_str().unwrap(),
+            r#"<section class="hero">ok</section>"#
+        );
     }
 
     #[test]

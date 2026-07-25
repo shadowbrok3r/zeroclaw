@@ -1,13 +1,3 @@
-// Background skill review fork — post-turn hook that wakes a forked agent
-// loop in a restricted toolset to decide whether the just-finished
-// conversation should change the installed skill library.
-//
-// Inspired by hermes-agent's `_spawn_background_review` pattern (see
-// nousresearch/hermes-agent at run_agent.py). ZeroClaw differs in that the
-// fork runs inline (no background thread — Rust async lets us await it on
-// the same task), targets the agentskills.io `SKILL.md` format directly,
-// and writes through dedicated `skill_manage`/`skill_view` tools.
-
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -29,19 +19,12 @@ task_local! {
     static SKILL_REVIEW_ACTIVE: ();
 }
 
-/// Decide whether to fire the review fork, and run it if so.
-///
-/// Gating (in this order):
-/// 1. `config.enabled == true`
-/// 2. Not already inside a review (recursion guard)
-/// 3. History accumulated at least `nudge_interval_iterations` tool-result messages
-///
-/// The "failed_slugs" list is passed as a *hint* in the review prompt so the
-/// fork can spend its budget where the user just got hurt — but failure is NOT
-/// the trigger condition. Routine improvements (user corrections, novel
-/// techniques) happen on successful sessions too.
 #[allow(clippy::too_many_arguments)]
 pub async fn maybe_run_skill_review(
+    // Full config, for resolving the configured `vision_model_provider`'s
+    // alias-specific options on the review fork's vision route. `None` on
+    // configless (test) paths; the production caller (`run`) threads `Some`.
+    full_config: Option<&zeroclaw_config::schema::Config>,
     workspace_dir: PathBuf,
     config: SkillImprovementConfig,
     allow_scripts: bool,
@@ -56,6 +39,7 @@ pub async fn maybe_run_skill_review(
     max_tool_result_chars: usize,
     max_context_tokens: usize,
     cancellation_token: Option<&CancellationToken>,
+    agent_alias: Option<&str>,
 ) {
     if !config.enabled {
         return;
@@ -91,47 +75,66 @@ pub async fn maybe_run_skill_review(
     review_history.push(ChatMessage::user(&review_input));
 
     let receipts: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let turn_id = uuid::Uuid::new_v4().to_string();
 
     let result = SKILL_REVIEW_ACTIVE
         .scope((), async {
             crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-                model_provider: provider,
+                sop_reassembly: None,
+                exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+                    crate::agent::loop_::ResolvedModelAccess {
+                        model_provider: provider,
+                        provider_name,
+                        model: model_name,
+                        temperature: Some(0.3),
+                    },
+                    crate::agent::loop_::ResolvedIo {
+                        tools_registry: &tools,
+                        observer,
+                        // low so the fork doesn't ramble
+                        silent: true,
+                        approval: None,
+                        multimodal_config: multimodal,
+                        config: full_config,
+                        hooks: None,
+                        activated_tools: None,
+                        model_switch_callback: None,
+                        receipt_generator: None,
+                    },
+                    crate::agent::loop_::ResolvedRuntimeKnobs {
+                        max_tool_iterations: config.max_review_iterations as usize,
+                        excluded_tools: &[],
+                        dedup_exempt_tools: &[],
+                        pacing,
+                        strict_tool_parsing: false,
+                        // lenient for the restricted fork
+                        parallel_tools: false,
+                        // sequential for the mutation-capable fork
+                        max_tool_result_chars,
+                        context_token_budget: max_context_tokens,
+                        knobs: &crate::agent::loop_::LoopKnobs::default(),
+                    },
+                ),
                 history: &mut review_history,
-                tools_registry: &tools,
-                observer,
-                provider_name,
-                model: model_name,
-                temperature: Some(0.3), // low so the fork doesn't ramble
-                silent: true,
-                approval: None, // no human in the loop here
+                // no human in the loop here
                 channel_name: "skill_review",
                 channel_reply_target: None,
-                multimodal_config: multimodal,
-                max_tool_iterations: config.max_review_iterations as usize,
                 cancellation_token: cancellation_token.cloned(),
                 on_delta: None,
-                hooks: None,
-                excluded_tools: &[],
-                dedup_exempt_tools: &[],
-                activated_tools: None,
-                model_switch_callback: None,
-                pacing,
-                strict_tool_parsing: false, // lenient for the restricted fork
-                parallel_tools: false,      // sequential for the mutation-capable fork
-                max_tool_result_chars,
-                context_token_budget: max_context_tokens,
                 shared_budget: None,
                 channel: None,
-                receipt_generator: None,
                 collected_receipts: Some(&receipts),
                 event_tx: None,
                 steering: None,
                 new_messages_out: None,
-                knobs: &crate::agent::loop_::LoopKnobs::default(),
                 image_cache: None,
-                // Phase 1: stamp Internal/Trusted. Real per-transport
-                // stamping is PR C (RFC #6971 §4).
-                ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                // Phase 1: stamp Internal/Trusted. Per-transport
+                // stamping lands in a later phase.
+                memory: None,
+                ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
+                agent_alias,
+                parent_agent_alias: None,
+                turn_id: &turn_id,
             })
             .await
         })
@@ -202,12 +205,6 @@ fn count_tool_iterations(history: &[ChatMessage]) -> usize {
     history.iter().filter(|m| m.role == "tool").count()
 }
 
-/// Convert the review's tool receipts + final text into a one-line summary
-/// for the user. Returns "" if the fork did nothing notable.
-///
-/// `fork_history` must contain only messages produced by the review fork
-/// itself (not the parent turn), so that the fallback scan does not pick up
-/// tool results from the user's main turn.
 fn summarize_actions(
     receipts: &Mutex<Vec<String>>,
     fork_history: &[ChatMessage],

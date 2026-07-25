@@ -2,25 +2,16 @@
 //! command per `slash`-tagged skill). Discord delivers application-command
 //! interactions over the same Gateway WebSocket as INTERACTION_CREATE; this
 //! module owns deriving the desired command set from installed skills and
-//! reconciling it against Discord's REST API — idempotent upsert + stale-command
-//! reaping, with persisted-fingerprint and `Retry-After` durability via
-//! `discord_slash_state`. The READY-time orchestration, the dispatch arm, and
-//! the interaction callbacks live in `mod.rs` / `interaction`.
 
 use serde_json::json;
 
 use super::slash_options::{Choice, OptKind, OptionSpec};
-use super::types::{DiscordSlashCommandSpec, ReconcileOutcome};
+use super::types::{DiscordSlashCommandSpec, ReconcileOutcome, SlashScope};
 
 /// Discord caps an application at 100 global commands; stay under it with
 /// headroom for `/ask` and future built-ins.
 pub(crate) const MAX_SKILL_SLASH_COMMANDS: usize = 90;
 
-/// Squeeze a skill name into Discord's command-name charset
-/// (`^[a-z0-9_-]{1,32}$`): ASCII-lowercase, runs of anything else collapse
-/// to a single `-`. Deliberately stricter than Discord's full unicode
-/// charset — an all-non-ASCII name slugs to empty and is dropped (with a
-/// WARN naming the skill), which is a documented limitation.
 pub(crate) fn discord_command_slug(name: &str) -> String {
     let mut slug = String::new();
     let mut last_dash = true; // suppress leading '-'
@@ -39,19 +30,6 @@ pub(crate) fn discord_command_slug(name: &str) -> String {
     slug.trim_end_matches('-').to_string()
 }
 
-/// Map installed skills to slash-command specs. Exposure rules:
-/// - opt-in via the `slash` tag — skills run shell/HTTP tools, so surfacing
-///   one to a whole guild must be a deliberate per-skill decision;
-/// - community-synced skills (tag `open-skills`) are excluded even when
-///   tagged: their manifests are third-party-controlled, and a remote
-///   commit must not be able to surface new commands (name + description
-///   render in every guild's Discord UI) without operator action.
-///
-/// Specs are sorted by slug so the output (and everything derived from it:
-/// the registration fingerprint, collision winners, the cap cutoff) is
-/// deterministic regardless of filesystem iteration order. Reserved names,
-/// empty slugs, and collisions are dropped with a WARN; the set caps at
-/// `MAX_SKILL_SLASH_COMMANDS` with dropped names logged (no silent caps).
 pub fn discord_slash_specs_from_skills(
     skills: &[zeroclaw_runtime::skills::Skill],
 ) -> Vec<DiscordSlashCommandSpec> {
@@ -100,6 +78,11 @@ pub fn discord_slash_specs_from_skills(
             skill_name,
             slug,
             description: description.chars().take(100).collect(),
+            description_localizations: valid_discord_localizations(
+                &skill.description_localizations,
+                &skill.name,
+                "command",
+            ),
             options: map_skill_slash_options(skill),
         });
     }
@@ -108,16 +91,6 @@ pub fn discord_slash_specs_from_skills(
     specs
 }
 
-/// Map a skill's `[[skill.slash_options]]` declarations into Discord option
-/// specs. Every authoring mistake is sanitised or dropped with a WARN rather
-/// than passed through to Discord, because an invalid registration body is
-/// rejected with a 400 and `reconcile_slash_commands` would then retry it on
-/// every READY (a re-registration loop). Specifically: an unknown `type` drops
-/// the option; the name is slugged to Discord's option-name charset (dropped if
-/// it slugs to empty) and de-duplicated within the command; numeric choices
-/// whose value doesn't parse to the option type are dropped; inverted `min`/
-/// `max` bounds are dropped. Required options are sorted first (Discord rejects
-/// a required option that follows an optional one).
 fn map_skill_slash_options(skill: &zeroclaw_runtime::skills::Skill) -> Vec<OptionSpec> {
     let mut options = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -160,6 +133,11 @@ fn map_skill_slash_options(skill: &zeroclaw_runtime::skills::Skill) -> Vec<Optio
         options.push(OptionSpec {
             name,
             description: decl.description.chars().take(100).collect(),
+            description_localizations: valid_discord_localizations(
+                &decl.description_localizations,
+                &skill.name,
+                &decl.name,
+            ),
             kind,
             required: decl.required,
             choices,
@@ -189,11 +167,44 @@ fn warn_drop_option(skill: &zeroclaw_runtime::skills::Skill, option: &str, reaso
     );
 }
 
-/// Build the agent prompt for a skill slash command: the legacy single `input`
-/// for an untyped command, or the submitted `name: value` lines for a typed
-/// one. Returns `None` only when an *untyped* command was invoked with empty
-/// input — a typed command, even an all-optional one invoked with no arguments,
-/// still invokes the skill (rendering an empty argument list).
+/// Discord's supported command-localization locale codes
+/// (<https://discord.com/developers/docs/reference#locales>). Registering with
+/// any other key is a 400 that would wedge the reconcile in a retry loop, so a
+/// skill-authored localization map is filtered to these before registration.
+const DISCORD_LOCALES: &[&str] = &[
+    "id", "da", "de", "en-GB", "en-US", "es-ES", "es-419", "fr", "hr", "it", "lt", "hu", "nl",
+    "no", "pl", "pt-BR", "ro", "fi", "sv-SE", "vi", "tr", "cs", "el", "bg", "ru", "uk", "hi", "th",
+    "zh-CN", "ja", "zh-TW", "ko",
+];
+
+fn valid_discord_localizations(
+    raw: &std::collections::BTreeMap<String, String>,
+    skill: &str,
+    context: &str,
+) -> std::collections::BTreeMap<String, String> {
+    raw.iter()
+        .filter(|(loc, _)| {
+            if DISCORD_LOCALES.contains(&loc.as_str()) {
+                true
+            } else {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "skill": skill,
+                            "context": context,
+                            "locale": loc,
+                        })),
+                    "dropping unsupported Discord locale from slash localization"
+                );
+                false
+            }
+        })
+        .map(|(k, v)| (k.clone(), v.chars().take(100).collect()))
+        .collect()
+}
+
 pub(crate) fn skill_command_prompt(
     spec: &DiscordSlashCommandSpec,
     input: &str,
@@ -248,7 +259,7 @@ fn map_options_cap(specs: &mut Vec<DiscordSlashCommandSpec>) {
 pub(crate) fn slash_command_registration_body(
     specs: &[DiscordSlashCommandSpec],
 ) -> serde_json::Value {
-    let mut commands = vec![json!({
+    let mut ask = json!({
         "name": "ask",
         "description": "Ask the agent a question",
         "type": 1, // CHAT_INPUT
@@ -258,59 +269,99 @@ pub(crate) fn slash_command_registration_body(
             "type": 3, // STRING
             "required": true
         }]
-    })];
+    });
+    if let Some(loc) = localizations_object(builtin_localizations::ASK_COMMAND) {
+        ask["description_localizations"] = loc;
+    }
+    if let Some(loc) = localizations_object(builtin_localizations::ASK_PROMPT_OPTION) {
+        ask["options"][0]["description_localizations"] = loc;
+    }
+    let mut commands = vec![ask];
     for spec in specs {
         // A skill that declares no typed options keeps the legacy single
         // required string `input` (backward-compatible + the ownership marker
         // for reaping); one that declares options registers them instead.
         let options: Vec<serde_json::Value> = if spec.options.is_empty() {
-            vec![json!({
+            let mut input = json!({
                 "name": "input",
                 "description": SKILL_COMMAND_OPTION_DESCRIPTION,
                 "type": 3, // STRING
                 "required": true
-            })]
+            });
+            if let Some(loc) = localizations_object(builtin_localizations::SKILL_INPUT_OPTION) {
+                input["description_localizations"] = loc;
+            }
+            vec![input]
         } else {
             spec.options
                 .iter()
                 .map(OptionSpec::to_registration_json)
                 .collect()
         };
-        commands.push(json!({
+        let mut cmd = json!({
             "name": spec.slug,
             "description": spec.description,
             "type": 1, // CHAT_INPUT
             "options": options,
-        }));
+        });
+        if !spec.description_localizations.is_empty() {
+            cmd["description_localizations"] = json!(spec.description_localizations);
+        }
+        commands.push(cmd);
     }
     serde_json::Value::Array(commands)
 }
 
-/// The option description this feature writes on every skill command. It
-/// doubles as the ownership marker for stale-command reaping: Discord has
-/// no durable "registered by" field, and a structural shape alone (one
-/// required string option named `input`) is generic enough that foreign
-/// tooling could collide with it.
 pub(crate) const SKILL_COMMAND_OPTION_DESCRIPTION: &str = "What to send to the skill";
 
-/// Ownership fingerprint for commands this feature owns: exactly one
-/// required string option named `input` carrying this feature's exact
-/// option description. Used to reap commands for uninstalled skills across
-/// restarts; commands registered by other tooling must never be touched —
-/// the description match makes accidental collision with a foreign
-/// `/x <input>` command effectively impossible.
-///
-/// Limitation: two slash-enabled aliases sharing one bot token would see
-/// each other's commands as reap candidates (commands are
-/// application-global, desired sets are per-alias). Enable slash commands
-/// on at most one alias per bot application.
-///
-/// Limitation (typed options): this recognizes only the legacy single-`input`
-/// shape. A skill command that declares typed options has a different shape and
-/// is therefore NOT auto-reaped when its skill is uninstalled — it is still
-/// upserted/updated normally while installed. This is deliberately conservative
-/// (it never risks deleting a foreign command); durable reaping of typed
-/// commands (persisting the registered slug set) is a follow-on.
+mod builtin_localizations {
+    /// `/ask` command description ("Ask the agent a question").
+    pub(super) const ASK_COMMAND: &[(&str, &str)] = &[
+        ("es-ES", "Hazle una pregunta al agente"),
+        ("fr", "Poser une question à l'agent"),
+        ("ja", "エージェントに質問する"),
+        ("zh-CN", "向智能体提问"),
+    ];
+    /// `/ask` `prompt` option description ("What to ask").
+    pub(super) const ASK_PROMPT_OPTION: &[(&str, &str)] = &[
+        ("es-ES", "Qué preguntar"),
+        ("fr", "Que demander"),
+        ("ja", "質問内容"),
+        ("zh-CN", "要问什么"),
+    ];
+    /// Default skill `input` option description (`SKILL_COMMAND_OPTION_DESCRIPTION`).
+    pub(super) const SKILL_INPUT_OPTION: &[(&str, &str)] = &[
+        ("es-ES", "Qué enviar a la habilidad"),
+        ("fr", "Que envoyer à la compétence"),
+        ("ja", "スキルに送る内容"),
+        ("zh-CN", "发送给技能的内容"),
+    ];
+}
+
+/// Build a Discord `*_localizations` object from a `(discord_locale, text)`
+/// table. Empty input → `None`, so the caller omits the key entirely and the
+/// command body stays byte-stable when there are no translations (preserving
+/// the reconcile no-op for un-localized commands).
+fn localizations_object(entries: &[(&str, &str)]) -> Option<serde_json::Value> {
+    if entries.is_empty() {
+        return None;
+    }
+    let map: serde_json::Map<String, serde_json::Value> = entries
+        .iter()
+        // Clamp to Discord's 100-char description limit, as the skill-authored
+        // path does (`valid_discord_localizations`): a built-in translation that
+        // ever exceeds it would otherwise 400 the registration and wedge the
+        // reconcile in a retry loop.
+        .map(|(loc, text)| {
+            (
+                (*loc).to_string(),
+                json!(text.chars().take(100).collect::<String>()),
+            )
+        })
+        .collect();
+    Some(serde_json::Value::Object(map))
+}
+
 pub(crate) fn is_skill_command_shape(cmd: &serde_json::Value) -> bool {
     let Some(opts) = cmd.get("options").and_then(|o| o.as_array()) else {
         return false;
@@ -325,19 +376,17 @@ pub(crate) fn is_skill_command_shape(cmd: &serde_json::Value) -> bool {
         && o.get("description").and_then(|d| d.as_str()) == Some(SKILL_COMMAND_OPTION_DESCRIPTION)
 }
 
-/// Comparable projection of a command for change detection: description plus
-/// per-option (name, type, required, description) and, for typed options, the
-/// (choices, min/max value, min/max length, autocomplete) constraints. Discord
-/// decorates
-/// listed commands with server-side fields (id, version,
-/// default_member_permissions, …) that must not defeat the comparison; the
-/// numeric constraints are normalised (numbers → f64, lengths → u64, choice
-/// values → number-or-string) so an int-vs-float representation difference
-/// between what we send and what Discord echoes back doesn't force a spurious
-/// re-registration.
 pub(crate) fn command_projection(cmd: &serde_json::Value) -> serde_json::Value {
     json!({
         "description": cmd.get("description").cloned().unwrap_or_default(),
+        // Localizations participate in change detection (with the GET's
+        // `with_localizations=true`): Discord echoes `null` when none, which
+        // equals our omitted key - so un-localized commands stay a no-op while
+        // a translation change forces exactly one re-registration.
+        "description_localizations": cmd
+            .get("description_localizations")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
         "options": cmd
             .get("options")
             .and_then(|o| o.as_array())
@@ -349,6 +398,10 @@ pub(crate) fn command_projection(cmd: &serde_json::Value) -> serde_json::Value {
                             "type": o.get("type").cloned().unwrap_or_default(),
                             "required": o.get("required").cloned().unwrap_or(json!(false)),
                             "description": o.get("description").cloned().unwrap_or_default(),
+                            "description_localizations": o
+                                .get("description_localizations")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null),
                             "choices": o
                                 .get("choices")
                                 .and_then(|c| c.as_array())
@@ -405,27 +458,15 @@ async fn rate_limit_deadline(resp: reqwest::Response) -> i64 {
     crate::discord_slash_state::retry_after_deadline(&headers, body.as_ref(), now)
 }
 
-/// Reconcile the application's global commands with the desired set:
-/// upsert each desired command (POST upserts by name) and delete stale
-/// skill-shaped commands left over from uninstalled skills. Commands
-/// registered by other tooling are never touched — this deliberately
-/// avoids the bulk-overwrite PUT. Global commands can take up to an hour
-/// to propagate the first time.
-///
-/// Returns `Err` when any owned stale command could not be deleted (other
-/// than a 404, which means it is already gone): the caller's fingerprint
-/// must not record such a pass as successful, or the stale command would
-/// never be retried while the desired set stays unchanged. Upserts for the
-/// desired set are still attempted first so a delete failure cannot block
-/// new registrations.
 pub(crate) async fn reconcile_slash_commands(
     client: &reqwest::Client,
     bot_token: &str,
     app_id: &str,
     desired: &serde_json::Value,
     api_base: &str,
+    scope: SlashScope,
+    guild_ids: &[String],
 ) -> anyhow::Result<ReconcileOutcome> {
-    let base = format!("{api_base}/applications/{app_id}/commands");
     let auth = format!("Bot {bot_token}");
     let Some(desired) = desired.as_array() else {
         anyhow::bail!("desired command set is not an array");
@@ -435,14 +476,57 @@ pub(crate) async fn reconcile_slash_commands(
         .filter_map(|c| c.get("name").and_then(|n| n.as_str()))
         .collect();
 
-    // Reap stale skill commands first so the 100-command cap never blocks
-    // the upserts that follow. Delete failures are counted, not fatal
-    // mid-pass: the upserts still run, but the pass reports Err at the end
-    // so the fingerprint is not recorded and the next READY retries.
-    let mut failed_deletes = 0usize;
+    let global_base = format!("{api_base}/applications/{app_id}/commands");
+    let guild_base = |g: &str| format!("{api_base}/applications/{app_id}/guilds/{g}/commands");
+    let (active, inactive): (Vec<String>, Vec<String>) = match scope {
+        SlashScope::Global => (
+            vec![global_base],
+            guild_ids.iter().map(|g| guild_base(g)).collect(),
+        ),
+        SlashScope::Guild => (
+            guild_ids.iter().map(|g| guild_base(g)).collect(),
+            vec![global_base],
+        ),
+    };
+    // The canonical `/ask` we would register, used to prove ownership before
+    // reaping a `/ask` from the inactive scope a foreign `/ask` whose
+    // projection differs is left untouched.
+    let expected_ask = desired
+        .iter()
+        .find(|c| c.get("name").and_then(|n| n.as_str()) == Some("ask"));
+    // Best-effort cleanup of the now-inactive scope first; a 429 surfaces the
+    // cooldown like any active-scope pass would.
+    for base in &inactive {
+        if let ReconcileOutcome::RateLimited { until } =
+            reap_all_owned_commands(client, &auth, base, expected_ask).await?
+        {
+            return Ok(ReconcileOutcome::RateLimited { until });
+        }
+    }
+    // Reconcile each active endpoint (one for Global; one per guild for Guild).
+    for base in &active {
+        if let ReconcileOutcome::RateLimited { until } =
+            reconcile_one_endpoint(client, &auth, base, desired, &desired_names).await?
+        {
+            return Ok(ReconcileOutcome::RateLimited { until });
+        }
+    }
+    Ok(ReconcileOutcome::Reconciled)
+}
+
+async fn reap_all_owned_commands(
+    client: &reqwest::Client,
+    auth: &str,
+    base: &str,
+    expected_ask: Option<&serde_json::Value>,
+) -> anyhow::Result<ReconcileOutcome> {
+    // `with_localizations=true` so the listing echoes the full `*_localizations`
+    // dictionaries; without it Discord returns them null and our `/ask`
+    // ownership check below (a projection match against the command we register,
+    // which carries localizations) would never match our own `/ask`.
     let resp = client
-        .get(&base)
-        .header("Authorization", &auth)
+        .get(format!("{base}?with_localizations=true"))
+        .header("Authorization", auth)
         .send()
         .await
         .map_err(reqwest::Error::without_url)?;
@@ -452,9 +536,107 @@ pub(crate) async fn reconcile_slash_commands(
         });
     }
     if !resp.status().is_success() {
-        anyhow::bail!("listing global commands failed ({})", resp.status());
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"status": resp.status().as_u16()})),
+            "inactive-scope command listing failed; skipping cross-scope cleanup"
+        );
+        return Ok(ReconcileOutcome::Reconciled);
     }
-    let existing: Vec<serde_json::Value> = resp.json().await?;
+    // Best-effort: a malformed listing body must not abort the (more important)
+    // active-scope reconcile - log and skip cross-scope cleanup, as for a failed
+    // listing status above.
+    let existing: Vec<serde_json::Value> = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"err": e.without_url().to_string()})),
+                "inactive-scope command listing returned an unparseable body; skipping cross-scope cleanup"
+            );
+            return Ok(ReconcileOutcome::Reconciled);
+        }
+    };
+    for cmd in &existing {
+        let name = cmd.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        // Only reap a `/ask` that is *ours* - one whose projection matches the
+        // `/ask` we register Deleting by name alone would reap a `/ask`
+        // registered by other tooling that happens to share the inactive scope.
+        // Skill commands keep their own shape-based ownership marker.
+        let is_owned_ask = name == "ask"
+            && expected_ask.is_some_and(|a| command_projection(cmd) == command_projection(a));
+        if !is_owned_ask && !is_skill_command_shape(cmd) {
+            continue;
+        }
+        let Some(id) = cmd.get("id").and_then(|i| i.as_str()) else {
+            continue;
+        };
+        let del = client
+            .delete(format!("{base}/{id}"))
+            .header("Authorization", auth)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?;
+        if del.status().is_success() || del.status() == reqwest::StatusCode::NOT_FOUND {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"command": name})),
+                "reaped command from inactive slash scope"
+            );
+        } else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "command": name,
+                        "status": del.status().as_u16(),
+                    })),
+                "failed to reap command from inactive slash scope (best-effort)"
+            );
+        }
+    }
+    Ok(ReconcileOutcome::Reconciled)
+}
+
+/// Reconcile the skill command set at a single endpoint (`base`): reap stale
+/// skill commands, then upsert each desired command whose projection differs
+/// from what's registered. Steady-state restarts converge to ~zero writes.
+async fn reconcile_one_endpoint(
+    client: &reqwest::Client,
+    auth: &str,
+    base: &str,
+    desired: &[serde_json::Value],
+    desired_names: &std::collections::HashSet<&str>,
+) -> anyhow::Result<ReconcileOutcome> {
+    // Reap stale skill commands first so the 100-command cap never blocks
+    // the upserts that follow. Delete failures are counted, not fatal
+    // mid-pass: the upserts still run, but the pass reports Err at the end
+    // so the fingerprint is not recorded and the next READY retries.
+    let mut failed_deletes = 0usize;
+    // `with_localizations=true` so the listing echoes back the full
+    // `*_localizations` dictionaries; without it Discord returns them null and
+    // every localized command would mismatch the projection and re-register on
+    // each READY (burning the daily command-create budget).
+    let resp = client
+        .get(format!("{base}?with_localizations=true"))
+        .header("Authorization", auth)
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)?;
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Ok(ReconcileOutcome::RateLimited {
+            until: rate_limit_deadline(resp).await,
+        });
+    }
+    if !resp.status().is_success() {
+        anyhow::bail!("listing commands failed ({})", resp.status());
+    }
+    let existing: Vec<serde_json::Value> =
+        resp.json().await.map_err(reqwest::Error::without_url)?;
     for cmd in &existing {
         let name = cmd.get("name").and_then(|n| n.as_str()).unwrap_or("");
         if name == "ask" || desired_names.contains(name) || !is_skill_command_shape(cmd) {
@@ -465,7 +647,7 @@ pub(crate) async fn reconcile_slash_commands(
         };
         let del = client
             .delete(format!("{base}/{id}"))
-            .header("Authorization", &auth)
+            .header("Authorization", auth)
             .send()
             .await
             .map_err(reqwest::Error::without_url)?;
@@ -509,8 +691,8 @@ pub(crate) async fn reconcile_slash_commands(
             continue;
         }
         let resp = client
-            .post(&base)
-            .header("Authorization", &auth)
+            .post(base)
+            .header("Authorization", auth)
             .json(cmd)
             .send()
             .await
@@ -562,6 +744,7 @@ mod typed_option_tests {
             skill_name: "s".to_string(),
             slug: "s".to_string(),
             description: "d".to_string(),
+            description_localizations: Default::default(),
             options,
         }
     }
@@ -570,6 +753,7 @@ mod typed_option_tests {
         OptionSpec {
             name: name.to_string(),
             description: name.to_string(),
+            description_localizations: Default::default(),
             kind,
             required,
             choices: Vec::new(),
@@ -591,6 +775,68 @@ mod typed_option_tests {
         assert_eq!(
             opts[0]["description"],
             json!(SKILL_COMMAND_OPTION_DESCRIPTION)
+        );
+    }
+
+    #[test]
+    fn builtin_commands_carry_compiled_in_localizations() {
+        let body = slash_command_registration_body(&[spec_with(Vec::new())]);
+        let cmds = body.as_array().unwrap();
+        // /ask command + its prompt option are localized.
+        let ask = &cmds[0];
+        assert_eq!(ask["name"], json!("ask"));
+        assert_eq!(
+            ask["description_localizations"]["fr"],
+            json!("Poser une question à l'agent")
+        );
+        assert_eq!(
+            ask["options"][0]["description_localizations"]["ja"],
+            json!("質問内容")
+        );
+        // The default skill `input` option is localized too, while keeping its
+        // canonical (English) description as the reap-ownership marker.
+        let input = &cmds[1]["options"][0];
+        assert_eq!(input["name"], json!("input"));
+        assert_eq!(
+            input["description"],
+            json!(SKILL_COMMAND_OPTION_DESCRIPTION)
+        );
+        assert!(input["description_localizations"]["zh-CN"].is_string());
+    }
+
+    #[test]
+    fn skill_localizations_flow_through_and_bad_locales_are_dropped() {
+        use std::collections::BTreeMap;
+        let mut cmd_loc = BTreeMap::new();
+        cmd_loc.insert("fr".to_string(), "Vérifier le déploiement".to_string());
+        // An authoring typo must be dropped, not 400 the whole registration.
+        cmd_loc.insert("xx-INVALID".to_string(), "ignored".to_string());
+        let mut opt_loc = BTreeMap::new();
+        opt_loc.insert("ja".to_string(), "クエリ".to_string());
+
+        let mut option = sso("query", "string");
+        option.description_localizations = opt_loc;
+        let mut skill = skill_with(vec![option]);
+        skill.description_localizations = cmd_loc;
+
+        let specs = discord_slash_specs_from_skills(std::slice::from_ref(&skill));
+        let spec = &specs[0];
+        assert_eq!(
+            spec.description_localizations.get("fr").map(String::as_str),
+            Some("Vérifier le déploiement")
+        );
+        assert!(!spec.description_localizations.contains_key("xx-INVALID"));
+
+        let body = slash_command_registration_body(&specs);
+        let cmd = &body.as_array().unwrap()[1]; // [0] is /ask
+        assert_eq!(
+            cmd["description_localizations"]["fr"],
+            json!("Vérifier le déploiement")
+        );
+        assert!(cmd["description_localizations"].get("xx-INVALID").is_none());
+        assert_eq!(
+            cmd["options"][0]["description_localizations"]["ja"],
+            json!("クエリ")
         );
     }
 
@@ -643,7 +889,7 @@ Write it.
 "#;
         std::fs::write(skill_dir.join("SKILL.md"), md).unwrap();
 
-        let skills = zeroclaw_runtime::skills::load_skills_from_directory(tmp.path(), false);
+        let (skills, _) = zeroclaw_runtime::skills::load_skills_from_directory(tmp.path(), false);
         let specs = discord_slash_specs_from_skills(&skills);
         assert_eq!(
             specs.len(),
@@ -695,6 +941,7 @@ Write it.
         let skill = zeroclaw_runtime::skills::Skill {
             name: "s".to_string(),
             description: "d".to_string(),
+            description_localizations: Default::default(),
             version: "0".to_string(),
             author: None,
             tags: vec!["slash".to_string()],
@@ -706,6 +953,7 @@ Write it.
                     description: "o".to_string(),
                     kind: "string".to_string(),
                     required: false,
+                    description_localizations: Default::default(),
                     choices: Vec::new(),
                     min: None,
                     max: None,
@@ -717,6 +965,7 @@ Write it.
                     description: "r".to_string(),
                     kind: "integer".to_string(),
                     required: true,
+                    description_localizations: Default::default(),
                     choices: Vec::new(),
                     min: None,
                     max: None,
@@ -728,6 +977,7 @@ Write it.
                     description: "b".to_string(),
                     kind: "bogus".to_string(),
                     required: false,
+                    description_localizations: Default::default(),
                     choices: Vec::new(),
                     min: None,
                     max: None,
@@ -748,6 +998,7 @@ Write it.
         zeroclaw_runtime::skills::SkillSlashOption {
             name: name.to_string(),
             description: "d".to_string(),
+            description_localizations: Default::default(),
             kind: kind.to_string(),
             required: false,
             choices: Vec::new(),
@@ -764,6 +1015,7 @@ Write it.
         zeroclaw_runtime::skills::Skill {
             name: "s".to_string(),
             description: "d".to_string(),
+            description_localizations: Default::default(),
             version: "0".to_string(),
             author: None,
             tags: vec!["slash".to_string()],

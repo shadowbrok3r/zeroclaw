@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# bump-version.sh — Update every hardcoded version reference in the repo.
+# bump-version.sh: update every hardcoded version reference in the repo.
 #
 # Usage:
 #   scripts/release/bump-version.sh           # reads version from Cargo.toml
@@ -79,7 +79,7 @@ echo "Workspace Cargo.toml..."
 ROOT_CARGO="$REPO_ROOT/Cargo.toml"
 if [[ -f "$ROOT_CARGO" ]]; then
   before="$(sha256sum "$ROOT_CARGO" | awk '{print $1}')"
-  # [workspace.package] version — first bare `version = "..."` line in the file
+  # [workspace.package] version, first bare `version = "..."` line in the file
   sed -i -E '0,/^version = "[^"]+"/s||version = "'"$VERSION"'"|' "$ROOT_CARGO" 2>/dev/null \
     || sed -i '' -E '/^version = "[^"]+"/{s//version = "'"$VERSION"'"/;:a;n;ba;}' "$ROOT_CARGO"
   # [workspace.dependencies] path-dep version pins, skipping aardvark*. Covers
@@ -142,48 +142,35 @@ done
 
 # ── Docs book examples + matching i18n catalogs ────────────────────
 # Two surgical patterns, both anchored enough to skip release-runbook
-# history lines like "Last verified: May 2026 (v0.7.4 cycle)" or
-# "scheduled for deletion in v0.7.4 (#5915)" which intentionally pin
-# to the version they were written for:
+# release-runbook history lines that intentionally pin an original verification
+# month or scheduled-removal release instead of tracking the current version:
 #   - container image tags    `zeroclawlabs/zeroclaw:vX.Y.Z`
-#   - /health response example `"version": "X.Y.Z"`
+#   - /health response example `"version":"X.Y.Z"` (compact or spaced JSON)
+#   - RPC initialize example   `"serverVersion":"X.Y.Z"` (compact or spaced JSON)
+# The `"version"`/`"serverVersion"` swaps tolerate an optional space after the
+# colon and preserve whichever style each occurrence uses, so both minified
+# examples (e.g. the RPC handshake) and pretty-printed ones stay in step. The
+# key anchor is unchanged, so historical-version prose is still skipped.
 # Sweeping `docs/book/src/**/*.md` keeps user-facing examples in step
-# with the release; `docs/book/po/*.po` mirrors the same swap into the
-# translation catalogs that the i18n pipeline reads.
+# with the release. The translation catalogues (`docs/book/po`) live in the
+# zeroclaw-docs-translations submodule and own their own version-literal swaps,
+# so they are not touched here; refresh-translations.sh tags and pins them.
 echo "Docs book examples..."
 docs_files=()
 while IFS= read -r -d '' f; do
   docs_files+=("$f")
 done < <(find "$REPO_ROOT/docs/book/src" -type f -name '*.md' -print0)
-while IFS= read -r -d '' f; do
-  docs_files+=("$f")
-done < <(find "$REPO_ROOT/docs/book/po" -type f -name '*.po' -print0 2>/dev/null)
 for f in "${docs_files[@]}"; do
   rel="${f#$REPO_ROOT/}"
-  # Image tags share one form across .md and .po (no quotes involved).
   bump "$rel" \
     'zeroclawlabs/zeroclaw:v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?' \
     "zeroclawlabs/zeroclaw:v${VERSION}"
-  # Version literal needs per-format dispatch: the unescaped pattern is
-  # a strict substring of the escaped one, so running both blindly
-  # would have the unescaped pass clobber the .po backslashes and
-  # leave malformed gettext strings.
-  case "$f" in
-    *.md)
-      bump "$rel" \
-        '"version": "[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?"' \
-        "\"version\": \"${VERSION}\""
-      ;;
-    *.po)
-      # Single-quoted replacement so the literal backslashes survive
-      # bash *and* sed: sed sees `\\"` in the substitution, which it
-      # emits as a single backslash followed by a quote, restoring
-      # the gettext escaped form.
-      bump "$rel" \
-        '\\"version\\": \\"[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?\\"' \
-        '\\"version\\": \\"'"${VERSION}"'\\"'
-      ;;
-  esac
+  bump "$rel" \
+    '"version":( ?)"[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?"' \
+    "\"version\":\\1\"${VERSION}\""
+  bump "$rel" \
+    '"serverVersion":( ?)"[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?"' \
+    "\"serverVersion\":\\1\"${VERSION}\""
 done
 
 # ── Docs stable-version pointer ────────────────────────────────────
@@ -209,6 +196,24 @@ else
   changed=$((changed + 1))
 fi
 
+# ── Nix git-dep hashes ──────────────────────────────────────────
+# Refresh NAR hashes for git-sourced dependencies so the flake can
+# resolve them.  Skips gracefully if the script or its prerequisites
+# (nix-prefetch-git, jq) are missing.
+echo "Nix git-dep hashes..."
+REFRESH_SCRIPT="$REPO_ROOT/scripts/dev/refresh-nix-hashes.sh"
+if [[ -x "$REFRESH_SCRIPT" ]]; then
+  if command -v nix-prefetch-git >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    ( cd "$REPO_ROOT" && bash "$REFRESH_SCRIPT" ) \
+      && echo "  refreshed nix/hashes.json" \
+      || echo "  warn: refresh-nix-hashes.sh failed; nix/hashes.json may be stale"
+  else
+    echo "  skip: nix-prefetch-git or jq not on PATH"
+  fi
+else
+  echo "  skip: scripts/dev/refresh-nix-hashes.sh not found"
+fi
+
 # ── Generated install surfaces (single source of truth) ───────────
 # After the workspace version is bumped, regenerate every spec-driven install
 # surface so version and feature sets stay canonical. This OWNS the version and
@@ -227,7 +232,7 @@ fi
 
 echo ""
 if [[ $changed -gt 0 ]]; then
-  echo "Done — $changed file(s) updated to v$VERSION."
+  echo "Done. $changed file(s) updated to v$VERSION."
 else
-  echo "Done — all files already at v$VERSION."
+  echo "Done. all files already at v$VERSION."
 fi

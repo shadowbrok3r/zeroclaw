@@ -1,7 +1,8 @@
-//! JSON-RPC 2.0 transport — copied from `zeroclaw-api::jsonrpc` so
-//! `apps/zerocode` does not depend on that crate. Wire shape is the
-//! contract; if the daemon evolves its envelope, this file evolves
-//! to match.
+//! JSON-RPC 2.0 transport.
+//!
+//! `apps/zerocode` keeps local ownership of its transport plumbing.
+//! Wire shape is the contract; if the daemon evolves its envelope, this file
+//! evolves to match.
 //!
 //! `RpcOutbound` carries the writer channel + a pending-request map
 //! so concurrent notifications and outbound calls cannot interleave
@@ -158,6 +159,27 @@ impl RpcOutbound {
 
     pub async fn send_raw(&self, json: String) -> bool {
         self.writer_tx.send(json).await.is_ok()
+    }
+
+    /// Write a JSON-RPC response (success or error) keyed to a
+    /// server-originated request id. Used by the TUI when the daemon
+    /// invokes a method on us (e.g. `elicitation/create`) and we need
+    /// to ship back an `Accept` / `Decline` / `Cancel`.
+    pub async fn respond(
+        &self,
+        id: Value,
+        result: std::result::Result<Value, JsonRpcError>,
+    ) -> bool {
+        let resp = JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            result: result.as_ref().ok().cloned(),
+            error: result.err(),
+            id,
+        };
+        match serde_json::to_string(&resp) {
+            Ok(s) => self.writer_tx.send(s).await.is_ok(),
+            Err(_) => false,
+        }
     }
 
     pub async fn notify(&self, method: &'static str, params: Value) {

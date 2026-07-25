@@ -47,15 +47,6 @@ pub struct ModelsQuery {
     pub model_provider: String,
 }
 
-/// `GET /api/config/catalog/models?model_provider=<name>` — fetch the model list
-/// for one model_provider. Same code path the CLI wizard uses
-/// (`zeroclaw_providers::create_model_provider(...).list_models()`), which goes
-/// through the models.dev cached catalog for OpenAI / Anthropic / Gemini,
-/// the live `/v1/models` endpoint for OpenRouter, etc.
-///
-/// Lazy: the dashboard hits this only when the user picks a model_provider, so
-/// initial catalog load stays fast. Fetch failures return an empty list
-/// with `live: false` so the form falls back to a free-text input.
 pub async fn handle_catalog_models(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -64,10 +55,14 @@ pub async fn handle_catalog_models(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    let _ = state;
     let local = zeroclaw_runtime::quickstart::model_provider_is_local(&q.model_provider);
+    // Snapshot config so the catalog resolves the alias credential and can reach
+    // the native /models endpoint (surfacing new native-only models that the
+    // models.dev snapshot may not carry yet) instead of silently falling back.
+    let cfg = state.config.read().clone();
     let (models, pricing, live) =
-        zeroclaw_runtime::quickstart::model_catalog(&q.model_provider).await;
+        zeroclaw_runtime::quickstart::model_catalog_with_config(Some(&cfg), &q.model_provider)
+            .await;
     axum::Json(CatalogModelsResult {
         model_provider: q.model_provider,
         models,
@@ -86,12 +81,6 @@ fn error_response(err: ConfigApiError) -> Response {
 
 // ── Section + picker (mirrors the TUI flow) ──────────────────────────
 
-/// Pure derivation of the section status response from a config snapshot.
-/// `needs_quickstart` is `false` iff at least one enabled `[agents.<alias>]`
-/// block has a resolved model provider with a selected model plus resolved
-/// risk/runtime profile refs. A provider without a bound, runnable agent is
-/// not a completion signal: chat dispatch still bounces with a setup error in
-/// that state.
 #[must_use]
 pub fn derive_section_status(cfg: &zeroclaw_config::schema::Config) -> ConfigStatusResult {
     let missing = quickstart_missing_requirements(cfg);
@@ -199,11 +188,6 @@ fn quickstart_agent_missing_requirements(
     missing
 }
 
-/// `GET /api/config/status` — boolean signal for the dashboard's
-/// fresh-install redirect. The daemon writes a default `config.toml` on
-/// first init, so file existence isn't a useful "is the user new?" check.
-/// Section status: ready iff at least one agent has its
-/// `model_provider`, `risk_profile`, and `runtime_profile` bound.
 pub async fn handle_section_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
@@ -232,15 +216,6 @@ pub struct AgentOptionsResponse {
     pub agents: Vec<String>,
 }
 
-/// Build the `AgentOptionsResponse` from a config snapshot. Pure function
-/// so tests can drive the same code path the handler runs without spinning
-/// up an `AppState`.
-///
-/// `get_map_keys` expects **kebab-case** paths (the macro at
-/// `crates/zeroclaw-macros/src/lib.rs:366` builds lookup arms with
-/// `snake_to_kebab(field_name)`). Passing snake_case for any
-/// underscore-bearing field silently returns `None` → empty `Vec` →
-/// dashboard renders "No X configured yet" even though X is configured.
 pub fn build_agent_options(cfg: &zeroclaw_config::schema::Config) -> AgentOptionsResponse {
     use zeroclaw_config::traits::AliasSource;
 
@@ -276,15 +251,6 @@ pub async fn handle_agent_options(State(state): State<AppState>, headers: Header
     axum::Json(build_agent_options(&cfg)).into_response()
 }
 
-/// `GET /api/config/sections` — list every top-level config section.
-///
-/// Schema-driven: walks `Config::prop_fields()` and collects unique first
-/// segments, then asks `Config::map_key_sections()` for which ones have
-/// pickers. The 4 quickstart sections (`model_providers`, `channels`, `memory`,
-/// `tunnel`) keep their existing per-section dispatch in
-/// `handle_section_picker`; everything else (`gateway`, `observability`,
-/// `scheduler`, ...) renders as a direct form. Adding a new top-level
-/// field to `Config` makes it appear here automatically.
 pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
@@ -310,12 +276,6 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
         roots.remove(*hidden);
     }
 
-    // A section gets a picker only when its OWN root carries a map (path
-    // == key) or its immediate child is a typed-family map (path == key
-    // + "." + one segment). Deeper nested maps belong to a subsection's
-    // own editor and must not promote their top-level section to a
-    // picker — `cost.rates.providers.models.<type>` is the rate-sheet's
-    // concern, not a reason to give `[cost]` an Add affordance.
     let all_map_paths: Vec<&'static str> = zeroclaw_config::schema::Config::map_key_sections()
         .iter()
         .map(|s| s.path)
@@ -357,19 +317,8 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
         .collect();
     roots.retain(|k| k.contains('.') || !prefixes_with_children.contains(k));
 
-    // Hard-ban the rate-sheet subtree from the sidebar. `[cost.rates.*]` is
-    // edited from inside the `[cost]` section's tabs (and from each
-    // provider-type page's Costs tab); it has no standalone picker, no
-    // direct form at any intermediate depth, and surfacing a path like
-    // `cost.rates.providers.tts` as its own sidebar entry only yields a
-    // dead-end "no picker" page.
     roots.retain(|k| !k.starts_with("cost.rates"));
 
-    // Sort: curated sections first in their canonical order
-    // (single source of truth in `zeroclaw_config::sections`), then
-    // everything else alphabetically. This is what makes /quickstart's wizard
-    // order and /config's foundation grouping derive from one Rust const
-    // — frontends consume the response order directly.
     let mut ordered: Vec<String> = roots.into_iter().collect();
     ordered.sort_by(|a, b| {
         match (
@@ -386,11 +335,6 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
     let sections: Vec<ConfigSectionEntry> = ordered
         .into_iter()
         .map(|key| {
-            // Picker eligibility = anything `handle_section_picker`
-            // dispatches non-trivially. Wizard sections that opt out
-            // (workspace/hardware/personality) are direct-form. Map-keyed
-            // sections outside the wizard (multi-agent peer groups, etc.)
-            // get the generic schema-walk picker.
             let wizard = zeroclaw_config::sections::Section::from_key(&key);
             let has_picker = match wizard {
                 Some(w) => !matches!(
@@ -410,6 +354,9 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
                 group: section_group(&key).to_string(),
                 is_quickstart: wizard.is_some(),
                 shape: wizard.map(zeroclaw_config::sections::Section::shape),
+                cost_category: zeroclaw_config::schema::cost_category_for_provider_section(&key)
+                    .unwrap_or_default()
+                    .to_string(),
                 key,
             }
         })
@@ -448,16 +395,6 @@ const HIDDEN_TOP_LEVEL: &[&str] = &[
     "pre_override_snapshots",
 ];
 
-/// Display group for a section. Delegates to
-/// `zeroclaw_config::sections::section_group_for_key` — grouping lives
-/// in the `sections!` table (curated rows) plus its long-tail map, so
-/// the dashboard, the RPC `config/sections` handler, and the TUI all
-/// read one source. Unknown keys fall into `Other` so new schema
-/// additions still surface — they just land in the catch-all bucket
-/// until someone curates them.
-///
-/// Group order in the dashboard sidebar is governed by the frontend (see
-/// `Config.tsx`), mirroring `zeroclaw_config::sections::SECTION_GROUPS`.
 fn section_group(key: &str) -> &'static str {
     zeroclaw_config::sections::section_group_for_key(key).label()
 }
@@ -476,16 +413,6 @@ pub struct SectionPath {
     pub section: String,
 }
 
-/// `GET /api/config/sections/<section>` — picker items for that section.
-///
-/// Per-section dispatch:
-/// * `providers` → `zeroclaw_providers::list_model_providers()` (CLI's catalog).
-/// * `memory` → `zeroclaw_memory::selectable_memory_backends()`.
-/// * `channels` / `tunnel` → schema-walk: clone config, `init_defaults` the
-///   section, then strip the section prefix from `prop_fields()` and dedupe
-///   by first segment. Same trick the TUI uses; new channels appear
-///   automatically when a `#[nested] Option<...>` field is added.
-/// * Anything else returns 404 (hardware has no picker).
 pub async fn handle_section_picker(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -534,14 +461,6 @@ pub async fn handle_section_picker(
     .into_response()
 }
 
-/// Result of picker dispatch for a [`Section`]. `Items` carries the
-/// list rendered into the dashboard / CLI picker UI; `DirectForm`
-/// signals a section without a picker step (the caller falls through
-/// to `/api/config/list?prefix=<section>` for direct field rendering).
-///
-/// Splitting this out from `handle_section_picker` keeps the per-Section
-/// dispatch a pure function — testable without an `AppState` mock and
-/// exhaustively coverable by iterating every variant.
 enum PickerDispatch {
     Items(Vec<PickerItem>),
     DirectForm,
@@ -566,11 +485,7 @@ fn picker_items_for(
         }
         Section::Memory => PickerDispatch::Items(memory_picker(cfg)),
         Section::Channels => PickerDispatch::Items(schema_walk_picker(cfg, "channels")),
-        Section::Tunnel => PickerDispatch::Items(schema_walk_picker_with_none(
-            cfg,
-            "tunnel",
-            "tunnel.tunnel-provider",
-        )),
+        Section::Tunnel => PickerDispatch::Items(tunnel_provider_picker(cfg)),
         Section::Agents => PickerDispatch::Items(agents_picker(cfg)),
         // Storage is two-tier (`storage.<kind>.<alias>`) — same shape
         // and walker as channels and the typed-provider families.
@@ -585,7 +500,9 @@ fn picker_items_for(
         | Section::KnowledgeBundles
         | Section::SkillBundles
         | Section::RiskProfiles
-        | Section::RuntimeProfiles => {
+        | Section::RuntimeProfiles
+        | Section::ModelRoutes
+        | Section::EmbeddingRoutes => {
             PickerDispatch::Items(one_tier_alias_map_picker(cfg, section.as_str()))
         }
         Section::Hardware | Section::Mcp | Section::Skills | Section::QuickstartState => {
@@ -733,11 +650,6 @@ fn memory_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
         .collect()
 }
 
-/// Generic schema-walk picker for sections like `channels` whose subsections
-/// are `#[nested] HashMap<String, T>` fields. Discovery: use `map_key_sections()`
-/// to enumerate all statically-known sub-sections under `<section>.` — this
-/// works for HashMap-based channels without needing init_defaults to insert
-/// entries (HashMap fields start empty and init_defaults leaves them empty).
 fn schema_walk_picker(cfg: &zeroclaw_config::schema::Config, section: &str) -> Vec<PickerItem> {
     let prefix_with_dot = format!("{section}.");
 
@@ -782,15 +694,6 @@ fn schema_walk_picker(cfg: &zeroclaw_config::schema::Config, section: &str) -> V
         .collect()
 }
 
-/// Generic picker for `OneTierAliasMap` sections — walks the live
-/// `prop_fields()` for the section prefix and returns one PickerItem
-/// per operator-defined alias. The closed-kind enumeration that
-/// [`schema_walk_picker`] does via `Config::map_key_sections()` doesn't
-/// apply here: aliases under `peer_groups`, `cron`, `risk_profiles`,
-/// etc. are operator-named, with no statically-known catalog. Every
-/// existing alias is reported `configured`; the dashboard's `+ Add`
-/// affordance handles new-key creation through
-/// [`handle_select_item`].
 fn one_tier_alias_map_picker(
     cfg: &zeroclaw_config::schema::Config,
     section: &str,
@@ -888,15 +791,11 @@ fn first_alias<'a>(aliases: impl Iterator<Item = &'a String>) -> Option<String> 
     aliases.first().map(|alias| (*alias).clone())
 }
 
-/// `tunnel`-flavored picker: same as `schema_walk_picker` plus a synthetic
-/// `none` entry at the top, marked active when the current `tunnel.tunnel_provider`
-/// matches. Mirrors the TUI's tunnel section.
-fn schema_walk_picker_with_none(
-    cfg: &zeroclaw_config::schema::Config,
-    section: &str,
-    active_prop_path: &str,
-) -> Vec<PickerItem> {
-    let active = cfg.get_prop(active_prop_path).unwrap_or_default();
+fn tunnel_provider_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
+    // The canonical prop name uses an underscore (`tunnel_provider`); the
+    // hyphenated form is unknown to get_prop and silently yields "" (no active
+    // provider ever badged).
+    let active = cfg.get_prop("tunnel.tunnel_provider").unwrap_or_default();
     let mut items = vec![PickerItem {
         key: "none".to_string(),
         label: "none".to_string(),
@@ -907,14 +806,25 @@ fn schema_walk_picker_with_none(
             None
         },
     }];
-    let mut rest = schema_walk_picker(cfg, section);
-    // Re-mark the active one in the schema-walk results.
-    for item in &mut rest {
-        if item.key == active {
-            item.badge = Some("active".to_string());
-        }
+    for entry in cfg.tunnel.nested_option_entries() {
+        let badge = if entry.field == active {
+            Some("active".to_string())
+        } else if entry.present {
+            Some("configured".to_string())
+        } else {
+            None
+        };
+        items.push(PickerItem {
+            key: entry.field.to_string(),
+            label: entry.display_name.to_string(),
+            description: if entry.description.is_empty() {
+                None
+            } else {
+                Some(entry.description.to_string())
+            },
+            badge,
+        });
     }
-    items.extend(rest);
     items
 }
 
@@ -925,21 +835,6 @@ pub struct SectionItemPath {
     pub key: String,
 }
 
-/// `POST /api/config/sections/<section>/items/<key>` — instantiate the
-/// selected item in the live config (idempotent) and return the dotted
-/// prefix the frontend should fetch fields under.
-///
-/// Per-section dispatch:
-/// * `providers` → POST equivalent of `/api/config/map-key?path=providers.models&key=<key>`,
-///   then return `model_providers.<key>`.
-/// * `channels` → init_defaults under `channels.<key>`, return `channels.<key>`.
-/// * `memory` → set_prop `memory.backend = <key>`, return `memory`.
-/// * `tunnel` → set_prop `tunnel.tunnel_provider = <key>` (and init_defaults the
-///   subsection if `<key>` is not "none"), return `tunnel.<key>` (or `tunnel`
-///   for the `none` case).
-///
-/// The optional JSON body `{"alias": "<name>"}` names the entry being created,
-/// e.g. `"work"` for `model_providers.anthropic.work`. Omit to use `"default"`.
 #[derive(Debug, Default, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SectionSelectBody {
@@ -977,11 +872,6 @@ pub async fn handle_section_select(
 
     let (fields_prefix, created) = match section_enum {
         Section::ModelProviders | Section::TtsProviders | Section::TranscriptionProviders => {
-            // Two-tier typed-family path: outer bucket is the family
-            // (`model_providers.<type>` etc.), inner key is the alias the
-            // operator named. `create_map_key` is idempotent so re-selecting
-            // an existing type/alias is a no-op for the bucket and just
-            // returns the form prefix for the alias.
             let family = section_enum.as_str();
             let created = working
                 .create_map_key(&format!("{family}.{key}"), &alias)
@@ -1018,13 +908,6 @@ pub async fn handle_section_select(
                 Ok(c) => c,
                 Err(resp) => return resp,
             };
-            // The per-channel-type struct's `enabled` field defaults to
-            // `false` for paste-safety (don't fire a listener on a
-            // half-pasted block). For wizard-driven creation the operator
-            // has just consciously added the alias, so flip
-            // the new entry's `enabled` to true. Re-selecting an existing
-            // alias is a no-op (created=false), so user-edited values are
-            // never trampled.
             if created {
                 let enabled_path = format!("channels.{key}.{alias}.enabled");
                 if let Err(e) = working.set_prop_persistent(&enabled_path, "true") {
@@ -1049,25 +932,34 @@ pub async fn handle_section_select(
         | Section::KnowledgeBundles
         | Section::SkillBundles
         | Section::RiskProfiles
-        | Section::RuntimeProfiles => {
-            // OneTierAliasMap: the URL path key IS the alias. One
-            // `create_map_key("<section>", &key)` call works for every
-            // operator-named HashMap section; create_map_key is
-            // idempotent, so selecting an existing alias just returns
-            // the form prefix without modifying anything.
+        | Section::RuntimeProfiles
+        | Section::ModelRoutes
+        | Section::EmbeddingRoutes => {
             let section_key = section_enum.as_str();
-            let created = working.create_map_key(section_key, &key).map_err(|msg| {
-                error_response(
-                    ConfigApiError::new(
-                        ConfigApiCode::PathNotFound,
-                        format!("could not select {section_key} alias `{key}`: {msg}"),
-                    )
-                    .with_path(section_key),
-                )
-            });
-            let created = match created {
+            let created = match zeroclaw_config::alias_refs::create_map_key_checked(
+                &mut working,
+                section_key,
+                &key,
+            ) {
                 Ok(c) => c,
-                Err(resp) => return resp,
+                Err(zeroclaw_config::alias_refs::CreateError::Reserved(a)) => {
+                    return error_response(
+                        ConfigApiError::new(
+                            ConfigApiCode::ValidationFailed,
+                            format!("alias `{a}` is reserved and cannot be created"),
+                        )
+                        .with_path(format!("{section_key}.{key}")),
+                    );
+                }
+                Err(zeroclaw_config::alias_refs::CreateError::Invalid(msg)) => {
+                    return error_response(
+                        ConfigApiError::new(
+                            ConfigApiCode::PathNotFound,
+                            format!("could not select {section_key} alias `{key}`: {msg}"),
+                        )
+                        .with_path(section_key),
+                    );
+                }
             };
             // Agents need a per-alias workspace dir on disk so the
             // PersonalityEditor and the runtime have somewhere to read
@@ -1087,20 +979,19 @@ pub async fn handle_section_select(
                         .with_path(section_key),
                     );
                 }
-                if let Err(err) =
-                    zeroclaw_config::schema::ensure_bootstrap_files(&workspace_dir).await
+                if let Err(err) = zeroclaw_runtime::agent::personality::seed_default_personality(
+                    &working,
+                    &key,
+                    &workspace_dir,
+                )
+                .await
                 {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": key, "workspace": workspace_dir.display().to_string(), "err": err.to_string()})), "agent workspace scaffolded but bootstrap files seed failed (continuing)");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": key, "workspace": workspace_dir.display().to_string(), "err": err.to_string()})), "agent workspace scaffolded but personality seed failed (continuing)");
                 }
             }
             (format!("{section_key}.{key}"), created)
         }
         Section::Storage => {
-            // Two-tier typed-family (`storage.<kind>.<alias>`) — same
-            // shape and selection flow as model_providers / tts_providers /
-            // transcription_providers. Outer bucket is the storage kind
-            // (sqlite, postgres, qdrant, markdown, lucid); inner key is
-            // the operator-named alias.
             let created = working
                 .create_map_key(&format!("storage.{key}"), &alias)
                 .map_err(|msg| {
@@ -1136,13 +1027,13 @@ pub async fn handle_section_select(
             ("memory".to_string(), true)
         }
         Section::Tunnel => {
-            if let Err(e) = working.set_prop_persistent("tunnel.tunnel-provider", &key) {
+            if let Err(e) = working.set_prop_persistent("tunnel.tunnel_provider", &key) {
                 return error_response(
                     ConfigApiError::new(
                         ConfigApiCode::ValidationFailed,
-                        format!("could not set tunnel.tunnel-provider = `{key}`: {e}"),
+                        format!("could not set tunnel.tunnel_provider = `{key}`: {e}"),
                     )
-                    .with_path("tunnel.tunnel-provider"),
+                    .with_path("tunnel.tunnel_provider"),
                 );
             }
             let prefix = if key == "none" {
@@ -1192,13 +1083,6 @@ pub async fn handle_section_select(
 mod tests {
     use super::*;
 
-    /// Regression guard: every alias-bearing map the handler exposes must
-    /// be reachable from `Config::get_map_keys` using the kebab-case path
-    /// `build_agent_options` passes. Snake_case silently returns `None` →
-    /// empty Vec → dashboard renders "No X configured yet" when X exists.
-    /// This test drives the same code the gateway runs and would have
-    /// caught the original bug. Adding a new alias-bearing field requires
-    /// adding it here too.
     #[test]
     fn build_agent_options_returns_every_configured_alias() {
         let mut cfg = zeroclaw_config::schema::Config::default();
@@ -1372,12 +1256,92 @@ mod tests {
         zeroclaw_config::schema::Config::default()
     }
 
+    fn section_test_state(config: zeroclaw_config::schema::Config) -> AppState {
+        let memory: std::sync::Arc<dyn zeroclaw_api::memory_traits::Memory> =
+            std::sync::Arc::new(zeroclaw_memory::NoneMemory::new("none"));
+        AppState {
+            config: std::sync::Arc::new(parking_lot::RwLock::new(config)),
+            model_provider: std::sync::Arc::new(crate::UnconfiguredModelProvider),
+            model: "test-model".to_string(),
+            temperature: None,
+            mem: memory.clone(),
+            memory_strategy: std::sync::Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    memory,
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: std::sync::Arc::new(zeroclaw_runtime::security::pairing::PairingGuard::new(
+                false,
+                &[],
+            )),
+            trust_forwarded_headers: false,
+            rate_limiter: std::sync::Arc::new(crate::GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: std::sync::Arc::new(crate::auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: std::sync::Arc::new(crate::IdempotencyStore::new(
+                std::time::Duration::from_secs(300),
+                1000,
+            )),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-wati")]
+            wati: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: std::sync::Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            tools_registry: std::sync::Arc::new(Vec::new()),
+            tools_registry_by_agent: std::sync::Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: std::sync::Arc::new(crate::sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: std::sync::Arc::new(crate::nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: crate::nodes::mdns::MdnsPeerRegistry::default(),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+            cancel_tokens: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            pending_reload: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+        }
+    }
+
     #[test]
     fn mcp_section_is_direct_form_despite_map_key_servers() {
         // Regression: MCP is map-keyed but must use the direct form, not the
         // onboard picker (same as hardware/skills).
         let key = "mcp";
         let wizard = zeroclaw_config::sections::Section::from_key(key);
+        // `Mcp` declares `key: "mcp"`, so this always resolves; the map-path
+        // fallback `handle_sections` uses for unknown keys is unreachable here
+        // (and is a closure over that function's `all_map_paths`, so it is not
+        // in scope from the test module).
         let has_picker = match wizard {
             Some(w) => !matches!(
                 w,
@@ -1385,7 +1349,7 @@ mod tests {
                     | zeroclaw_config::sections::Section::Mcp
                     | zeroclaw_config::sections::Section::Skills
             ),
-            None => section_has_picker_for_key(key),
+            None => unreachable!("Section::from_key({key:?}) must resolve"),
         };
         assert!(
             !has_picker,
@@ -1446,12 +1410,6 @@ mod tests {
 
     #[test]
     fn channels_select_initializes_subsection_so_set_prop_works() {
-        // Regression for the channels init/set flow: after
-        // handle_section_select for channels/matrix, the in-memory config
-        // must have channels.matrix.<alias> so a subsequent set_prop on
-        // channels.matrix.* succeeds rather than bailing "Unknown property".
-        // Uses create_map_key directly (the synchronous core of the select
-        // endpoint) to keep the test free of HTTP machinery.
         let mut cfg = empty_cfg();
         assert!(cfg.channels.matrix.is_empty(), "fresh config: matrix unset");
 
@@ -1604,7 +1562,7 @@ mod tests {
     #[test]
     fn tunnel_picker_includes_synthetic_none() {
         let cfg = empty_cfg();
-        let items = schema_walk_picker_with_none(&cfg, "tunnel", "tunnel.tunnel-provider");
+        let items = tunnel_provider_picker(&cfg);
         assert_eq!(
             items[0].key, "none",
             "`none` must be the first entry in the tunnel picker"
@@ -1613,11 +1571,110 @@ mod tests {
         assert_eq!(items[0].badge.as_deref(), Some("active"));
     }
 
-    /// Empty OneTierAliasMap section yields zero picker items. No
-    /// closed-kind catalog applies for these sections — only operator-defined
-    /// aliases populate the picker. Section wire keys are kebab-case
-    /// because the Configurable derive runs each field name through
-    /// `snake_to_kebab` when registering map-key paths.
+    #[test]
+    fn tunnel_picker_surfaces_all_option_backed_providers_on_fresh_config() {
+        let cfg = empty_cfg();
+        let items = tunnel_provider_picker(&cfg);
+        let keys: std::collections::BTreeSet<&str> = items.iter().map(|i| i.key.as_str()).collect();
+        for required in [
+            "none",
+            "cloudflare",
+            "tailscale",
+            "ngrok",
+            "openvpn",
+            "pinggy",
+            "custom",
+        ] {
+            assert!(
+                keys.contains(required),
+                "tunnel picker on a fresh config must include `{required}`; got: {:?}",
+                keys.into_iter().collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    #[test]
+    fn tunnel_picker_marks_active_provider_from_configured_section() {
+        let mut cfg = empty_cfg();
+        cfg.tunnel.tunnel_provider = "tailscale".to_string();
+        let items = tunnel_provider_picker(&cfg);
+        let active: Vec<&str> = items
+            .iter()
+            .filter(|i| i.badge.as_deref() == Some("active"))
+            .map(|i| i.key.as_str())
+            .collect();
+        assert_eq!(
+            active,
+            vec!["tailscale"],
+            "exactly one entry should be active after setting `tunnel.tunnel_provider = tailscale`"
+        );
+        assert_eq!(
+            items[0].key, "none",
+            "`none` is still the first picker entry even when another provider is active"
+        );
+    }
+
+    #[test]
+    fn tunnel_picker_badges_present_option_fields_as_configured() {
+        let mut cfg = empty_cfg();
+        cfg.tunnel.tunnel_provider = "cloudflare".to_string();
+        // Materialize the cloudflare nested Option directly so the picker sees
+        // it as present, without writing the developer's real config.
+        cfg.tunnel.cloudflare = Some(zeroclaw_config::schema::CloudflareTunnelConfig::default());
+        let items = tunnel_provider_picker(&cfg);
+        let cloudflare = items
+            .iter()
+            .find(|i| i.key == "cloudflare")
+            .expect("cloudflare should appear in the picker");
+        assert_eq!(
+            cloudflare.badge.as_deref(),
+            Some("active"),
+            "cloudflare is the active provider"
+        );
+        // `tailscale` is statically known but the user hasn't configured
+        // it — its Option is still None, so no badge.
+        let tailscale = items
+            .iter()
+            .find(|i| i.key == "tailscale")
+            .expect("tailscale should appear in the picker");
+        assert!(
+            tailscale.badge.is_none(),
+            "tailscale's Option is None, so no badge; got: {:?}",
+            tailscale.badge
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnel_select_updates_canonical_provider_and_active_picker_badge() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        let state = section_test_state(cfg);
+
+        let response = handle_section_select(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            axum::extract::Path(SectionItemPath {
+                section: "tunnel".to_string(),
+                key: "cloudflare".to_string(),
+            }),
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let cfg = state.config.read().clone();
+        assert_eq!(cfg.tunnel.tunnel_provider, "cloudflare");
+        let items = tunnel_provider_picker(&cfg);
+        let cloudflare = items
+            .iter()
+            .find(|item| item.key == "cloudflare")
+            .expect("cloudflare should appear in the picker");
+        assert_eq!(cloudflare.badge.as_deref(), Some("active"));
+    }
+
     #[test]
     fn one_tier_alias_map_picker_is_empty_for_unconfigured_section() {
         let cfg = empty_cfg();
@@ -1639,10 +1696,6 @@ mod tests {
         }
     }
 
-    /// After `create_map_key("<kebab-section>", "<alias>")`, the picker
-    /// surfaces the alias as a `configured` entry. Same shape applies
-    /// to every OneTierAliasMap section — the picker is generic over
-    /// the prefix.
     #[test]
     fn one_tier_alias_map_picker_surfaces_created_aliases() {
         let cases: &[(&str, &str)] = &[
@@ -1673,14 +1726,6 @@ mod tests {
         }
     }
 
-    /// Exhaustive picker dispatch: every [`Section`] variant must
-    /// resolve through `picker_items_for` without panic. DirectForm
-    /// sections (Workspace, Hardware, Mcp) return the
-    /// `PickerDispatch::DirectForm` sentinel; every other section
-    /// returns at least zero items. Loops over the wizard order plus
-    /// every explorer-only variant — adding a new Section variant
-    /// fails to compile until it gets a routing arm in
-    /// `picker_items_for`.
     #[test]
     fn picker_dispatch_covers_every_section_variant() {
         use zeroclaw_config::sections::Section;
@@ -1727,11 +1772,6 @@ mod tests {
         }
     }
 
-    /// Storage is `[storage.<kind>.<alias>]` — two-tier typed-family
-    /// shape, served by the storage picker. The picker
-    /// surfaces the 5 storage kinds (sqlite, postgres, qdrant,
-    /// markdown, lucid) regardless of which aliases exist, and badges
-    /// the kind `created` once any alias under it is created.
     #[test]
     fn storage_picker_lists_all_kinds_and_marks_created() {
         let cfg = empty_cfg();

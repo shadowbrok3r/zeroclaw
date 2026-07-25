@@ -1,9 +1,4 @@
 //! An [`Observer`] that records tool-call outcomes and token usage from a run.
-//!
-//! This is the clean seam for trajectory/cost capture: the agent loop already
-//! emits [`ObserverEvent`]s for every tool call and LLM response, so the eval
-//! harness observes them without touching the agent. It is the Phase 0 seed of
-//! the richer run-record capture used by later phases.
 
 use std::sync::Mutex;
 use zeroclaw_api::observability_traits::{Observer, ObserverEvent, ObserverMetric};
@@ -79,5 +74,87 @@ impl Observer for RecordingObserver {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use zeroclaw_api::observability_traits::{Observer, ObserverEvent};
+
+    fn tool_call_event(tool: &str, success: bool) -> ObserverEvent {
+        ObserverEvent::ToolCall {
+            parent_agent_alias: None,
+            tool: tool.to_string(),
+            tool_call_id: None,
+            duration: Duration::from_millis(10),
+            success,
+            arguments: None,
+            result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
+        }
+    }
+
+    fn llm_event(input: u64, output: u64) -> ObserverEvent {
+        ObserverEvent::LlmResponse {
+            parent_agent_alias: None,
+            model_provider: String::new(),
+            model: String::new(),
+            duration: Duration::from_millis(50),
+            success: true,
+            error_message: None,
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            messages: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
+        }
+    }
+
+    #[test]
+    fn new_observer_is_empty() {
+        let obs = RecordingObserver::new();
+        assert!(obs.tool_names().is_empty());
+        assert!(obs.all_tools_succeeded());
+        assert_eq!(obs.tokens(), (0, 0));
+    }
+
+    #[test]
+    fn tool_names_records_order() {
+        let obs = RecordingObserver::new();
+        obs.record_event(&tool_call_event("search", true));
+        obs.record_event(&tool_call_event("write", true));
+        assert_eq!(
+            obs.tool_names(),
+            vec!["search".to_string(), "write".to_string()]
+        );
+    }
+
+    #[test]
+    fn all_tools_succeeded_false_on_failure() {
+        let obs = RecordingObserver::new();
+        obs.record_event(&tool_call_event("ok", true));
+        obs.record_event(&tool_call_event("bad", false));
+        assert!(!obs.all_tools_succeeded());
+    }
+
+    #[test]
+    fn tokens_accumulate_across_llm_responses() {
+        let obs = RecordingObserver::new();
+        obs.record_event(&llm_event(100, 50));
+        obs.record_event(&llm_event(200, 80));
+        assert_eq!(obs.tokens(), (300, 130));
+    }
+
+    #[test]
+    fn unrelated_events_are_ignored() {
+        let obs = RecordingObserver::new();
+        obs.record_event(&ObserverEvent::HeartbeatTick);
+        assert!(obs.tool_names().is_empty());
+        assert_eq!(obs.tokens(), (0, 0));
     }
 }

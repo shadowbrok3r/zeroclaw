@@ -1,12 +1,4 @@
 //! Local keybinding presets and override resolution.
-//!
-//! A preset is a named, COMPLETE keymap built from the typed action
-//! enums and `Chord` constructors — never authored `"tag.variant"` or
-//! `"ctrl+p"` strings. Picking a preset fully overwrites the
-//! `[keybindings]` table, so every preset must define every rebindable
-//! action; a test enforces it. Presets start from the full default map
-//! and reassign the actions they change. Walked from `KEY_PRESETS`,
-//! mirroring the theme registry walked via `theme_names`.
 
 use std::collections::HashMap;
 
@@ -14,8 +6,8 @@ use anyhow::{Result, bail};
 use crossterm::event::KeyCode;
 
 use crate::keymap::{
-    ChatTabAction, Chord, ConfigTabAction, DashboardTabAction, FileExplorerAction, GlobalAction,
-    InputBarAction, LogsTabAction, QuickstartTabAction, RebindableActions,
+    ChatTabAction, Chord, ConfigTabAction, DashboardTabAction, DoctorTabAction, FileExplorerAction,
+    GlobalAction, InputBarAction, LogsTabAction, QuickstartTabAction, RebindableActions,
     overrides::OverrideTable,
 };
 
@@ -39,6 +31,7 @@ fn all_defaults() -> HashMap<String, Vec<Chord>> {
     fill_defaults::<LogsTabAction>(&mut map);
     fill_defaults::<DashboardTabAction>(&mut map);
     fill_defaults::<ConfigTabAction>(&mut map);
+    fill_defaults::<DoctorTabAction>(&mut map);
     fill_defaults::<QuickstartTabAction>(&mut map);
     fill_defaults::<InputBarAction>(&mut map);
     fill_defaults::<FileExplorerAction>(&mut map);
@@ -235,12 +228,6 @@ impl KeyPreset {
     }
 }
 
-/// Turn a sparse `action_key -> chords` map into the nested
-/// `tag -> variant -> chords` override table, validating intra-action
-/// duplicates and intra-tag chord uniqueness. Reserved-chord rejection
-/// lives on the capture-modal path only — the compile-time defaults
-/// legitimately use Enter/Esc (e.g. open-detail, cancel), so blocking
-/// them here would reject the baseline itself.
 pub fn build_override_table(rows: HashMap<String, Vec<Chord>>) -> Result<OverrideTable> {
     let mut table: OverrideTable = HashMap::new();
     let mut seen: HashMap<String, HashMap<Chord, String>> = HashMap::new();
@@ -289,9 +276,6 @@ mod tests {
         assert!(!t.is_empty());
     }
 
-    /// Every preset must define EVERY rebindable action — full overwrite
-    /// means a missing action would silently lose its binding. This is
-    /// the invariant that makes validation tractable.
     #[test]
     fn every_preset_covers_every_action() {
         let expected: std::collections::BTreeSet<String> = all_action_keys().into_iter().collect();

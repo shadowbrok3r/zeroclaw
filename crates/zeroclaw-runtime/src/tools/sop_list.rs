@@ -79,7 +79,7 @@ impl Tool for SopListTool {
         if filtered.is_empty() {
             return Ok(ToolResult {
                 success: true,
-                output: format!("No SOPs match filter '{filter}'."),
+                output: format!("No SOPs match filter '{filter}'.").into(),
                 error: None,
             });
         }
@@ -116,7 +116,7 @@ impl Tool for SopListTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }
@@ -146,11 +146,15 @@ mod tests {
                 requires_confirmation: false,
                 kind: SopStepKind::default(),
                 schema: None,
+                ..SopStep::default()
             }],
             cooldown_secs: 0,
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
         }
     }
 

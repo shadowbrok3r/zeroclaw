@@ -1,8 +1,4 @@
 //! Policy engine for memory operations.
-//!
-//! Validates operations against configurable rules before they reach the
-//! backend. Enforces namespace quotas, category limits, read-only namespaces,
-//! and per-category retention rules.
 
 use super::traits::MemoryCategory;
 use zeroclaw_config::schema::MemoryPolicyConfig;
@@ -194,5 +190,22 @@ mod tests {
             enforcer.retention_days_for_category(&MemoryCategory::Daily, 30),
             30
         );
+    }
+
+    #[test]
+    fn namespace_quota_error_reports_current_and_max_counts() {
+        let policy = MemoryPolicyConfig {
+            max_entries_per_namespace: 3,
+            ..empty_policy()
+        };
+        let enforcer = PolicyEnforcer::new(&policy);
+
+        match enforcer.check_namespace_limit(3) {
+            Err(PolicyViolation::NamespaceQuotaExceeded { max, current }) => {
+                assert_eq!(max, 3);
+                assert_eq!(current, 3);
+            }
+            other => panic!("expected namespace quota exceeded, got {other:?}"),
+        }
     }
 }

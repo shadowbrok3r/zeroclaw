@@ -21,3 +21,8 @@ export type { ConfirmDialogProps } from './ConfirmDialog';
 
 export { ComboBox } from './ComboBox';
 export type { ComboBoxProps } from './ComboBox';
+
+export { Select } from './Select';
+export type { SelectProps, SelectOption } from './Select';
+
+export { HelpTip } from './HelpTip';

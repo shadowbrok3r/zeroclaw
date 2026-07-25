@@ -1,22 +1,9 @@
 //! ZeroClaw API layer — trait definitions and shared types.
-//!
-//! This crate defines the fundamental abstractions that all ZeroClaw subsystems
-//! depend on. No implementations, no heavy dependencies. Every other crate in
-//! the workspace depends on this. The compiler enforces that no implementation
-//! crate can import another without going through these interfaces.
-//!
-//! ## Traits
-//! - [`model_provider::ModelProvider`] — LLM inference backends
-//! - [`channel::Channel`] — messaging platform integrations
-//! - [`tool::Tool`] — agent-callable capabilities
-//! - [`memory_traits::Memory`] — conversation memory backends
-//! - [`observability_traits::Observer`] — metrics and tracing
-//! - [`runtime_traits::RuntimeAdapter`] — execution environment adapters
-//! - [`peripherals_traits::Peripheral`] — hardware board integrations
 
 pub mod agent;
 pub mod attribution;
 pub mod channel;
+pub mod elicitation;
 pub mod hook;
 pub mod ingress;
 pub mod jsonrpc;
@@ -25,7 +12,10 @@ pub mod memory_traits;
 pub mod model_provider;
 pub mod observability_traits;
 pub mod peripherals_traits;
+pub mod plan;
 pub mod platform;
+pub mod principal;
+pub mod runtime_status;
 pub mod runtime_traits;
 pub mod schema;
 pub mod session_keys;
