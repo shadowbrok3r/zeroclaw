@@ -1731,6 +1731,9 @@ pub async fn run_gateway(
         .route("/webhook", post(handle_webhook))
         .merge(optional_channel_routes())
         // ── Claude Code runner hooks ──
+        // The transcript sibling `/hooks/claude-code/transcript` lives on its
+        // own sub-router below: it needs a larger body limit than the
+        // router-wide `RequestBodyLimitLayer`.
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
@@ -2059,6 +2062,24 @@ pub async fn run_gateway(
             Duration::from_secs(gateway_request_timeout_secs(&config.gateway)),
         ));
 
+    // Claude Code transcript backfill: same hook-secret auth as
+    // /hooks/claude-code, but transcript JSONL tails exceed the 64 KiB
+    // router-wide body cap, so the route carries its own streaming limit
+    // (8 MiB; oversized uploads answer 413 mid-stream, never fully buffered).
+    let claude_transcript_router: Router = Router::new()
+        .route(
+            "/hooks/claude-code/transcript",
+            post(api::handle_claude_code_transcript),
+        )
+        .with_state(state.clone())
+        .layer(RequestBodyLimitLayer::new(
+            api::CLAUDE_CODE_TRANSCRIPT_MAX_BODY_BYTES,
+        ))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(gateway_request_timeout_secs(&config.gateway)),
+        ));
+
     // Manual cron-trigger and A2A task routes live on their own sub-router so
     // they can opt out of the 30s gateway-wide TimeoutLayer. Both run a
     // synchronous agent turn inline. Layers attached here travel with the
@@ -2075,7 +2096,9 @@ pub async fn run_gateway(
             Duration::from_secs(gateway_long_running_request_timeout_secs(&config.gateway)),
         ));
 
-    let inner = inner.merge(long_running_router);
+    let inner = inner
+        .merge(claude_transcript_router)
+        .merge(long_running_router);
 
     // Nest under path prefix when configured (axum strips prefix before routing).
     // nest() at "/prefix" handles both "/prefix" and "/prefix/*" but not "/prefix/"

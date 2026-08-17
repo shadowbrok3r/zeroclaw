@@ -2569,6 +2569,179 @@ pub async fn handle_claude_code_hook(
     }
 }
 
+// ── Claude Code transcript backfill endpoint ─────────────────────
+
+/// Body cap for transcript uploads (8 MiB). Enforced while the body streams
+/// in by the dedicated `RequestBodyLimitLayer` on this route's sub-router
+/// (see `run_gateway`), so oversized uploads answer 413 without ever being
+/// buffered in full; the in-handler check is a defensive mirror.
+pub(crate) const CLAUDE_CODE_TRANSCRIPT_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+pub struct ClaudeCodeTranscriptQuery {
+    /// Claude Code session id (`cc_` is prepended server-side).
+    #[serde(default)]
+    pub session: Option<String>,
+    /// Agent alias to attribute the session to (validated).
+    #[serde(default)]
+    pub agent: Option<String>,
+}
+
+/// Parse one Claude Code transcript JSONL line into a `(role, text)` turn.
+///
+/// Only `type == "user" | "assistant"` lines with non-empty text survive;
+/// `message.content` is either a plain string or a block list whose `text`
+/// blocks are joined. Local-command echoes (`<local-command...`,
+/// `<command-name>...`) and every other line type (progress, tool
+/// snapshots) yield `None`.
+fn parse_transcript_line(line: &str) -> Option<(String, String)> {
+    let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let turn_type = value.get("type")?.as_str()?;
+    if turn_type != "user" && turn_type != "assistant" {
+        return None;
+    }
+    let message = value.get("message")?;
+    let role = match message.get("role").and_then(|v| v.as_str()) {
+        Some(role @ ("user" | "assistant")) => role,
+        _ => turn_type,
+    };
+    let text = match message.get("content")? {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(blocks) => {
+            let parts: Vec<&str> = blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(|v| v.as_str()) == Some("text"))
+                .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+                .collect();
+            parts.join("\n")
+        }
+        _ => return None,
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("<local-command")
+        || trimmed.starts_with("<command-name>")
+    {
+        return None;
+    }
+    Some((role.to_string(), text))
+}
+
+pub async fn handle_claude_code_transcript(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ClaudeCodeTranscriptQuery>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    // Same secret gate as the hook endpoint, but stricter when unset: with
+    // ingestion disabled there is nothing this endpoint could do, so it
+    // answers as if it did not exist.
+    match check_claude_code_hook_secret(&state, &headers) {
+        HookSecretCheck::Disabled => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Not found"})),
+            )
+                .into_response();
+        }
+        HookSecretCheck::Rejected => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "claude-code transcript: rejected — invalid or missing X-ZC-Hook-Secret"
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Unauthorized — invalid or missing X-ZC-Hook-Secret header"
+                })),
+            )
+                .into_response();
+        }
+        HookSecretCheck::Authorized => {}
+    }
+
+    let Some(session_id) = query
+        .session
+        .as_deref()
+        .and_then(sanitize_claude_code_session_id)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Missing or invalid ?session=: expected [A-Za-z0-9_-]{1,64}"
+            })),
+        )
+            .into_response();
+    };
+    let agent_alias = match validated_hook_agent(&state, query.agent.as_deref()) {
+        Ok(alias) => alias,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(backend) = state.session_backend.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Session persistence is disabled"})),
+        )
+            .into_response();
+    };
+    if body.len() > CLAUDE_CODE_TRANSCRIPT_MAX_BODY_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({"error": "Transcript body too large"})),
+        )
+            .into_response();
+    }
+
+    let text = String::from_utf8_lossy(&body);
+    let turns: Vec<(String, String)> = text.lines().filter_map(parse_transcript_line).collect();
+
+    // Full-fidelity replacement: drop the sparse live rows, append the
+    // parsed transcript in order. `clear_messages` keeps the metadata row,
+    // so name and agent alias survive (pinned by test).
+    let session_key = format!("cc_{session_id}");
+    let replace = || -> std::io::Result<()> {
+        if backend.get_session_agent_alias(&session_key)?.is_none() {
+            // Fresh or unattributed key: stamp the validated alias (upserts
+            // the metadata row). An existing attribution is left untouched.
+            backend.set_session_agent_alias(&session_key, &agent_alias)?;
+        }
+        backend.clear_messages(&session_key)?;
+        for (role, content) in &turns {
+            backend.append(
+                &session_key,
+                &zeroclaw_providers::ChatMessage {
+                    role: role.clone(),
+                    content: content.clone(),
+                },
+            )?;
+        }
+        backend.set_session_state(&session_key, "idle", None)?;
+        Ok(())
+    };
+    match replace() {
+        Ok(()) => {
+            crate::session_events::emit_session_event_from_backend(
+                &state,
+                crate::session_events::SessionEventKind::Update,
+                &session_key,
+            );
+            Json(serde_json::json!({
+                "ok": true,
+                "session_key": session_key,
+                "messages": turns.len(),
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to backfill transcript: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
 // Shared test helper: `api_config` tests reuse this AppState builder for the
 // agent rename/delete cascade handlers/coverage).
 
@@ -4343,6 +4516,206 @@ pub(crate) mod tests {
             backend.list_sessions().is_empty(),
             "rejected requests must keep the store clean"
         );
+    }
+
+    // ── Claude Code transcript backfill router tests ──────────────────
+
+    /// Mirrors production wiring: the transcript route rides its own
+    /// sub-router with a streaming body limit (see `run_gateway`).
+    fn transcript_app(state: AppState) -> axum::Router {
+        axum::Router::new()
+            .route(
+                "/hooks/claude-code/transcript",
+                axum::routing::post(handle_claude_code_transcript),
+            )
+            .with_state(state)
+            .layer(tower_http::limit::RequestBodyLimitLayer::new(
+                CLAUDE_CODE_TRANSCRIPT_MAX_BODY_BYTES,
+            ))
+    }
+
+    fn transcript_request(
+        uri: &str,
+        secret: Option<&str>,
+        body: String,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut builder = axum::http::Request::builder().method("POST").uri(uri);
+        if let Some(secret) = secret {
+            builder = builder.header(CLAUDE_CODE_HOOK_SECRET_HEADER, secret);
+        }
+        builder.body(axum::body::Body::from(body)).unwrap()
+    }
+
+    /// Transcript JSONL fixture: string content, block-list content, a
+    /// local-command echo, a command-name echo, an empty text, and a
+    /// non-turn line type — only the first two survive parsing.
+    fn transcript_fixture() -> String {
+        [
+            r#"{"type":"user","message":{"role":"user","content":"please fix the updater"}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Looking at the"},{"type":"tool_use","id":"t1","name":"Bash","input":{}},{"type":"text","text":"updater tests now."}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>ok</local-command-stdout>"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"<command-name>/clear</command-name>"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"   "}}"#,
+            r#"{"type":"progress","message":{"role":"user","content":"nope"}}"#,
+            "not json at all",
+        ]
+        .join("\n")
+    }
+
+    #[tokio::test]
+    async fn claude_transcript_parses_fixture_into_turns() {
+        use tower::ServiceExt as _;
+
+        let (_tmp, state, backend) = claude_hook_state();
+        let response = transcript_app(state)
+            .oneshot(transcript_request(
+                "/hooks/claude-code/transcript?session=sess-7&agent=test-agent",
+                Some(TEST_HOOK_SECRET),
+                transcript_fixture(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["session_key"], "cc_sess-7");
+        assert_eq!(json["messages"], 2);
+
+        let messages = backend.load("cc_sess-7");
+        assert_eq!(messages.len(), 2, "only real user/assistant turns persist");
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "please fix the updater");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(
+            messages[1].content, "Looking at the\nupdater tests now.",
+            "text blocks join; tool_use blocks drop"
+        );
+        assert_eq!(
+            backend
+                .get_session_agent_alias("cc_sess-7")
+                .unwrap()
+                .as_deref(),
+            Some("test-agent"),
+            "fresh key gets stamped with the validated alias"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_transcript_replaces_live_rows_and_keeps_metadata() {
+        use tower::ServiceExt as _;
+
+        let (_tmp, state, backend) = claude_hook_state();
+        // Sparse live rows from hook ingestion, plus metadata to survive.
+        backend
+            .set_session_agent_alias("cc_sess-8", "test-agent")
+            .unwrap();
+        backend
+            .set_session_name("cc_sess-8", "cc:zeroclaw")
+            .unwrap();
+        backend
+            .append(
+                "cc_sess-8",
+                &zeroclaw_providers::ChatMessage::user("sparse live prompt"),
+            )
+            .unwrap();
+        backend
+            .append(
+                "cc_sess-8",
+                &zeroclaw_providers::ChatMessage::tool("Bash: cargo test"),
+            )
+            .unwrap();
+        backend
+            .set_session_state("cc_sess-8", "running", None)
+            .unwrap();
+        let mut rx = state.event_tx.subscribe();
+
+        let response = transcript_app(state)
+            .oneshot(transcript_request(
+                "/hooks/claude-code/transcript?session=sess-8&agent=test-agent",
+                Some(TEST_HOOK_SECRET),
+                transcript_fixture(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let messages = backend.load("cc_sess-8");
+        assert_eq!(messages.len(), 2, "live rows are fully replaced");
+        assert_eq!(messages[0].content, "please fix the updater");
+
+        // clear_messages keeps the metadata row: name and alias survive.
+        let meta = backend
+            .get_session_metadata("cc_sess-8")
+            .expect("metadata row survives replacement");
+        assert_eq!(meta.name.as_deref(), Some("cc:zeroclaw"));
+        assert_eq!(meta.agent_alias.as_deref(), Some("test-agent"));
+
+        let session_state = backend
+            .get_session_state("cc_sess-8")
+            .unwrap()
+            .expect("state row");
+        assert_eq!(session_state.state, "idle");
+
+        let event = rx.try_recv().expect("one session_update broadcast");
+        assert_eq!(event["type"], "session_update");
+        assert_eq!(event["session_key"], "cc_sess-8");
+        assert!(
+            rx.try_recv().is_err(),
+            "backfill emits exactly one lifecycle frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_transcript_auth_gates() {
+        use tower::ServiceExt as _;
+
+        // Secret configured, header missing/wrong → 401.
+        let (_tmp, state, backend) = claude_hook_state();
+        for secret in [None, Some("wrong-secret")] {
+            let response = transcript_app(state.clone())
+                .oneshot(transcript_request(
+                    "/hooks/claude-code/transcript?session=sess-1&agent=test-agent",
+                    secret,
+                    transcript_fixture(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        assert!(backend.list_sessions().is_empty());
+
+        // No secret configured → ingestion disabled, endpoint answers 404.
+        let (_tmp2, mut state, backend) = claude_hook_state();
+        state.claude_code_hook_secret_hash = None;
+        let response = transcript_app(state)
+            .oneshot(transcript_request(
+                "/hooks/claude-code/transcript?session=sess-1&agent=test-agent",
+                Some(TEST_HOOK_SECRET),
+                transcript_fixture(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(backend.list_sessions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn claude_transcript_oversized_body_answers_413() {
+        use tower::ServiceExt as _;
+
+        let (_tmp, state, backend) = claude_hook_state();
+        let oversized = "x".repeat(CLAUDE_CODE_TRANSCRIPT_MAX_BODY_BYTES + 1);
+        let response = transcript_app(state)
+            .oneshot(transcript_request(
+                "/hooks/claude-code/transcript?session=sess-1&agent=test-agent",
+                Some(TEST_HOOK_SECRET),
+                oversized,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(backend.list_sessions().is_empty());
     }
 
     /// Seed three attributed sessions: one stamped for the caller's device,
