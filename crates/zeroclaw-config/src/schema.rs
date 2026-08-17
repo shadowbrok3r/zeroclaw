@@ -9032,6 +9032,7 @@ pub struct ClaudeCodeConfig {
     /// keeps the plaintext in state. When unset the endpoint stays log-only.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub hook_secret: Option<String>,
 }
