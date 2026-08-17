@@ -465,6 +465,51 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(count)
     }
 
+    fn cleanup_stale_scoped(
+        &self,
+        ttl_hours: u64,
+        scope: crate::session_backend::SessionCleanupScope,
+    ) -> std::io::Result<usize> {
+        let conn = self.conn.lock();
+        let ttl = i64::try_from(ttl_hours).unwrap_or(i64::MAX);
+        let cutoff = (Utc::now() - Duration::hours(ttl)).to_rfc3339();
+
+        // Scope predicate keys off the one metadata field each family owns:
+        // gateway keys carry the `gw_` prefix, channel rows a `channel_id`.
+        // RPC chat sessions (`rpc_`, no channel_id) match neither scope.
+        let scope_predicate = match scope {
+            crate::session_backend::SessionCleanupScope::Gateway => {
+                r"session_key LIKE 'gw\_%' ESCAPE '\'"
+            }
+            crate::session_backend::SessionCleanupScope::Channel => "channel_id IS NOT NULL",
+        };
+
+        let stale_keys: Vec<String> = {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT session_key FROM session_metadata \
+                     WHERE last_activity < ?1 AND {scope_predicate}"
+                ))
+                .map_err(std::io::Error::other)?;
+            let rows = stmt
+                .query_map(params![cutoff], |row| row.get(0))
+                .map_err(std::io::Error::other)?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        let count = stale_keys.len();
+        for key in &stale_keys {
+            // FTS rows are removed by the sessions_ad delete trigger.
+            let _ = conn.execute("DELETE FROM sessions WHERE session_key = ?1", params![key]);
+            let _ = conn.execute(
+                "DELETE FROM session_metadata WHERE session_key = ?1",
+                params![key],
+            );
+        }
+
+        Ok(count)
+    }
+
     fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
         let conn = self.conn.lock();
 
@@ -1068,6 +1113,89 @@ mod tests {
         let sessions = backend.list_sessions();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0], "new_session");
+    }
+
+    /// Seed one message + a metadata row whose `last_activity` is `age_hours`
+    /// in the past, optionally attributed to a channel.
+    fn seed_aged_session(
+        backend: &SqliteSessionBackend,
+        key: &str,
+        age_hours: i64,
+        channel_id: Option<&str>,
+    ) {
+        let conn = backend.conn.lock();
+        let stamp = (Utc::now() - Duration::hours(age_hours)).to_rfc3339();
+        conn.execute(
+            "INSERT INTO sessions (session_key, role, content, created_at) VALUES (?1, 'user', 'x', ?2)",
+            params![key, stamp],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, channel_id) \
+             VALUES (?1, ?2, ?3, 1, ?4)",
+            params![key, stamp, stamp, channel_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cleanup_stale_scoped_gateway_only_touches_gw_rows() {
+        use crate::session_backend::SessionCleanupScope;
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        seed_aged_session(&backend, "gw_stale", 100, None);
+        seed_aged_session(&backend, "gw_fresh", 1, None);
+        seed_aged_session(&backend, "discord.clamps_room_alice", 100, Some("discord.clamps"));
+        seed_aged_session(&backend, "rpc_stale", 100, None);
+
+        let cleaned = backend
+            .cleanup_stale_scoped(48, SessionCleanupScope::Gateway)
+            .unwrap();
+        assert_eq!(cleaned, 1, "only the stale gw_ row is swept");
+
+        assert!(!backend.session_exists("gw_stale"));
+        assert!(backend.session_exists("gw_fresh"), "fresh gw_ row survives");
+        assert!(
+            backend.session_exists("discord.clamps_room_alice"),
+            "channel rows are outside the gateway scope"
+        );
+        assert!(
+            backend.session_exists("rpc_stale"),
+            "rpc_ rows have no TTL owner and must survive"
+        );
+        assert!(backend.load("gw_stale").is_empty(), "messages deleted too");
+    }
+
+    #[test]
+    fn cleanup_stale_scoped_channel_only_touches_channel_rows() {
+        use crate::session_backend::SessionCleanupScope;
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        seed_aged_session(&backend, "gw_stale", 100, None);
+        seed_aged_session(&backend, "discord.clamps_room_alice", 100, Some("discord.clamps"));
+        seed_aged_session(&backend, "telegram.main_chat_bob", 1, Some("telegram.main"));
+        seed_aged_session(&backend, "rpc_stale", 100, None);
+
+        let cleaned = backend
+            .cleanup_stale_scoped(48, SessionCleanupScope::Channel)
+            .unwrap();
+        assert_eq!(cleaned, 1, "only the stale channel row is swept");
+
+        assert!(!backend.session_exists("discord.clamps_room_alice"));
+        assert!(
+            backend.session_exists("telegram.main_chat_bob"),
+            "fresh channel row survives"
+        );
+        assert!(
+            backend.session_exists("gw_stale"),
+            "gateway rows are outside the channel scope"
+        );
+        assert!(
+            backend.session_exists("rpc_stale"),
+            "rpc_ rows have no TTL owner and must survive"
+        );
     }
 
     #[test]

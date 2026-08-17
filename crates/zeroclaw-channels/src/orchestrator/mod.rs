@@ -10477,6 +10477,54 @@ pub async fn start_channels(
             None
         };
 
+    if config.channels.session_ttl_hours > 0
+        && let Some(ref store) = shared_session_store
+    {
+        // Hourly channel-scoped TTL sweep (rows with a channel_id). Gateway
+        // `gw_` rows are swept by the gateway's own sweep; RPC sessions are
+        // never TTL'd here. The interval's first tick completes immediately,
+        // so a startup sweep runs before the hourly cadence.
+        let ttl_hours = u64::from(config.channels.session_ttl_hours);
+        let sweep_backend = Arc::clone(store);
+        zeroclaw_spawn::spawn!(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                match sweep_backend.cleanup_stale_scoped(
+                    ttl_hours,
+                    zeroclaw_infra::session_backend::SessionCleanupScope::Channel,
+                ) {
+                    Ok(cleaned) => {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "cleaned": cleaned,
+                                "ttl_hours": ttl_hours,
+                            })),
+                            "Channel session TTL sweep completed"
+                        );
+                    }
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                            "Channel session TTL sweep failed"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     let mut channels_by_name_shared: Option<Arc<HashMap<String, Arc<dyn Channel>>>> = None;
     let mut collected_channel_keys: Vec<String> = Vec::new();
     let mut max_in_flight_messages: Option<usize> = None;

@@ -1224,17 +1224,6 @@ pub async fn run_gateway(
                         config.channels.session_backend
                     )
                 );
-                if config.gateway.session_ttl_hours > 0
-                    && let Ok(cleaned) = backend.cleanup_stale(config.gateway.session_ttl_hours)
-                    && cleaned > 0
-                {
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"cleaned": cleaned})),
-                        "Cleaned up stale gateway sessions"
-                    );
-                }
                 Some(backend)
             }
             Err(e) => {
@@ -1251,6 +1240,55 @@ pub async fn run_gateway(
     } else {
         None
     };
+
+    if config.gateway.session_ttl_hours > 0
+        && let Some(ref backend) = session_backend
+    {
+        // Hourly gateway-scoped TTL sweep. Scoped to `gw_` rows: channel
+        // sessions are swept by their own subsystem
+        // (channels.session_ttl_hours), RPC sessions are never TTL'd here.
+        // The interval's first tick completes immediately, preserving the
+        // previous startup sweep.
+        let ttl_hours = u64::from(config.gateway.session_ttl_hours);
+        let sweep_backend = Arc::clone(backend);
+        zeroclaw_spawn::spawn!(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                match sweep_backend.cleanup_stale_scoped(
+                    ttl_hours,
+                    zeroclaw_infra::session_backend::SessionCleanupScope::Gateway,
+                ) {
+                    Ok(cleaned) => {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "cleaned": cleaned,
+                                "ttl_hours": ttl_hours,
+                            })),
+                            "Gateway session TTL sweep completed"
+                        );
+                    }
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                            "Gateway session TTL sweep failed"
+                        );
+                    }
+                }
+            }
+        });
+    }
 
     // ── Pairing guard ──────────────────────────────────────
     let pairing = Arc::new(PairingGuard::new(

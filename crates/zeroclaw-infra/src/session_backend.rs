@@ -56,6 +56,18 @@ pub struct SessionQuery {
     pub limit: Option<usize>,
 }
 
+/// Which session family a scoped TTL sweep may delete from. Sweeps are
+/// owned per subsystem (gateway vs. channel orchestrator), so each scope
+/// must never touch the other family's rows — nor RPC chat sessions,
+/// which have no TTL owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCleanupScope {
+    /// Gateway WebSocket sessions (`gw_`-prefixed keys).
+    Gateway,
+    /// Channel-driven sessions (rows with a recorded `channel_id`).
+    Channel,
+}
+
 /// One persisted message with the optional `created_at` the backend
 /// stamped on it. JSONL / in-memory backends return `None`; SQLite
 /// returns the row's `created_at` column.
@@ -131,6 +143,16 @@ pub trait SessionBackend: Send + Sync {
 
     /// Remove sessions that haven't been active within the given TTL hours.
     fn cleanup_stale(&self, _ttl_hours: u32) -> std::io::Result<usize> {
+        Ok(0)
+    }
+
+    /// Remove stale sessions belonging to one [`SessionCleanupScope`] only.
+    /// Backends without per-family metadata (JSONL) skip the sweep entirely.
+    fn cleanup_stale_scoped(
+        &self,
+        _ttl_hours: u64,
+        _scope: SessionCleanupScope,
+    ) -> std::io::Result<usize> {
         Ok(0)
     }
 

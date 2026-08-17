@@ -6849,7 +6849,10 @@ pub struct GatewayConfig {
     #[serde(default = "default_true")]
     pub session_persistence: bool,
 
-    /// Auto-archive stale gateway sessions older than N hours. 0 = disabled. Default: 0.
+    /// Delete stale gateway (`gw_`) sessions whose last activity is older
+    /// than N hours. The gateway sweeps hourly (plus once at startup) and
+    /// removes matching rows permanently; channel and RPC sessions are not
+    /// touched. 0 = disabled. Default: 0.
     #[serde(default)]
     pub session_ttl_hours: u32,
 
@@ -13245,7 +13248,11 @@ pub struct ChannelsConfig {
     /// SQLite provides FTS5 search, metadata tracking, and TTL cleanup.
     #[serde(default = "default_session_backend")]
     pub session_backend: String,
-    /// Auto-archive stale sessions older than this many hours. `0` disables. Default: `0`.
+    /// Delete stale channel sessions (rows attributed to a channel) whose
+    /// last activity is older than this many hours. The channel orchestrator
+    /// sweeps hourly (plus once at startup) and removes matching rows
+    /// permanently; gateway and RPC sessions are not touched. `0` disables.
+    /// Default: `0`.
     #[serde(default)]
     pub session_ttl_hours: u32,
     /// Inbound message debounce window in milliseconds. When a sender fires
