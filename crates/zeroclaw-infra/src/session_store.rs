@@ -176,6 +176,7 @@ impl SessionBackend for SessionStore {
                     channel_id: None,
                     room_id: None,
                     sender_id: None,
+                    origin_principal: None,
                 }
             })
             .collect()

@@ -1673,10 +1673,30 @@ pub async fn handle_api_sessions_list(
     // or a channel_id that resolves to an owning agent).
     // Pre-migration rows with neither set are skipped as orphans.
     let config = state.config.read().clone();
+    // Opt-in device scoping: hide sessions another device created. Rows with
+    // no origin principal (pre-stamping, or created over an unauthenticated
+    // transport) stay visible to every caller. The principal uses the same
+    // token hash ws.rs derives via `PairingGuard::authenticate_and_hash`.
+    let scope_to_device = config.gateway.scope_sessions_to_device;
+    let caller_principal = extract_bearer_token(&headers)
+        .filter(|token| !token.is_empty())
+        .map(|token| {
+            format!(
+                "device:{}",
+                zeroclaw_runtime::security::pairing::PairingGuard::token_hash(token)
+            )
+        });
     let all_metadata = backend.list_sessions_with_metadata();
     let sessions: Vec<serde_json::Value> = all_metadata
         .into_iter()
         .filter(|meta| meta.agent_alias.is_some() || meta.channel_id.is_some())
+        .filter(|meta| {
+            !scope_to_device
+                || match meta.origin_principal.as_deref() {
+                    None => true,
+                    Some(owner) => caller_principal.as_deref() == Some(owner),
+                }
+        })
         .map(|meta| {
             // Resolve owning agent: prefer the stamped alias, otherwise
             // reverse-look-up via channel_id (= `<type>.<alias>`) against
@@ -1902,8 +1922,7 @@ pub async fn handle_api_session_delete(
 
     // Capture metadata before the row is gone so the closed frame can still
     // carry alias/name/count.
-    let closed_fields =
-        crate::session_events::fields_from_backend(backend.as_ref(), &session_key);
+    let closed_fields = crate::session_events::fields_from_backend(backend.as_ref(), &session_key);
 
     match backend.delete_session(&session_key) {
         Ok(true) => {
@@ -3492,7 +3511,10 @@ pub(crate) mod tests {
 
     fn sessions_app(state: AppState) -> axum::Router {
         axum::Router::new()
-            .route("/api/sessions", axum::routing::get(handle_api_sessions_list))
+            .route(
+                "/api/sessions",
+                axum::routing::get(handle_api_sessions_list),
+            )
             .route(
                 "/api/sessions/{id}/messages",
                 axum::routing::get(handle_api_session_messages)
@@ -3500,8 +3522,7 @@ pub(crate) mod tests {
             )
             .route(
                 "/api/sessions/{id}",
-                axum::routing::delete(handle_api_session_delete)
-                    .put(handle_api_session_rename),
+                axum::routing::delete(handle_api_session_delete).put(handle_api_session_rename),
             )
             .route(
                 "/api/sessions/{id}/state",
@@ -3525,7 +3546,11 @@ pub(crate) mod tests {
         (tmp, state, backend)
     }
 
-    fn json_request(method: &str, uri: &str, body: serde_json::Value) -> axum::http::Request<axum::body::Body> {
+    fn json_request(
+        method: &str,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> axum::http::Request<axum::body::Body> {
         axum::http::Request::builder()
             .method(method)
             .uri(uri)
@@ -3693,6 +3718,98 @@ pub(crate) mod tests {
         assert_eq!(event["session_id"], "op-2");
         assert_eq!(event["message_count"], 1);
         assert!(event.get("content").is_none());
+    }
+
+    /// Seed three attributed sessions: one stamped for the caller's device,
+    /// one for a different device, one with no origin principal.
+    fn seed_device_scoped_sessions(backend: &Arc<dyn SessionBackend>, caller_token: &str) {
+        let mine = format!("device:{}", PairingGuard::token_hash(caller_token));
+        let theirs = format!("device:{}", PairingGuard::token_hash("other-device-token"));
+        for (key, principal) in [
+            ("gw_mine", Some(mine.as_str())),
+            ("gw_theirs", Some(theirs.as_str())),
+            ("gw_shared", None),
+        ] {
+            backend
+                .append(key, &zeroclaw_providers::ChatMessage::user("hi"))
+                .unwrap();
+            backend.set_session_agent_alias(key, "test-agent").unwrap();
+            if let Some(principal) = principal {
+                backend
+                    .set_session_origin_principal(key, principal)
+                    .unwrap();
+            }
+        }
+    }
+
+    fn listed_session_keys(json: &serde_json::Value) -> Vec<String> {
+        json["sessions"]
+            .as_array()
+            .expect("sessions array")
+            .iter()
+            .map(|s| s["session_key"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn sessions_list_shows_all_devices_when_scoping_disabled() {
+        use tower::ServiceExt as _;
+
+        let (_tmp, mut state, backend) = sqlite_session_state();
+        state.pairing = Arc::new(PairingGuard::new(true, &["caller-token".into()]));
+        seed_device_scoped_sessions(&backend, "caller-token");
+
+        let response = sessions_app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/sessions")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer caller-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let mut keys = listed_session_keys(&json);
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["gw_mine", "gw_shared", "gw_theirs"],
+            "default (scoping off) preserves the shared-session behavior"
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_list_filters_to_caller_device_when_scoped() {
+        use tower::ServiceExt as _;
+
+        let (_tmp, mut state, backend) = sqlite_session_state();
+        state.pairing = Arc::new(PairingGuard::new(true, &["caller-token".into()]));
+        state.config.write().gateway.scope_sessions_to_device = true;
+        seed_device_scoped_sessions(&backend, "caller-token");
+
+        let response = sessions_app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/sessions")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer caller-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let mut keys = listed_session_keys(&json);
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["gw_mine", "gw_shared"],
+            "scoped listing shows only the caller's and unstamped sessions"
+        );
     }
 
     #[tokio::test]

@@ -83,6 +83,11 @@ pub struct WsQuery {
     pub cwd: Option<String>,
     #[serde(default, alias = "workspaceDir", alias = "workspace_dir")]
     pub workspace_dir: Option<String>,
+    /// `?adopt=true`: explicitly re-attribute an existing session to the
+    /// connecting agent instead of refusing when the stored agent alias
+    /// differs. Never overrides the device-scoping guard.
+    #[serde(default)]
+    pub adopt: Option<bool>,
 }
 
 fn extract_ws_token<'a>(headers: &'a HeaderMap, query_token: Option<&'a str>) -> Option<&'a str> {
@@ -185,6 +190,7 @@ pub async fn handle_ws_chat(
     let session_id = params.session_id;
     let session_name = params.name;
     let session_cwd = params.cwd.or(params.workspace_dir);
+    let adopt = params.adopt.unwrap_or(false);
     ws.on_upgrade(move |socket| {
         handle_socket(
             socket,
@@ -194,6 +200,7 @@ pub async fn handle_ws_chat(
             session_name,
             session_cwd,
             auth_subject,
+            adopt,
         )
     })
     .into_response()
@@ -312,6 +319,7 @@ where
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_socket(
     socket: WebSocket,
     state: AppState,
@@ -323,6 +331,8 @@ async fn handle_socket(
     // connection was authenticated. Threaded to SOP approval frames so a policied
     // gate can be satisfied by an identified WS caller.
     auth_subject: Option<String>,
+    // `?adopt=true`: explicit re-attribution of an agent-owned session.
+    adopt: bool,
 ) {
     let (mut sender, mut receiver) = socket.split();
 
@@ -363,6 +373,41 @@ async fn handle_socket(
             stored_messages = messages;
             resumed = true;
         }
+
+        // ── Resume guards ─────────────────────────────────────────
+        // Refuse before touching the row (naming, stamping) so a refused
+        // connect cannot mutate a session it does not own.
+        let existing_meta = backend.get_session_metadata(&session_key);
+        let existing_alias = existing_meta
+            .as_ref()
+            .and_then(|m| m.agent_alias.as_deref());
+        let caller_principal = auth_subject.as_deref().map(|hash| format!("device:{hash}"));
+        if let Some(refusal) = resume_refusal_frame(
+            existing_alias,
+            &agent_alias,
+            adopt,
+            config.gateway.scope_sessions_to_device,
+            existing_meta
+                .as_ref()
+                .and_then(|m| m.origin_principal.as_deref()),
+            caller_principal.as_deref(),
+        ) {
+            let _ = sender.send(Message::Text(refusal.to_string().into())).await;
+            return;
+        }
+        if adopt && existing_alias.is_some_and(|existing| existing != agent_alias) {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "session_key": &session_key,
+                        "previous_agent": existing_alias,
+                        "new_agent": &agent_alias,
+                    })),
+                "session re-attributed via adopt=true"
+            );
+        }
+
         // Set session name if provided (non-empty) on connect
         if let Some(ref name) = session_name
             && !name.is_empty()
@@ -377,6 +422,13 @@ async fn handle_socket(
         // Stamp the agent alias so future /api/sessions queries and
         // per-agent filters can attribute this session to its agent.
         let _ = backend.set_session_agent_alias(&session_key, &agent_alias);
+
+        // Stamp the origin principal (first-writer wins in the backend) so
+        // opt-in device scoping can attribute the session to this device.
+        // Skipped when pairing is disabled: there is no token identity.
+        if let Some(ref principal) = caller_principal {
+            let _ = backend.set_session_origin_principal(&session_key, principal);
+        }
 
         // Announce the session on the public event bus: resuming an existing
         // transcript is an update, a fresh key is a creation.
@@ -928,6 +980,43 @@ fn needs_onboarding_ws_error(
         "message": crate::needs_quickstart_channel_reply(),
         "url": "/onboard",
     }))
+}
+
+/// Decide whether a WS connect may resume / claim an existing session.
+/// Returns the error frame to send before closing when the resume must be
+/// refused; `None` when the connect may proceed (fresh sessions included).
+fn resume_refusal_frame(
+    existing_alias: Option<&str>,
+    requested_alias: &str,
+    adopt: bool,
+    scope_to_device: bool,
+    existing_principal: Option<&str>,
+    caller_principal: Option<&str>,
+) -> Option<serde_json::Value> {
+    // Device scoping (opt-in): a session stamped by another device can never
+    // be resumed here — `adopt` does not override the device boundary.
+    if scope_to_device
+        && let Some(owner) = existing_principal
+        && caller_principal != Some(owner)
+    {
+        return Some(serde_json::json!({
+            "type": "error",
+            "error": "session_owned_by_other_device",
+        }));
+    }
+    // Agent ownership (always on): refuse silent re-attribution unless the
+    // client explicitly asked for it with `?adopt=true`.
+    if let Some(existing) = existing_alias
+        && existing != requested_alias
+        && !adopt
+    {
+        return Some(serde_json::json!({
+            "type": "error",
+            "error": "session_owned_by_other_agent",
+            "owning_agent": existing,
+        }));
+    }
+    None
 }
 
 fn event_matches_session(event: &serde_json::Value, session_id: &str) -> bool {
@@ -1575,6 +1664,90 @@ async fn process_chat_message(
 mod tests {
     use super::*;
     use axum::http::HeaderMap;
+
+    // ── Resume guards ─────────────────────────────────────────────
+
+    #[test]
+    fn resume_guard_allows_fresh_and_same_agent_sessions() {
+        // Fresh session (no stored alias) and matching alias both proceed,
+        // with and without device scoping.
+        for scoped in [false, true] {
+            assert!(resume_refusal_frame(None, "a", false, scoped, None, None).is_none());
+            assert!(resume_refusal_frame(Some("a"), "a", false, scoped, None, None).is_none());
+        }
+    }
+
+    #[test]
+    fn resume_guard_refuses_agent_mismatch_without_adopt() {
+        let frame = resume_refusal_frame(Some("owner"), "intruder", false, false, None, None)
+            .expect("mismatched alias must refuse");
+        assert_eq!(frame["type"], "error");
+        assert_eq!(frame["error"], "session_owned_by_other_agent");
+        assert_eq!(frame["owning_agent"], "owner");
+    }
+
+    #[test]
+    fn resume_guard_allows_agent_mismatch_with_adopt() {
+        assert!(
+            resume_refusal_frame(Some("owner"), "new-owner", true, false, None, None).is_none(),
+            "?adopt=true must permit explicit re-attribution"
+        );
+    }
+
+    #[test]
+    fn resume_guard_refuses_other_device_when_scoped_even_with_adopt() {
+        let frame = resume_refusal_frame(
+            Some("a"),
+            "a",
+            true,
+            true,
+            Some("device:owner-hash"),
+            Some("device:caller-hash"),
+        )
+        .expect("device mismatch must refuse under scoping");
+        assert_eq!(frame["error"], "session_owned_by_other_device");
+        assert!(
+            frame.get("owning_agent").is_none(),
+            "device refusal must not leak the owner principal"
+        );
+
+        // No caller identity (pairing disabled) also fails closed.
+        let frame = resume_refusal_frame(None, "a", false, true, Some("device:owner-hash"), None)
+            .expect("anonymous caller cannot resume a stamped session");
+        assert_eq!(frame["error"], "session_owned_by_other_device");
+    }
+
+    #[test]
+    fn resume_guard_ignores_device_principal_when_scoping_disabled() {
+        // Default behavior preserved: mismatched principals do not matter
+        // unless gateway.scope_sessions_to_device is enabled.
+        assert!(
+            resume_refusal_frame(
+                Some("a"),
+                "a",
+                false,
+                false,
+                Some("device:owner-hash"),
+                Some("device:caller-hash"),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn resume_guard_allows_matching_device_when_scoped() {
+        assert!(
+            resume_refusal_frame(
+                Some("a"),
+                "a",
+                false,
+                true,
+                Some("device:same-hash"),
+                Some("device:same-hash"),
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn ws_turn_has_a_single_channel_identity() {

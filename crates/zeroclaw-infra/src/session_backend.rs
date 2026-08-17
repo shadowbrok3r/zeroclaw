@@ -31,6 +31,12 @@ pub struct SessionMetadata {
     /// Inbound sender id verbatim (Discord username, phone number, ...).
     /// Not an FK — sessions can survive deletion of the upstream user.
     pub sender_id: Option<String>,
+    /// Principal that first touched the session over an authenticated
+    /// transport (`device:<sha256(bearer token)>`). First-writer wins;
+    /// never overwritten once set. `None` for sessions created before
+    /// stamping landed, unauthenticated transports, or backends that
+    /// don't track it.
+    pub origin_principal: Option<String>,
 }
 
 /// Structured routing context recorded alongside a session. Mirrors the
@@ -131,6 +137,7 @@ pub trait SessionBackend: Send + Sync {
                     channel_id: None,
                     room_id: None,
                     sender_id: None,
+                    origin_principal: None,
                 }
             })
             .collect()
@@ -216,6 +223,19 @@ pub trait SessionBackend: Send + Sync {
         Ok(None)
     }
 
+    /// Record the principal that created a session (e.g.
+    /// `device:<sha256(token)>`). First-writer wins: once a principal is
+    /// stored it is never overwritten. Backends create the metadata row if
+    /// the session has not persisted any messages yet. No-op for backends
+    /// that don't track it.
+    fn set_session_origin_principal(
+        &self,
+        _session_key: &str,
+        _principal: &str,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
     fn set_session_context(
         &self,
         _session_key: &str,
@@ -239,6 +259,7 @@ pub trait SessionBackend: Send + Sync {
             channel_id: None,
             room_id: None,
             sender_id: None,
+            origin_principal: None,
         })
     }
 
@@ -296,6 +317,7 @@ mod tests {
             channel_id: None,
             room_id: None,
             sender_id: None,
+            origin_principal: None,
         };
         assert_eq!(meta.key, "test");
         assert_eq!(meta.message_count, 5);
