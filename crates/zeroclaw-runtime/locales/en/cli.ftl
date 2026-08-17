@@ -1081,3 +1081,23 @@ sop-rpc-decision-invalid-state = Run {$run_id} cannot be resolved in its current
 sop-rpc-decision-unauthorized = The RPC principal is not authorized to resolve this SOP step.
 sop-rpc-policy-missing = SOP approval policy '{$name}' is not configured.
 sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
+
+# ── Sessions CLI — zeroclaw sessions {list,show,search,rename,delete} ──
+# Table column labels (data cells are not translated).
+cli-sessions-col-key = key
+cli-sessions-col-name = name
+cli-sessions-col-agent = agent
+cli-sessions-col-channel = channel
+cli-sessions-col-msgs = msgs
+cli-sessions-col-last-activity = last activity
+cli-sessions-none = (no sessions)
+cli-sessions-not-found = no session found for `{$id}` (tried `{$id}`, `gw_{$id}`, `rpc_{$id}`)
+cli-sessions-show-header = session {$key} — {$total} message(s), showing {$shown}
+cli-sessions-show-message = [{$role}] {$timestamp}
+cli-sessions-search-jsonl = search needs the sqlite session backend; the jsonl backend has no full-text index (0 results)
+cli-sessions-search-empty = no sessions match `{$keyword}`
+cli-sessions-renamed = renamed session {$key} → "{$name}"
+cli-sessions-delete-confirm = Delete session {$key} ({$count} message(s))? [y/N]
+cli-sessions-delete-aborted = aborted — no changes made
+cli-sessions-deleted = deleted session {$key}
+cli-sessions-delete-unsupported = the session backend reported nothing deleted for {$key} — it may not support delete

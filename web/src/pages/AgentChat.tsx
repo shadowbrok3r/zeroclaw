@@ -1,6 +1,6 @@
 import { memo, useState, useEffect, useRef, useCallback } from 'react';
 import { Link, Navigate, useParams } from 'react-router-dom';
-import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, BarChart2, ArrowDown, FolderOpen } from 'lucide-react';
+import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, BarChart2, ArrowDown, FolderOpen, History } from 'lucide-react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useAgent, type ChatMessage } from '@/contexts/AgentContext';
@@ -19,6 +19,7 @@ import ChatWorkspace from '@/pages/ChatWorkspace';
 
 import ToolCallCard from '@/components/ToolCallCard';
 import ApprovalBanner from '@/components/ApprovalBanner';
+import ThreadsPanel from '@/components/ThreadsPanel';
 
 const DRAFT_KEY_PREFIX = 'agent-chat';
 
@@ -122,6 +123,10 @@ export function AgentChatInner({
     respondToApproval,
     contextMaxTokens,
     contextInputTokens,
+    startNewThread,
+    sessionStart,
+    ownershipConflict,
+    adoptThread,
   } = useAgent();
 
   const { draft, saveDraft, clearDraft } = useDraft(`${DRAFT_KEY_PREFIX}.${agentAlias}`);
@@ -143,6 +148,9 @@ export function AgentChatInner({
   const [showToolActivity, setShowToolActivity] = useState(() => {
     try { return localStorage.getItem('zeroclaw_show_tool_activity') === '1'; } catch { return false; }
   });
+  // Threads panel (session browser for this agent). Mounted only while open so
+  // its SSE subscription and session fetch run only when the user is looking.
+  const [showThreads, setShowThreads] = useState(false);
 
   /** When false, new tokens/messages do not yank the viewport (same idea as Logs live view). */
   const [autoScroll, setAutoScroll] = useState(true);
@@ -216,9 +224,16 @@ export function AgentChatInner({
         return true;
 
       case 'clear':
-      case 'new':
         clearAllMessages();
         addLocalMessage(t('agent.cmd_cleared'));
+        return true;
+
+      case 'new':
+        // Unlike /clear (destructive delete-in-place), /new abandons the
+        // current thread locally and reconnects on a fresh session id. The old
+        // thread's server transcript stays browsable in the Threads panel.
+        startNewThread();
+        addLocalMessage(t('agent.cmd_new_thread'));
         return true;
 
       case 'model': {
@@ -265,7 +280,7 @@ export function AgentChatInner({
         addLocalMessage(t('agent.cmd_unknown').replace('{cmd}', `/${command}`));
         return true;
     }
-  }, [addLocalMessage, clearAllMessages, currentModel, availableModels, switchModel, modelLoading]);
+  }, [addLocalMessage, clearAllMessages, startNewThread, currentModel, availableModels, switchModel, modelLoading]);
 
   const handleSend = () => {
     const trimmed = input.trim();
@@ -442,6 +457,15 @@ export function AgentChatInner({
             <FolderOpen className="h-3.5 w-3.5" />
             {t('agentchat.files')}
           </Link>
+          <button
+            type="button"
+            onClick={() => setShowThreads(true)}
+            className="inline-flex items-center gap-1 px-2 h-6 rounded-[var(--radius-md)] text-xs font-medium text-pc-text-secondary transition-colors hover:text-pc-text hover:bg-[var(--pc-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
+            title={t('threads.title')}
+          >
+            <History className="h-3.5 w-3.5" />
+            {t('threads.title')}
+          </button>
         </div>
 
         <div className="relative" ref={modelDropdownRef}>
@@ -488,6 +512,41 @@ export function AgentChatInner({
         <div className="px-4 py-2 border-b border-status-error/20 bg-status-error/10 text-status-error flex items-center gap-2 text-sm animate-fade-in">
           <AlertCircle className="h-4 w-4 shrink-0" />
           {error}
+        </div>
+      )}
+
+      {/* Thread ownership conflict — the gateway refused to resume this
+          session because another agent or device owns it. Never auto-adopt:
+          an agent conflict offers an explicit "move thread here" action
+          beside the fresh-thread escape hatch; the device boundary cannot be
+          adopted, so that banner offers a fresh thread only. */}
+      {ownershipConflict && (
+        <div className="px-4 py-2 border-b border-status-warning/30 bg-status-warning/10 flex items-center gap-2 text-sm animate-fade-in">
+          <AlertCircle className="h-4 w-4 shrink-0 text-status-warning" />
+          <span className="flex-1 min-w-0 text-pc-text">
+            {ownershipConflict.kind === 'agent'
+              ? t('agent.session_owned_by_other').replace('{agent}', ownershipConflict.owningAgent)
+              : t('agent.session_owned_by_other_device')}
+          </span>
+          {ownershipConflict.kind === 'agent' && (
+            <Button variant="ghost" size="sm" onClick={adoptThread}>
+              {t('agent.adopt_thread')}
+            </Button>
+          )}
+          <Button variant="primary" size="sm" onClick={startNewThread}>
+            {t('agent.start_new_thread')}
+          </Button>
+        </div>
+      )}
+
+      {/* Resumed-thread indicator (from the gateway session_start frame). */}
+      {sessionStart?.resumed && (
+        <div
+          className="px-4 py-1 border-b text-[11px] flex items-center gap-1.5"
+          style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)', color: 'var(--pc-text-muted)' }}
+        >
+          <History className="h-3 w-3 shrink-0" />
+          {t('agent.resumed_thread').replace('{count}', String(sessionStart.messageCount))}
         </div>
       )}
 
@@ -604,6 +663,12 @@ export function AgentChatInner({
       {/* Tool approval banner — supervised-mode consent prompt (#6522). */}
       {pendingApproval && (
         <ApprovalBanner pending={pendingApproval} onRespond={respondToApproval} />
+      )}
+
+      {/* Threads panel — per-agent session browser (open/rename/delete chat
+          threads; read-only channel conversations). */}
+      {showThreads && (
+        <ThreadsPanel agentAlias={agentAlias} onClose={() => setShowThreads(false)} />
       )}
 
       {/* Input area */}

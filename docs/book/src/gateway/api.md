@@ -122,6 +122,32 @@ the page degrades gracefully and points you at the raw spec at
 `/api/openapi.json` so you can use any compatible viewer
 (Insomnia, Postman, Swagger UI, etc.).
 
+## Session endpoints
+
+The gateway exposes the unified session store (see
+[Session lifecycle](../architecture/session-lifecycle.md)) over REST. All
+endpoints require the pairing-derived bearer token.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/sessions` | List sessions with metadata (name, agent, channel, timestamps, message count). Rows attributable to no agent or channel are skipped. |
+| `GET` | `/api/sessions/{id}/messages` | Read the persisted transcript. |
+| `POST` | `/api/sessions/{id}/messages` | Send a message into the session and run a turn. |
+| `PUT` | `/api/sessions/{id}` | Rename the session. |
+| `DELETE` | `/api/sessions/{id}` | Delete the session's message rows and metadata. |
+| `GET` | `/api/sessions/{id}/state` | Per-turn state: `idle`, `running`, or `error`. |
+| `POST` | `/api/sessions/{id}/abort` | Abort the session's running turn. |
+| `GET` | `/api/sessions/running` | List sessions currently mid-turn. |
+
+`{id}` resolution is uniform across all verbs: the id is tried verbatim as a
+store key first, then as `gw_<id>`, then as `rpc_<id>`. Channel-composite and
+RPC sessions therefore get the same verb set as gateway WebSocket sessions.
+
+Session mutations also emit lifecycle frames on `/api/events` with
+`source: "sessions"` and `type` of `session_created`, `session_update`, or
+`session_closed`; the field contract is documented in
+[Session lifecycle](../architecture/session-lifecycle.md#session-lifecycle-sse-events).
+
 ## Event stream contract
 
 `GET /api/events` is a raw Server-Sent Events stream of observable runtime

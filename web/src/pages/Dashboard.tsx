@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import {
   Clock,
@@ -25,6 +25,9 @@ import {
   Search,
   Monitor,
   ArrowRight,
+  Pencil,
+  Check,
+  ExternalLink,
 } from "lucide-react";
 import type {
   StatusResponse,
@@ -43,6 +46,7 @@ import {
   getChannels,
   getSessionMessages,
   deleteSession,
+  renameSession,
   getMemory,
   storeMemory,
   deleteMemory,
@@ -163,6 +167,7 @@ import EntityLink from "@/components/EntityLink";
 import EntityEnabledToggle from "@/components/EntityEnabledToggle";
 import { useSSE } from "@/hooks/useSSE";
 import { usePolling } from "@/hooks/usePolling";
+import { setSessionId } from "@/lib/ws";
 import { t } from "@/lib/i18n";
 import { StatCard, PageHeader, ConfirmDialog } from "@/components/ui";
 
@@ -979,9 +984,20 @@ function SessionsTab() {
   const [deleting, setDeleting] = useState<string | null>(null);
   // The session queued for deletion; non-null opens the confirm dialog.
   const [pendingDelete, setPendingDelete] = useState<Session | null>(null);
+  const navigate = useNavigate();
+  // Inline rename: session_key being edited + its draft value.
+  const [renaming, setRenaming] = useState<{ key: string; value: string } | null>(
+    null,
+  );
+  const [renameSaving, setRenameSaving] = useState(false);
 
   const { events } = useSSE({
-    filterTypes: ["session_update", "session_created", "session_closed"],
+    filterTypes: [
+      "session_update",
+      "session_created",
+      "session_closed",
+      "agent_end",
+    ],
     autoConnect: true,
   });
 
@@ -1001,10 +1017,68 @@ function SessionsTab() {
     loadSessions();
   }, [loadSessions]);
 
+  // Session lifecycle frames refresh immediately. `agent_end` (fired for every
+  // completed turn, including channel-driven ones like Discord) is debounced so
+  // a burst of turns coalesces into one reload.
+  const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     if (events.length === 0) return;
+    const last = events[events.length - 1];
+    if (last?.type === "agent_end") {
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+      refreshTimerRef.current = setTimeout(() => {
+        refreshTimerRef.current = null;
+        loadSessions();
+      }, 2000);
+      return;
+    }
     loadSessions();
-  }, [events.length, loadSessions]);
+  }, [events.length, events, loadSessions]);
+
+  useEffect(
+    () => () => {
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+    },
+    [],
+  );
+
+  // Jump into the live chat on this session's thread: repoint the alias's
+  // stored thread id, then open the agent's chat page (its WebSocket connects
+  // with the repointed id). Only meaningful for gateway WS sessions (gw_ keys)
+  // with a known owning agent.
+  const openInChat = (session: Session) => {
+    if (!session.agent_alias) return;
+    setSessionId(session.agent_alias, session.session_id);
+    navigate(`/agent/${encodeURIComponent(session.agent_alias)}`);
+  };
+
+  const commitRename = async () => {
+    if (!renaming || renameSaving) return;
+    const { key, value } = renaming;
+    const trimmed = value.trim();
+    // Empty or unchanged input is a cancel, not a rename: the server rejects
+    // PUT {name: ''} with 400 "name is required", which would surface the
+    // error banner and leave the editor wedged open.
+    const currentName = sessions.find((s) => s.session_key === key)?.name ?? "";
+    if (!trimmed || trimmed === currentName) {
+      setRenaming(null);
+      return;
+    }
+    setRenameSaving(true);
+    try {
+      await renameSession(key, trimmed);
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.session_key === key ? { ...s, name: trimmed } : s,
+        ),
+      );
+      setRenaming(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRenameSaving(false);
+    }
+  };
 
   const knownAgents = useMemo(() => {
     const s = new Set<string>();
@@ -1250,9 +1324,41 @@ function SessionsTab() {
             >
               <div className="flex-1 min-w-0">
                 <div className="flex items-start gap-2 mb-1 flex-wrap">
+                  {renaming?.key === session.session_key ? (
+                    <input
+                      autoFocus
+                      value={renaming.value}
+                      onChange={(e) =>
+                        setRenaming({
+                          key: session.session_key,
+                          value: e.target.value,
+                        })
+                      }
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") void commitRename();
+                        if (e.key === "Escape") setRenaming(null);
+                      }}
+                      placeholder={t("dashboard.session_name_placeholder")}
+                      className="input-electric px-2 py-0.5 text-xs w-44"
+                      aria-label={t("dashboard.rename_session")}
+                    />
+                  ) : (
+                    session.name && (
+                      <span
+                        className="text-sm font-medium break-all"
+                        style={{ color: "var(--pc-text-primary)" }}
+                      >
+                        {session.name}
+                      </span>
+                    )
+                  )}
                   <span
                     className="text-sm font-medium font-mono break-all"
-                    style={{ color: "var(--pc-text-primary)" }}
+                    style={{
+                      color: session.name
+                        ? "var(--pc-text-muted)"
+                        : "var(--pc-text-primary)",
+                    }}
                   >
                     {session.session_id}
                   </span>
@@ -1297,6 +1403,56 @@ function SessionsTab() {
                 </div>
               </div>
               <div className="flex items-center gap-1 flex-shrink-0">
+                {session.session_key.startsWith("gw_") &&
+                  session.agent_alias && (
+                    <button
+                      type="button"
+                      onClick={() => openInChat(session)}
+                      className="p-1.5 rounded-lg hover:bg-[var(--pc-hover)]"
+                      title={t("dashboard.open_in_chat")}
+                      style={{ color: "var(--pc-accent)" }}
+                    >
+                      <ExternalLink className="h-4 w-4" />
+                    </button>
+                  )}
+                {renaming?.key === session.session_key ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => void commitRename()}
+                      disabled={renameSaving}
+                      className="p-1.5 rounded-lg hover:bg-[var(--pc-hover)] disabled:opacity-50"
+                      title={t("common.save")}
+                      style={{ color: "var(--color-status-success)" }}
+                    >
+                      <Check className="h-4 w-4" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setRenaming(null)}
+                      className="p-1.5 rounded-lg hover:bg-[var(--pc-hover)]"
+                      title={t("common.cancel")}
+                      style={{ color: "var(--pc-text-muted)" }}
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setRenaming({
+                        key: session.session_key,
+                        value: session.name ?? "",
+                      })
+                    }
+                    className="p-1.5 rounded-lg hover:bg-[var(--pc-hover)]"
+                    title={t("dashboard.rename_session")}
+                    style={{ color: "var(--pc-text-muted)" }}
+                  >
+                    <Pencil className="h-4 w-4" />
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => openInspect(session)}

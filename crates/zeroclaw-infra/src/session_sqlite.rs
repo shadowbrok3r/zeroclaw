@@ -137,6 +137,10 @@ impl SqliteSessionBackend {
                 "sender_id",
                 "ALTER TABLE session_metadata ADD COLUMN sender_id TEXT",
             ),
+            (
+                "origin_principal",
+                "ALTER TABLE session_metadata ADD COLUMN origin_principal TEXT",
+            ),
         ] {
             let present: bool = conn
                 .query_row(
@@ -393,7 +397,7 @@ impl SessionBackend for SqliteSessionBackend {
     fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(
-            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, origin_principal
              FROM session_metadata ORDER BY last_activity DESC",
         ) {
             Ok(s) => s,
@@ -410,6 +414,7 @@ impl SessionBackend for SqliteSessionBackend {
             let channel_id: Option<String> = row.get(6)?;
             let room_id: Option<String> = row.get(7)?;
             let sender_id: Option<String> = row.get(8)?;
+            let origin_principal: Option<String> = row.get(9)?;
 
             let created = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
@@ -429,6 +434,7 @@ impl SessionBackend for SqliteSessionBackend {
                 channel_id,
                 room_id,
                 sender_id,
+                origin_principal,
             })
         }) {
             Ok(r) => r,
@@ -455,6 +461,55 @@ impl SessionBackend for SqliteSessionBackend {
 
         let count = stale_keys.len();
         for key in &stale_keys {
+            let _ = conn.execute("DELETE FROM sessions WHERE session_key = ?1", params![key]);
+            let _ = conn.execute(
+                "DELETE FROM session_metadata WHERE session_key = ?1",
+                params![key],
+            );
+        }
+
+        Ok(count)
+    }
+
+    fn cleanup_stale_scoped(
+        &self,
+        ttl_hours: u64,
+        scope: crate::session_backend::SessionCleanupScope,
+    ) -> std::io::Result<usize> {
+        let conn = self.conn.lock();
+        let ttl = i64::try_from(ttl_hours).unwrap_or(i64::MAX);
+        let cutoff = (Utc::now() - Duration::hours(ttl)).to_rfc3339();
+
+        // Scope predicate keys off the one metadata field each family owns:
+        // gateway keys carry the `gw_` prefix, channel rows a `channel_id`.
+        // RPC chat sessions (`rpc_`, no channel_id) match neither scope.
+        let scope_predicate = match scope {
+            crate::session_backend::SessionCleanupScope::Gateway => {
+                r"session_key LIKE 'gw\_%' ESCAPE '\'"
+            }
+            crate::session_backend::SessionCleanupScope::Channel => "channel_id IS NOT NULL",
+        };
+
+        // Never sweep an in-flight session: a turn can outlive the TTL
+        // cutoff (last_activity is only bumped on message writes), and
+        // deleting the row mid-turn makes the persist guard drop the turn.
+        let stale_keys: Vec<String> = {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT session_key FROM session_metadata \
+                     WHERE last_activity < ?1 AND {scope_predicate} \
+                     AND COALESCE(state, 'idle') != 'running'"
+                ))
+                .map_err(std::io::Error::other)?;
+            let rows = stmt
+                .query_map(params![cutoff], |row| row.get(0))
+                .map_err(std::io::Error::other)?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        let count = stale_keys.len();
+        for key in &stale_keys {
+            // FTS rows are removed by the sessions_ad delete trigger.
             let _ = conn.execute("DELETE FROM sessions WHERE session_key = ?1", params![key]);
             let _ = conn.execute(
                 "DELETE FROM session_metadata WHERE session_key = ?1",
@@ -590,7 +645,7 @@ impl SessionBackend for SqliteSessionBackend {
     fn get_session_metadata(&self, session_key: &str) -> Option<SessionMetadata> {
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, origin_principal
              FROM session_metadata WHERE session_key = ?1",
             params![session_key],
             |row| {
@@ -603,6 +658,7 @@ impl SessionBackend for SqliteSessionBackend {
                 let channel_id: Option<String> = row.get(6)?;
                 let room_id: Option<String> = row.get(7)?;
                 let sender_id: Option<String> = row.get(8)?;
+                let origin_principal: Option<String> = row.get(9)?;
 
                 let created = DateTime::parse_from_rfc3339(&created_str)
                     .map(|dt| dt.with_timezone(&Utc))
@@ -622,10 +678,23 @@ impl SessionBackend for SqliteSessionBackend {
                     channel_id,
                     room_id,
                     sender_id,
+                    origin_principal,
                 })
             },
         )
         .ok()
+    }
+
+    fn touch_session(&self, session_key: &str) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        let now = Utc::now().to_rfc3339();
+        // Existing rows only: a touch must never create a session.
+        conn.execute(
+            "UPDATE session_metadata SET last_activity = ?1 WHERE session_key = ?2",
+            params![now, session_key],
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(())
     }
 
     fn set_session_state(
@@ -641,12 +710,33 @@ impl SessionBackend for SqliteSessionBackend {
         } else {
             None
         };
-        conn.execute(
-            "UPDATE session_metadata SET state = ?1, turn_id = ?2, turn_started_at = ?3
-             WHERE session_key = ?4",
-            params![state, turn_id, started_at, session_key],
-        )
-        .map_err(std::io::Error::other)?;
+        if state == "running" {
+            // Recreate the metadata row if it is missing (e.g. a TTL sweep
+            // removed it while the socket idled past the cutoff): the next
+            // turn's 'running' write restores the row so the persist guard
+            // no longer drops the turn. Deliberate mid-turn deletions are
+            // unaffected — their turns are already past this write.
+            conn.execute(
+                "INSERT INTO session_metadata
+                    (session_key, created_at, last_activity, message_count, state, turn_id, turn_started_at)
+                 VALUES (?1, ?2, ?2, 0, ?3, ?4, ?5)
+                 ON CONFLICT(session_key) DO UPDATE SET
+                    state = excluded.state,
+                    turn_id = excluded.turn_id,
+                    turn_started_at = excluded.turn_started_at,
+                    last_activity = excluded.last_activity",
+                params![session_key, now, state, turn_id, started_at],
+            )
+            .map_err(std::io::Error::other)?;
+        } else {
+            conn.execute(
+                "UPDATE session_metadata
+                 SET state = ?1, turn_id = ?2, turn_started_at = ?3, last_activity = ?4
+                 WHERE session_key = ?5",
+                params![state, turn_id, started_at, now, session_key],
+            )
+            .map_err(std::io::Error::other)?;
+        }
         Ok(())
     }
 
@@ -681,7 +771,7 @@ impl SessionBackend for SqliteSessionBackend {
     fn list_running_sessions(&self) -> Vec<SessionMetadata> {
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(
-            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, origin_principal
              FROM session_metadata WHERE state = 'running' ORDER BY turn_started_at DESC",
         ) {
             Ok(s) => s,
@@ -698,6 +788,7 @@ impl SessionBackend for SqliteSessionBackend {
             let channel_id: Option<String> = row.get(6)?;
             let room_id: Option<String> = row.get(7)?;
             let sender_id: Option<String> = row.get(8)?;
+            let origin_principal: Option<String> = row.get(9)?;
             let created = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
@@ -715,6 +806,7 @@ impl SessionBackend for SqliteSessionBackend {
                 channel_id,
                 room_id,
                 sender_id,
+                origin_principal,
             })
         }) {
             Ok(r) => r,
@@ -729,7 +821,7 @@ impl SessionBackend for SqliteSessionBackend {
         #[allow(clippy::cast_possible_wrap)]
         let cutoff = (Utc::now() - chrono::Duration::seconds(threshold_secs as i64)).to_rfc3339();
         let mut stmt = match conn.prepare(
-            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, origin_principal
              FROM session_metadata
              WHERE state = 'running' AND turn_started_at < ?1
              ORDER BY turn_started_at ASC",
@@ -748,6 +840,7 @@ impl SessionBackend for SqliteSessionBackend {
             let channel_id: Option<String> = row.get(6)?;
             let room_id: Option<String> = row.get(7)?;
             let sender_id: Option<String> = row.get(8)?;
+            let origin_principal: Option<String> = row.get(9)?;
             let created = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
@@ -765,6 +858,7 @@ impl SessionBackend for SqliteSessionBackend {
                 channel_id,
                 room_id,
                 sender_id,
+                origin_principal,
             })
         }) {
             Ok(r) => r,
@@ -810,7 +904,7 @@ impl SessionBackend for SqliteSessionBackend {
         keys.iter()
             .filter_map(|key| {
                 conn.query_row(
-                    "SELECT created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id FROM session_metadata WHERE session_key = ?1",
+                    "SELECT created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, origin_principal FROM session_metadata WHERE session_key = ?1",
                     params![key],
                     |row| {
                         let created_str: String = row.get(0)?;
@@ -821,6 +915,7 @@ impl SessionBackend for SqliteSessionBackend {
                         let channel_id: Option<String> = row.get(5)?;
                         let room_id: Option<String> = row.get(6)?;
                         let sender_id: Option<String> = row.get(7)?;
+                        let origin_principal: Option<String> = row.get(8)?;
                         Ok(SessionMetadata {
                             key: key.clone(),
                             name,
@@ -836,6 +931,7 @@ impl SessionBackend for SqliteSessionBackend {
                             channel_id,
                             room_id,
                             sender_id,
+                            origin_principal,
                         })
                     },
                 )
@@ -873,6 +969,30 @@ impl SessionBackend for SqliteSessionBackend {
             rusqlite::Error::QueryReturnedNoRows => Ok(None),
             other => Err(std::io::Error::other(other)),
         })
+    }
+
+    fn set_session_origin_principal(
+        &self,
+        session_key: &str,
+        principal: &str,
+    ) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        let principal_val = if principal.is_empty() {
+            None
+        } else {
+            Some(principal)
+        };
+        let now = Utc::now().to_rfc3339();
+        // First-writer wins: COALESCE keeps an already-stored principal.
+        conn.execute(
+            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, origin_principal)
+             VALUES (?1, ?2, ?3, 0, ?4)
+             ON CONFLICT(session_key) DO UPDATE SET
+                origin_principal = COALESCE(session_metadata.origin_principal, excluded.origin_principal)",
+            params![session_key, now, now, principal_val],
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(())
     }
 
     fn set_session_context(
@@ -1068,6 +1188,233 @@ mod tests {
         let sessions = backend.list_sessions();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0], "new_session");
+    }
+
+    /// Seed one message + a metadata row whose `last_activity` is `age_hours`
+    /// in the past, optionally attributed to a channel.
+    fn seed_aged_session(
+        backend: &SqliteSessionBackend,
+        key: &str,
+        age_hours: i64,
+        channel_id: Option<&str>,
+    ) {
+        let conn = backend.conn.lock();
+        let stamp = (Utc::now() - Duration::hours(age_hours)).to_rfc3339();
+        conn.execute(
+            "INSERT INTO sessions (session_key, role, content, created_at) VALUES (?1, 'user', 'x', ?2)",
+            params![key, stamp],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, channel_id) \
+             VALUES (?1, ?2, ?3, 1, ?4)",
+            params![key, stamp, stamp, channel_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cleanup_stale_scoped_gateway_only_touches_gw_rows() {
+        use crate::session_backend::SessionCleanupScope;
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        seed_aged_session(&backend, "gw_stale", 100, None);
+        seed_aged_session(&backend, "gw_fresh", 1, None);
+        seed_aged_session(
+            &backend,
+            "discord.clamps_room_alice",
+            100,
+            Some("discord.clamps"),
+        );
+        seed_aged_session(&backend, "rpc_stale", 100, None);
+
+        let cleaned = backend
+            .cleanup_stale_scoped(48, SessionCleanupScope::Gateway)
+            .unwrap();
+        assert_eq!(cleaned, 1, "only the stale gw_ row is swept");
+
+        assert!(!backend.session_exists("gw_stale"));
+        assert!(backend.session_exists("gw_fresh"), "fresh gw_ row survives");
+        assert!(
+            backend.session_exists("discord.clamps_room_alice"),
+            "channel rows are outside the gateway scope"
+        );
+        assert!(
+            backend.session_exists("rpc_stale"),
+            "rpc_ rows have no TTL owner and must survive"
+        );
+        assert!(backend.load("gw_stale").is_empty(), "messages deleted too");
+    }
+
+    #[test]
+    fn cleanup_stale_scoped_channel_only_touches_channel_rows() {
+        use crate::session_backend::SessionCleanupScope;
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        seed_aged_session(&backend, "gw_stale", 100, None);
+        seed_aged_session(
+            &backend,
+            "discord.clamps_room_alice",
+            100,
+            Some("discord.clamps"),
+        );
+        seed_aged_session(&backend, "telegram.main_chat_bob", 1, Some("telegram.main"));
+        seed_aged_session(&backend, "rpc_stale", 100, None);
+
+        let cleaned = backend
+            .cleanup_stale_scoped(48, SessionCleanupScope::Channel)
+            .unwrap();
+        assert_eq!(cleaned, 1, "only the stale channel row is swept");
+
+        assert!(!backend.session_exists("discord.clamps_room_alice"));
+        assert!(
+            backend.session_exists("telegram.main_chat_bob"),
+            "fresh channel row survives"
+        );
+        assert!(
+            backend.session_exists("gw_stale"),
+            "gateway rows are outside the channel scope"
+        );
+        assert!(
+            backend.session_exists("rpc_stale"),
+            "rpc_ rows have no TTL owner and must survive"
+        );
+    }
+
+    #[test]
+    fn cleanup_stale_scoped_skips_running_sessions() {
+        use crate::session_backend::SessionCleanupScope;
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        seed_aged_session(&backend, "gw_stale_running", 100, None);
+        seed_aged_session(&backend, "gw_stale_idle", 100, None);
+        backend
+            .set_session_state("gw_stale_running", "running", Some("turn-1"))
+            .unwrap();
+        // Re-age the row: the 'running' write refreshes last_activity.
+        {
+            let conn = backend.conn.lock();
+            let stamp = (Utc::now() - Duration::hours(100)).to_rfc3339();
+            conn.execute(
+                "UPDATE session_metadata SET last_activity = ?1 \
+                 WHERE session_key = 'gw_stale_running'",
+                params![stamp],
+            )
+            .unwrap();
+        }
+
+        let cleaned = backend
+            .cleanup_stale_scoped(48, SessionCleanupScope::Gateway)
+            .unwrap();
+        assert_eq!(cleaned, 1, "only the idle stale row is swept");
+        assert!(
+            backend.session_exists("gw_stale_running"),
+            "an in-flight (running) session must never be swept mid-turn"
+        );
+        assert!(!backend.session_exists("gw_stale_idle"));
+    }
+
+    #[test]
+    fn touch_session_bumps_last_activity_without_creating_rows() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        seed_aged_session(&backend, "gw_old", 100, None);
+        backend.touch_session("gw_old").unwrap();
+        let meta = backend.get_session_metadata("gw_old").unwrap();
+        assert!(
+            Utc::now() - meta.last_activity < Duration::minutes(1),
+            "touch must move last_activity to now (was {})",
+            meta.last_activity
+        );
+
+        // A touch on an unknown key must not conjure a session row.
+        backend.touch_session("gw_ghost").unwrap();
+        assert!(!backend.session_exists("gw_ghost"));
+    }
+
+    #[test]
+    fn running_state_write_recreates_deleted_row_and_append_persists() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("gw_s1", &ChatMessage::user("hi")).unwrap();
+        assert!(backend.delete_session("gw_s1").unwrap());
+        assert!(!backend.session_exists("gw_s1"));
+
+        // The next turn's 'running' transition restores the metadata row so
+        // the ws.rs persist guard (which refuses to write when the row is
+        // gone) no longer drops the turn.
+        backend
+            .set_session_state("gw_s1", "running", Some("turn-2"))
+            .unwrap();
+        assert!(backend.session_exists("gw_s1"));
+        let state = backend.get_session_state("gw_s1").unwrap().unwrap();
+        assert_eq!(state.state, "running");
+        assert_eq!(state.turn_id.as_deref(), Some("turn-2"));
+        assert!(state.turn_started_at.is_some());
+
+        backend
+            .append("gw_s1", &ChatMessage::user("after resurrect"))
+            .unwrap();
+        let msgs = backend.load("gw_s1");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "after resurrect");
+        let meta = backend.get_session_metadata("gw_s1").unwrap();
+        assert_eq!(meta.message_count, 1);
+
+        // Non-running writes stay UPDATE-only: they never create a row.
+        backend
+            .set_session_state("gw_missing", "idle", None)
+            .unwrap();
+        assert!(!backend.session_exists("gw_missing"));
+    }
+
+    #[test]
+    fn origin_principal_first_writer_wins() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("hi")).unwrap();
+        backend
+            .set_session_origin_principal("s1", "device:aaa")
+            .unwrap();
+        backend
+            .set_session_origin_principal("s1", "device:bbb")
+            .unwrap();
+
+        let meta = backend.get_session_metadata("s1").unwrap();
+        assert_eq!(
+            meta.origin_principal.as_deref(),
+            Some("device:aaa"),
+            "a later writer must never overwrite the original principal"
+        );
+    }
+
+    #[test]
+    fn origin_principal_creates_metadata_row_before_first_append() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        // Stamp before any message exists (WS connect happens pre-turn).
+        backend
+            .set_session_origin_principal("gw_fresh", "device:aaa")
+            .unwrap();
+        assert!(backend.session_exists("gw_fresh"));
+        let meta = backend.get_session_metadata("gw_fresh").unwrap();
+        assert_eq!(meta.origin_principal.as_deref(), Some("device:aaa"));
+        assert_eq!(meta.message_count, 0);
+
+        // The first append upserts into the same row and keeps the stamp.
+        backend
+            .append("gw_fresh", &ChatMessage::user("hi"))
+            .unwrap();
+        let meta = backend.get_session_metadata("gw_fresh").unwrap();
+        assert_eq!(meta.origin_principal.as_deref(), Some("device:aaa"));
+        assert_eq!(meta.message_count, 1);
     }
 
     #[test]

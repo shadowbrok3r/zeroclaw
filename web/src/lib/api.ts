@@ -2115,6 +2115,15 @@ export function getSessionMessages(
   );
 }
 
+/** Rename a persisted session: PUT /api/sessions/{id} with `{name}`. Accepts
+ * the full DB key — gateway `gw_<uuid>` and channel-composite keys alike. */
+export function renameSession(sessionKey: string, name: string): Promise<void> {
+  return apiFetch<void>(`/api/sessions/${encodeURIComponent(sessionKey)}`, {
+    method: "PUT",
+    body: JSON.stringify({ name }),
+  });
+}
+
 /** Delete a persisted session by its full DB key. */
 export function deleteSession(
   sessionKey: string,

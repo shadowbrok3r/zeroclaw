@@ -20,6 +20,12 @@ export interface WebSocketClientOptions {
   maxReconnectDelay?: number;
   /** Set to false to disable auto-reconnect. Default true. */
   autoReconnect?: boolean;
+  /** Append `&adopt=true` to the /ws/chat query so the gateway re-attributes
+   * a session owned by another agent to this one. Opt-in and one-intent:
+   * callers clear the public `adopt` field once the adopted session is
+   * established so routine reconnects never re-send the override.
+   * Default false. */
+  adopt?: boolean;
 }
 
 const DEFAULT_RECONNECT_DELAY = 1000;
@@ -40,6 +46,22 @@ export function getOrCreateSessionId(agentAlias: string): string {
   return id;
 }
 
+/** Mint a fresh session ID for the given agent alias, persist it as the
+ * alias's current thread, and return it. The previous ID is simply abandoned
+ * locally — its server-side session is left intact so the old thread stays
+ * browsable and resumable from the Threads panel. */
+export function newSessionId(agentAlias: string): string {
+  const id = generateUUID();
+  localStorage.setItem(`${SESSION_ID_KEY_PREFIX}.${agentAlias}`, id);
+  return id;
+}
+
+/** Point the given agent alias at an existing session ID (thread switch).
+ * The next WebSocket connect for this alias resumes that session. */
+export function setSessionId(agentAlias: string, id: string): void {
+  localStorage.setItem(`${SESSION_ID_KEY_PREFIX}.${agentAlias}`, id);
+}
+
 export class WebSocketClient {
   private ws: WebSocket | null = null;
   private currentDelay: number;
@@ -50,6 +72,10 @@ export class WebSocketClient {
   public onOpen: WsOpenHandler | null = null;
   public onClose: WsCloseHandler | null = null;
   public onError: WsErrorHandler | null = null;
+  /** When true, the next connect (including auto-reconnects) sends
+   * `&adopt=true`. Mutable so the owner can clear it once the gateway
+   * accepts the adopted session (see `WebSocketClientOptions.adopt`). */
+  public adopt: boolean;
 
   private readonly agentAlias: string;
   private readonly baseUrl: string;
@@ -71,6 +97,7 @@ export class WebSocketClient {
     this.reconnectDelay = options.reconnectDelay ?? DEFAULT_RECONNECT_DELAY;
     this.maxReconnectDelay = options.maxReconnectDelay ?? MAX_RECONNECT_DELAY;
     this.autoReconnect = options.autoReconnect ?? true;
+    this.adopt = options.adopt ?? false;
     this.currentDelay = this.reconnectDelay;
   }
 
@@ -85,6 +112,7 @@ export class WebSocketClient {
     if (token) params.set('token', token);
     params.set('session_id', sessionId);
     params.set('agent', this.agentAlias);
+    if (this.adopt) params.set('adopt', 'true');
     const url = `${this.baseUrl}${basePath}/ws/chat?${params.toString()}`;
 
     const protocols: string[] = ['zeroclaw.v1'];

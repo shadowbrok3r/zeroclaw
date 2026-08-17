@@ -47,19 +47,11 @@ fn validate_session_id(session_id: &str) -> Result<(), SessionValidationError> {
     Ok(())
 }
 
+/// Resolve a caller-supplied session id to an existing stored key through
+/// the shared policy point (`zeroclaw_infra::session_backend::resolve_session_key`):
+/// verbatim first, then the `gw_` (gateway WS) and `rpc_` (RPC chat) prefixes.
 fn resolve_existing_session_key(backend: &dyn SessionBackend, session_id: &str) -> Option<String> {
-    let requested = session_id.trim();
-    let sessions = backend.list_sessions();
-    if sessions.iter().any(|key| key == requested) {
-        return Some(requested.to_string());
-    }
-    if !requested.starts_with("gw_") {
-        let gateway_key = format!("gw_{requested}");
-        if sessions.iter().any(|key| key == &gateway_key) {
-            return Some(gateway_key);
-        }
-    }
-    None
+    zeroclaw_infra::session_backend::resolve_session_key(backend, session_id.trim())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -877,6 +869,7 @@ mod tests {
             channel_id: channel_id.map(str::to_string),
             room_id: None,
             sender_id: None,
+            origin_principal: None,
         }
     }
 
@@ -1124,6 +1117,34 @@ mod tests {
         assert_eq!(gateway_messages[1].role, "user");
         assert_eq!(gateway_messages[1].content, "Wake up");
         assert!(backend.load("operator-1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_to_rpc_session_accepts_bare_chat_id() {
+        let (_tmp, backend) = test_backend();
+        backend
+            .append(
+                "rpc_chat-42",
+                &ChatMessage::assistant("Existing RPC message"),
+            )
+            .unwrap();
+        let tool = SessionsSendTool::new(backend.clone(), test_security());
+
+        let result = tool
+            .execute(json!({
+                "session_id": "chat-42",
+                "message": "Ping"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("rpc_chat-42"));
+
+        let rpc_messages = backend.load("rpc_chat-42");
+        assert_eq!(rpc_messages.len(), 2);
+        assert_eq!(rpc_messages[1].content, "Ping");
+        assert!(backend.load("chat-42").is_empty());
     }
 
     #[tokio::test]

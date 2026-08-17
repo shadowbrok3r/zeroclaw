@@ -6849,7 +6849,21 @@ pub struct GatewayConfig {
     #[serde(default = "default_true")]
     pub session_persistence: bool,
 
-    /// Auto-archive stale gateway sessions older than N hours. 0 = disabled. Default: 0.
+    /// Scope gateway sessions to the paired device (bearer token) that
+    /// created them. When enabled, `/api/sessions` lists only sessions whose
+    /// origin principal is unset or matches the caller's token, and a
+    /// WebSocket resume of a session created by another device is refused.
+    /// Requires `channels.session_backend = "sqlite"`; the jsonl backend
+    /// does not store origin principals, so this knob has no effect there.
+    /// Default: false (all paired devices share all sessions).
+    #[serde(default)]
+    pub scope_sessions_to_device: bool,
+
+    /// Delete stale gateway (`gw_`) sessions whose last activity is older
+    /// than N hours. The gateway sweeps hourly (plus once at startup) and
+    /// removes matching rows permanently; channel and RPC sessions are not
+    /// touched. Requires `channels.session_backend = "sqlite"`; the jsonl
+    /// backend is never swept. 0 = disabled. Default: 0.
     #[serde(default)]
     pub session_ttl_hours: u32,
 
@@ -6965,6 +6979,7 @@ impl Default for GatewayConfig {
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
             session_persistence: true,
+            scope_sessions_to_device: false,
             session_ttl_hours: 0,
             pairing_dashboard: PairingDashboardConfig::default(),
             web_dist_dir: None,
@@ -13245,7 +13260,12 @@ pub struct ChannelsConfig {
     /// SQLite provides FTS5 search, metadata tracking, and TTL cleanup.
     #[serde(default = "default_session_backend")]
     pub session_backend: String,
-    /// Auto-archive stale sessions older than this many hours. `0` disables. Default: `0`.
+    /// Delete stale channel sessions (rows attributed to a channel) whose
+    /// last activity is older than this many hours. The channel orchestrator
+    /// sweeps hourly (plus once at startup) and removes matching rows
+    /// permanently; gateway and RPC sessions are not touched. Requires
+    /// `session_backend = "sqlite"`; the jsonl backend is never swept.
+    /// `0` disables. Default: `0`.
     #[serde(default)]
     pub session_ttl_hours: u32,
     /// Inbound message debounce window in milliseconds. When a sender fires
@@ -27939,6 +27959,7 @@ allowed_numbers = ["+1", "+2"]
             idempotency_ttl_secs: 600,
             idempotency_max_keys: 4096,
             session_persistence: true,
+            scope_sessions_to_device: false,
             session_ttl_hours: 0,
             pairing_dashboard: PairingDashboardConfig::default(),
             web_dist_dir: None,

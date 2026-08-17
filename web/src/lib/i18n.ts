@@ -1481,6 +1481,14 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_failed': 'Failed to switch to model: {model}.',
     'agent.cmd_help_escape': 'Tip: to send a message starting with /, type // instead (e.g. //foo sends /foo).',
     'agent.cmd_hint_title': 'Commands',
+    // Session threads (en-only: t() falls back en → key for other locales)
+    'agent.cmd_help_new_thread': 'start a new thread (keeps the previous one)',
+    'agent.cmd_new_thread': 'Started a new thread. The previous thread is still available in the Threads panel.',
+    'agent.resumed_thread': 'resumed thread · {count} messages',
+    'agent.session_owned_by_other': 'This thread is owned by agent "{agent}". Start a new thread to continue chatting here.',
+    'agent.session_owned_by_other_device': 'This thread belongs to another device, so it cannot be resumed here. Start a new thread to continue chatting.',
+    'agent.adopt_thread': 'Move thread to this agent',
+    'agent.start_new_thread': 'Start new thread',
     'agent.compact_mode': 'Compact',
     'agent.tool_activity_show': 'Show tool activity',
     'agent.tool_activity_hide': 'Hide tool activity',
@@ -1495,6 +1503,27 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.approval_always': 'Always approve',
     'agent.approval_always_hint': 'Approve this tool automatically for the rest of this session',
     'agent.stop': 'Stop',
+
+    // Threads panel (per-agent session browser; en-only, t() falls back en → key)
+    'threads.title': 'Threads',
+    'threads.new_thread': 'New thread',
+    'threads.chat_threads': 'Chat threads',
+    'threads.channel_conversations': 'Channel conversations',
+    'threads.none': 'No threads yet.',
+    'threads.no_channel_conversations': 'No channel conversations.',
+    'threads.loading': 'Loading threads…',
+    'threads.load_error': 'Failed to load threads',
+    'threads.current': 'current',
+    'threads.open_thread': 'Open thread',
+    'threads.rename': 'Rename thread',
+    'threads.rename_placeholder': 'Thread name…',
+    'threads.delete': 'Delete thread',
+    'threads.confirm_delete_prefix': 'Delete thread',
+    'threads.confirm_delete_suffix': '? Its server transcript is removed. This cannot be undone.',
+    'threads.view_transcript': 'View transcript',
+    'threads.transcript': 'Transcript',
+    'threads.read_only': 'read-only',
+    'threads.other_sessions': 'Other sessions (TUI)',
 
     // Agent drawer / card
     'agent.detail_aria_prefix': 'Agent',
@@ -1891,6 +1920,10 @@ const translations: Record<Locale, Record<string, string>> = {
     'dashboard.oldest_first_short': 'oldest first',
     'dashboard.loading_transcript': 'Loading transcript…',
     'dashboard.no_persisted_messages': 'No persisted messages for this session.',
+    // Sessions tab thread actions (en-only, t() falls back en → key)
+    'dashboard.open_in_chat': 'Open in chat',
+    'dashboard.rename_session': 'Rename session',
+    'dashboard.session_name_placeholder': 'Session name…',
 
     // Dashboard — channels tab
     'dashboard.readiness.enabled': 'Enabled',

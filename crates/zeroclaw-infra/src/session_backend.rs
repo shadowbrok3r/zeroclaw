@@ -31,6 +31,12 @@ pub struct SessionMetadata {
     /// Inbound sender id verbatim (Discord username, phone number, ...).
     /// Not an FK — sessions can survive deletion of the upstream user.
     pub sender_id: Option<String>,
+    /// Principal that first touched the session over an authenticated
+    /// transport (`device:<sha256(bearer token)>`). First-writer wins;
+    /// never overwritten once set. `None` for sessions created before
+    /// stamping landed, unauthenticated transports, or backends that
+    /// don't track it.
+    pub origin_principal: Option<String>,
 }
 
 /// Structured routing context recorded alongside a session. Mirrors the
@@ -54,6 +60,18 @@ pub struct SessionQuery {
     pub keyword: Option<String>,
     /// Maximum number of sessions to return.
     pub limit: Option<usize>,
+}
+
+/// Which session family a scoped TTL sweep may delete from. Sweeps are
+/// owned per subsystem (gateway vs. channel orchestrator), so each scope
+/// must never touch the other family's rows — nor RPC chat sessions,
+/// which have no TTL owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCleanupScope {
+    /// Gateway WebSocket sessions (`gw_`-prefixed keys).
+    Gateway,
+    /// Channel-driven sessions (rows with a recorded `channel_id`).
+    Channel,
 }
 
 /// One persisted message with the optional `created_at` the backend
@@ -119,6 +137,7 @@ pub trait SessionBackend: Send + Sync {
                     channel_id: None,
                     room_id: None,
                     sender_id: None,
+                    origin_principal: None,
                 }
             })
             .collect()
@@ -131,6 +150,16 @@ pub trait SessionBackend: Send + Sync {
 
     /// Remove sessions that haven't been active within the given TTL hours.
     fn cleanup_stale(&self, _ttl_hours: u32) -> std::io::Result<usize> {
+        Ok(0)
+    }
+
+    /// Remove stale sessions belonging to one [`SessionCleanupScope`] only.
+    /// Backends without per-family metadata (JSONL) skip the sweep entirely.
+    fn cleanup_stale_scoped(
+        &self,
+        _ttl_hours: u64,
+        _scope: SessionCleanupScope,
+    ) -> std::io::Result<usize> {
         Ok(0)
     }
 
@@ -194,6 +223,19 @@ pub trait SessionBackend: Send + Sync {
         Ok(None)
     }
 
+    /// Record the principal that created a session (e.g.
+    /// `device:<sha256(token)>`). First-writer wins: once a principal is
+    /// stored it is never overwritten. Backends create the metadata row if
+    /// the session has not persisted any messages yet. No-op for backends
+    /// that don't track it.
+    fn set_session_origin_principal(
+        &self,
+        _session_key: &str,
+        _principal: &str,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
     fn set_session_context(
         &self,
         _session_key: &str,
@@ -217,7 +259,16 @@ pub trait SessionBackend: Send + Sync {
             channel_id: None,
             room_id: None,
             sender_id: None,
+            origin_principal: None,
         })
+    }
+
+    /// Refresh a session's `last_activity` to now without touching anything
+    /// else. Called on WS resume so a just-resumed thread is never near the
+    /// TTL cutoff. Must not create a row for an unknown key. No-op for
+    /// backends that don't track activity timestamps.
+    fn touch_session(&self, _session_key: &str) -> std::io::Result<()> {
+        Ok(())
     }
 
     /// Set the session state (e.g. "idle", "running", "error").
@@ -247,6 +298,29 @@ pub trait SessionBackend: Send + Sync {
     }
 }
 
+/// Resolve a caller-supplied session id to the full stored session key.
+///
+/// The one policy point for id → key resolution shared by the gateway API,
+/// the sessions CLI, and the inter-agent session tools. Tries the id
+/// verbatim first (channel-composite keys like `discord.clamps_room_alice`
+/// and already-prefixed `gw_`/`rpc_` keys), then the `gw_` gateway-WS
+/// prefix, then the `rpc_` RPC-chat prefix. Returns `None` when no session
+/// exists under any candidate key.
+pub fn resolve_session_key(backend: &dyn SessionBackend, id: &str) -> Option<String> {
+    if backend.session_exists(id) {
+        return Some(id.to_string());
+    }
+    let gw = format!("gw_{id}");
+    if backend.session_exists(&gw) {
+        return Some(gw);
+    }
+    let rpc = format!("rpc_{id}");
+    if backend.session_exists(&rpc) {
+        return Some(rpc);
+    }
+    None
+}
+
 /// Session state information.
 #[derive(Debug, Clone)]
 pub struct SessionState {
@@ -274,6 +348,7 @@ mod tests {
             channel_id: None,
             room_id: None,
             sender_id: None,
+            origin_principal: None,
         };
         assert_eq!(meta.key, "test");
         assert_eq!(meta.message_count, 5);
@@ -284,5 +359,52 @@ mod tests {
         let q = SessionQuery::default();
         assert!(q.keyword.is_none());
         assert!(q.limit.is_none());
+    }
+
+    struct KeySetBackend(Vec<String>);
+
+    impl SessionBackend for KeySetBackend {
+        fn load(&self, _session_key: &str) -> Vec<ChatMessage> {
+            Vec::new()
+        }
+        fn append(&self, _session_key: &str, _message: &ChatMessage) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            self.0.clone()
+        }
+        fn session_exists(&self, session_key: &str) -> bool {
+            self.0.iter().any(|k| k == session_key)
+        }
+    }
+
+    #[test]
+    fn resolve_session_key_tries_verbatim_then_gw_then_rpc() {
+        let backend = KeySetBackend(vec![
+            "discord.clamps_room_alice".to_string(),
+            "gw_1234".to_string(),
+            "rpc_abcd".to_string(),
+        ]);
+        assert_eq!(
+            resolve_session_key(&backend, "discord.clamps_room_alice").as_deref(),
+            Some("discord.clamps_room_alice")
+        );
+        // Verbatim match wins for already-prefixed ids.
+        assert_eq!(
+            resolve_session_key(&backend, "gw_1234").as_deref(),
+            Some("gw_1234")
+        );
+        assert_eq!(
+            resolve_session_key(&backend, "1234").as_deref(),
+            Some("gw_1234")
+        );
+        assert_eq!(
+            resolve_session_key(&backend, "abcd").as_deref(),
+            Some("rpc_abcd")
+        );
+        assert_eq!(resolve_session_key(&backend, "missing"), None);
     }
 }
