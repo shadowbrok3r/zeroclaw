@@ -1523,6 +1523,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'threads.view_transcript': 'View transcript',
     'threads.transcript': 'Transcript',
     'threads.read_only': 'read-only',
+    'threads.claude_code': 'Claude Code',
     'threads.other_sessions': 'Other sessions (TUI)',
 
     // Agent drawer / card

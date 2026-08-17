@@ -45,7 +45,7 @@ flowchart LR
 
 ## Session families and keyspaces
 
-Four families of keys coexist. Three live in `sessions.db`; ACP has its own
+Five families of keys coexist. Four live in `sessions.db`; ACP has its own
 database and its own protocol semantics.
 
 | Family | Key shape | Minted by | Resumed by |
@@ -53,6 +53,7 @@ database and its own protocol semantics.
 | Channel | `<channel>.<agent>_<room>_<sender>`, e.g. `discord.clamps_<room>_<sender>` | `conversation_history_key` in `crates/zeroclaw-channels/src/orchestrator/mod.rs` | Deterministically: the same platform identities always rebuild the same key |
 | Gateway WS | `gw_<uuid>` | `crates/zeroclaw-gateway/src/ws.rs` on connect when the client sends no session id | The client echoing the id from the `session_start` frame |
 | RPC chat | `rpc_<uuid>` | The RPC chat layer (zerocode) | The RPC client presenting the id |
+| Claude Code | `cc_<session_id>` | Claude Code hook ingestion on `/hooks/claude-code` (fork-local; see [Claude Code sessions](#claude-code-sessions)) | N/A: ingest-only, nothing connects to these keys |
 | ACP | Protocol-defined, in `<data_dir>/sessions/acp-sessions.db` | `crates/zeroclaw-infra/src/acp_session_store.rs` | ACP `session/load` / `session/resume` |
 
 Channel keys are the interesting case: they are derived, not stored anywhere
@@ -181,8 +182,8 @@ family:
 | `gateway.session_ttl_hours` | `gw_` rows only | Gateway (`run_gateway`) | `0` (disabled) |
 | `channels.session_ttl_hours` | Channel-composite rows only | Channel orchestrator (`start_channels`) | `0` (disabled) |
 
-`0` disables the corresponding sweep. `rpc_` rows and the ACP store are never
-TTL-swept. Upstream applies `gateway.session_ttl_hours` exactly once at
+`0` disables the corresponding sweep. `rpc_` rows, `cc_` rows, and the ACP
+store are never TTL-swept. Upstream applies `gateway.session_ttl_hours` exactly once at
 startup as an unscoped delete of every stale row and never reads the channels
 knob; both behaviors change here.
 
@@ -219,15 +220,55 @@ Sweep safety rules:
   semantics are "any paired device sees every session". Principal stamping is
   SQLite-only; on the JSONL backend the knob logs a warning and does nothing.
 
+### Claude Code sessions
+
+Remote Claude Code launchers report their sessions into the store through
+two gateway endpoints (handlers in `crates/zeroclaw-gateway/src/api.rs`;
+endpoint reference in [Gateway HTTP API](../gateway/api.md)):
+
+- `POST /hooks/claude-code?agent=<alias>` accepts both the legacy
+  `ClaudeCodeHookEvent` shape and the native Claude Code hook JSON,
+  discriminated by the presence of `hook_event_name`. Without
+  `claude_code.hook_secret` configured the endpoint keeps its historical
+  log-only behavior. With a secret configured, requests presenting it via
+  the `X-ZC-Hook-Secret` header ingest into `cc_<session_id>` rows; a
+  missing or wrong header answers 401.
+- `POST /hooks/claude-code/transcript?session=<sid>&agent=<alias>` uses the
+  same header auth and replaces the sparse live rows with the parsed
+  transcript JSONL tail (8 MiB body cap). The metadata row survives the
+  replacement, so name and agent alias are preserved.
+
+Event mapping: `SessionStart` stamps the agent alias, sets a `cc:<dir>` name
+from the last component of the reported `cwd`, and emits `session_created`;
+`UserPromptSubmit` appends a user row and flips the state to `running`;
+`PostToolUse` appends a compact `tool` row; `Stop` and `SessionEnd` return
+the state to `idle`. Legacy `event_type` values map onto the same actions
+(`tool_use` / `tool_result` to tool rows, `completion` to idle).
+
+Contract rules:
+
+- Session ids are sanitized to `[A-Za-z0-9_-]{1,64}`; anything else is
+  rejected with 400 before touching the store.
+- `?agent=` must name a configured agent (missing or unknown: 400), so
+  every `cc_` row is attributed from the start.
+- `transcript_path` in hook payloads is never read: it names a file on the
+  remote machine. Full transcripts arrive only through the backfill
+  endpoint.
+- `cc_` rows are never TTL-swept; they persist until deleted through the
+  session verbs.
+
+The threads panel lists `cc_` sessions in a dedicated read-only "Claude
+Code" group (see the next section).
+
 ### Web threads UI
 
 The dashboard chat gains a threads panel
 (`web/src/components/ThreadsPanel.tsx`): list, switch, rename, and delete
 `gw_` threads per agent, live-updated from the SSE lifecycle events, with
-read-only transcript viewers for channel conversations (Discord and friends)
-and RPC/TUI sessions. The `/new` slash command now starts a fresh thread under
-a new `gw_` key and leaves the previous thread listed; upstream's `/new`
-deleted the current session.
+read-only transcript viewers for channel conversations (Discord and friends),
+Claude Code (`cc_`) sessions, and RPC/TUI sessions. The `/new` slash command
+now starts a fresh thread under a new `gw_` key and leaves the previous
+thread listed; upstream's `/new` deleted the current session.
 
 ### `zeroclaw sessions` CLI
 

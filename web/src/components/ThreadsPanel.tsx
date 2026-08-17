@@ -34,8 +34,11 @@ export interface ThreadsPanelProps {
  *   onto any other key would fork an empty lookalike session.
  * - **Channel conversations** (`channel_id` set — Discord etc.): read-only;
  *   clicking a row opens a transcript viewer via the session messages API.
- * - **Other sessions** (neither a `gw_` key nor a `channel_id` — rpc_/TUI
- *   sessions): read-only, same transcript viewer as channel conversations.
+ * - **Claude Code** (`cc_` session keys — ingested via the gateway's
+ *   Claude Code hook endpoints): read-only, same transcript viewer.
+ * - **Other sessions** (neither a `gw_`/`cc_` key nor a `channel_id` —
+ *   rpc_/TUI sessions): read-only, same transcript viewer as channel
+ *   conversations.
  *
  * The list refetches on mount (the panel is mounted only while open) and
  * refreshes live on `session_created` / `session_update` / `session_closed`
@@ -121,12 +124,26 @@ export default function ThreadsPanel({ agentAlias, onClose }: ThreadsPanelProps)
         .sort((a, b) => b.last_activity.localeCompare(a.last_activity)),
     [sessions],
   );
-  // Neither a gw_ key nor a channel: rpc_/TUI sessions. Browsable read-only
-  // through the same transcript viewer as channel conversations.
+  // Claude Code sessions (cc_ keys, ingested via the gateway hook
+  // endpoints). Read-only: there is no live surface to switch onto.
+  const claudeCodeSessions = useMemo(
+    () =>
+      (sessions ?? [])
+        .filter((s) => !s.channel_id && s.session_key.startsWith('cc_'))
+        .sort((a, b) => b.last_activity.localeCompare(a.last_activity)),
+    [sessions],
+  );
+  // Neither a gw_/cc_ key nor a channel: rpc_/TUI sessions. Browsable
+  // read-only through the same transcript viewer as channel conversations.
   const otherSessions = useMemo(
     () =>
       (sessions ?? [])
-        .filter((s) => !s.channel_id && !s.session_key.startsWith('gw_'))
+        .filter(
+          (s) =>
+            !s.channel_id &&
+            !s.session_key.startsWith('gw_') &&
+            !s.session_key.startsWith('cc_'),
+        )
         .sort((a, b) => b.last_activity.localeCompare(a.last_activity)),
     [sessions],
   );
@@ -478,7 +495,59 @@ export default function ThreadsPanel({ agentAlias, onClose }: ThreadsPanelProps)
                 )}
               </section>
 
-              {/* Other sessions (rpc_/TUI — neither gw_ key nor channel).
+              {/* Claude Code sessions (cc_ keys — hook ingestion).
+                  Read-only transcript access via the shared viewer. */}
+              {claudeCodeSessions.length > 0 && (
+                <section>
+                  <h3
+                    className="text-xs font-semibold uppercase tracking-wider mb-2"
+                    style={{ color: 'var(--pc-text-muted)' }}
+                  >
+                    {t('threads.claude_code')}
+                  </h3>
+                  <div className="space-y-2">
+                    {claudeCodeSessions.map((s) => (
+                      <button
+                        key={s.session_key}
+                        type="button"
+                        onClick={() => openViewer(s)}
+                        className="w-full text-left flex items-center gap-2 py-2 px-3 rounded-xl hover:bg-[var(--pc-hover)]"
+                        style={{
+                          background: 'var(--pc-bg-elevated)',
+                          border: '1px solid transparent',
+                        }}
+                        title={t('threads.view_transcript')}
+                      >
+                        <div className="flex-1 min-w-0">
+                          <span className="flex items-center gap-2 flex-wrap">
+                            <span
+                              className={`text-sm truncate ${s.name ? 'font-medium' : 'font-mono'}`}
+                              style={{ color: 'var(--pc-text-primary)' }}
+                            >
+                              {s.name || s.session_id}
+                            </span>
+                          </span>
+                          <span
+                            className="flex items-center gap-2 text-xs mt-0.5"
+                            style={{ color: 'var(--pc-text-muted)' }}
+                          >
+                            <span className="flex items-center gap-1">
+                              <MessageSquare className="h-3 w-3" />
+                              {s.message_count}
+                            </span>
+                            <span>{formatRelative(s.last_activity)}</span>
+                            <span style={{ color: 'var(--pc-text-faint)' }}>
+                              {t('threads.read_only')}
+                            </span>
+                          </span>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </section>
+              )}
+
+              {/* Other sessions (rpc_/TUI — neither gw_/cc_ key nor channel).
                   Read-only transcript access only: switching onto a non-gw_
                   key would fork an empty session (see chatThreads). */}
               {otherSessions.length > 0 && (

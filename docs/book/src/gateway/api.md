@@ -148,6 +148,22 @@ Session mutations also emit lifecycle frames on `/api/events` with
 `session_closed`; the field contract is documented in
 [Session lifecycle](../architecture/session-lifecycle.md#session-lifecycle-sse-events).
 
+### Claude Code hook endpoints
+
+Two endpoints ingest remote Claude Code sessions into the `cc_` key family.
+They do not use bearer auth: they are gated by the shared secret configured
+as `claude_code.hook_secret`, presented via the `X-ZC-Hook-Secret` header.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/hooks/claude-code?agent=<alias>` | Ingest one hook event (native Claude Code hook JSON or the legacy `ClaudeCodeHookEvent` shape) into `cc_<session_id>`. With no `hook_secret` configured the endpoint is log-only and unauthenticated (unchanged historical behavior). With a secret configured, a correct header ingests; a missing or wrong header answers 401. |
+| `POST` | `/hooks/claude-code/transcript?session=<sid>&agent=<alias>` | Replace the session's live rows with a parsed Claude Code transcript JSONL tail (8 MiB body cap, 413 above it). Same header auth; answers 404 when no `hook_secret` is configured, 401 on a missing or wrong header. Metadata (name, agent alias) survives the replacement. |
+
+Both endpoints validate `session`/`session_id` against `[A-Za-z0-9_-]{1,64}`
+and require `?agent=` to name a configured agent; violations answer 400. See
+[Claude Code sessions](../architecture/session-lifecycle.md#claude-code-sessions)
+for the event mapping and contract rules.
+
 ## Event stream contract
 
 `GET /api/events` is a raw Server-Sent Events stream of observable runtime
