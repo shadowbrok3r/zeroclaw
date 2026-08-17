@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useRef, useState, useCallback } from 'react';
 import type { ApprovalDecision, PendingApproval, WsMessage } from '@/types/api';
-import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
+import { WebSocketClient, getOrCreateSessionId, newSessionId, setSessionId } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { t } from '@/lib/i18n';
 import { getProp, putProp, listProps, getStatus, getSessionMessages, abortSession, deleteSession } from '@/lib/api';
@@ -80,6 +80,21 @@ interface AgentContextValue {
   // Context window tracking (from "done" WS frames). See #7311.
   contextMaxTokens: number | null;
   contextInputTokens: number | null;
+  /** Current thread (session) id for this agent — the raw client uuid the
+   * WebSocket connects with. Changes when the user starts or switches threads. */
+  sessionId: string;
+  /** Mint a fresh thread id and reconnect on it. The previous thread's server
+   * session is left intact (still listed in the Threads panel). */
+  startNewThread: () => void;
+  /** Point this agent at an existing thread id, reconnect, and re-hydrate the
+   * transcript from the server. */
+  switchThread: (id: string) => void;
+  /** Info from the gateway's `session_start` frame: whether this connect
+   * resumed a persisted session, and how many messages it carried. */
+  sessionStart: { resumed: boolean; messageCount: number } | null;
+  /** Set when the gateway refused to resume this thread because another agent
+   * owns it (`session_owned_by_other_agent`). Cleared on thread change. */
+  ownershipConflict: { owningAgent: string } | null;
 }
 
 const AgentContext = createContext<AgentContextValue | null>(null);
@@ -115,7 +130,12 @@ export interface AgentProviderProps {
 }
 
 export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
-  const sessionIdRef = useRef(getOrCreateSessionId(agentAlias));
+  // The thread id is React state so the UI can start/switch threads at
+  // runtime; localStorage (via getOrCreateSessionId / newSessionId /
+  // setSessionId) stays the source of truth the WebSocket reads at connect().
+  const [sessionId, setSessionIdState] = useState(() => getOrCreateSessionId(agentAlias));
+  const sessionIdRef = useRef(sessionId);
+  sessionIdRef.current = sessionId;
   const [messages, setMessages] = useState<ChatMessage[]>(() => {
     const persisted = loadChatHistory(sessionIdRef.current);
     return persisted.length > 0 ? persistedToUiMessages(persisted) : [];
@@ -134,6 +154,10 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   // Context window tracking (from "done" WS frames). See #7311.
   const [contextMaxTokens, setContextMaxTokens] = useState<number | null>(null);
   const [contextInputTokens, setContextInputTokens] = useState<number | null>(null);
+  // `session_start` frame info ({resumed, message_count}); reset on thread change.
+  const [sessionStart, setSessionStart] = useState<{ resumed: boolean; messageCount: number } | null>(null);
+  // Gateway refused to resume: the thread belongs to another agent.
+  const [ownershipConflict, setOwnershipConflict] = useState<{ owningAgent: string } | null>(null);
 
   const wsRef = useRef<WebSocketClient | null>(null);
   // Canonical per-turn stream state. Every production transition that mutates
@@ -144,6 +168,10 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   const switchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsVersionRef = useRef(0);
   const localMessageMutationVersionRef = useRef(0);
+  // Set by startNewThread: a freshly minted uuid cannot have server history,
+  // so the next hydration pass skips its fetch. This keeps the local
+  // "new thread" notice from being wiped by an empty wholesale re-hydration.
+  const skipNextHydrationRef = useRef(false);
 
   // Prime the model-provider catalog once so error formatting can resolve
   // display names from the backend registry rather than a local shadow list.
@@ -151,9 +179,16 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     void primeModelProviderCatalog();
   }, []);
 
-  // Hydrate chat from server (preferred) or localStorage fallback
+  // Hydrate chat from server (preferred) or localStorage fallback. Re-runs
+  // whenever the thread id changes (startNewThread / switchThread) so a
+  // switched-to thread re-hydrates from GET /api/sessions/{id}/messages.
   useEffect(() => {
-    const sid = sessionIdRef.current;
+    const sid = sessionId;
+    if (skipNextHydrationRef.current) {
+      skipNextHydrationRef.current = false;
+      setHistoryReady(true);
+      return;
+    }
     const hydrationStartedAtMutationVersion = localMessageMutationVersionRef.current;
     let cancelled = false;
 
@@ -188,13 +223,13 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [sessionId]);
 
   // Mirror transcript to localStorage (bounded); server remains source of truth when persistence is on
   useEffect(() => {
     if (!historyReady) return;
-    saveChatHistory(sessionIdRef.current, uiMessagesToPersisted(messages));
-  }, [messages, historyReady]);
+    saveChatHistory(sessionId, uiMessagesToPersisted(messages));
+  }, [messages, historyReady, sessionId]);
 
   // Auto-clear a pending approval when its timeout elapses on the backend.
   // The gateway auto-denies after `timeout_secs`; without this effect the
@@ -226,6 +261,15 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   const handleWsMessage = useCallback((msg: WsMessage) => {
     switch (msg.type) {
       case 'session_start':
+        // Record whether the gateway resumed a persisted session and how many
+        // messages it carried, so the chat can show a "resumed thread · N
+        // messages" indicator.
+        setSessionStart({
+          resumed: msg.resumed === true,
+          messageCount: typeof msg.message_count === 'number' ? msg.message_count : 0,
+        });
+        break;
+
       case 'connected':
         break;
 
@@ -457,6 +501,15 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       }
 
       case 'error':
+        // Ownership guard: the gateway refused to resume because the session
+        // belongs to a different agent. Surface a dedicated banner with a
+        // "start new thread" action instead of a generic error bubble; never
+        // auto-adopt (`?adopt=true`) on the user's behalf.
+        if (msg.error === 'session_owned_by_other_agent') {
+          setOwnershipConflict({ owningAgent: msg.owning_agent ?? '' });
+          setTyping(false);
+          break;
+        }
         const friendlyMessage = friendlyAgentError(msg.message);
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => [
@@ -555,7 +608,10 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     wsRef.current = ws;
 
     return () => {
-      ws.disconnect();
+      // Disconnect whichever socket is live NOW — model switches and thread
+      // changes may have replaced the one this effect created.
+      (wsRef.current ?? ws).disconnect();
+      wsRef.current = null;
     };
   }, [attachSocketCallbacks, agentAlias]);
 
@@ -821,6 +877,65 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     })();
   }, [agentAlias, attachSocketCallbacks, foldTurnStream]);
 
+  // Tear down the current socket (detaching callbacks first so its onClose
+  // cannot write stale connection state) and open a fresh one. The new client
+  // reads the alias's current session id from localStorage at connect() time,
+  // so callers must persist the target thread id BEFORE invoking this.
+  const rebuildSocket = useCallback(() => {
+    const oldWs = wsRef.current;
+    if (oldWs) {
+      oldWs.onOpen = null;
+      oldWs.onClose = null;
+      oldWs.onError = null;
+      oldWs.onMessage = null;
+      oldWs.disconnect();
+    }
+    const ws = new WebSocketClient({ agentAlias });
+    // Assign wsRef before connect() so a synchronous throw can't strand the
+    // page on the old intentionally-closed socket (see switchModel).
+    wsRef.current = ws;
+    attachSocketCallbacks(ws);
+    ws.connect();
+  }, [agentAlias, attachSocketCallbacks]);
+
+  // Shared per-turn / per-thread view reset used when the thread identity
+  // changes. Does NOT touch the server: no session is deleted or aborted.
+  const resetThreadView = useCallback(() => {
+    localMessageMutationVersionRef.current += 1;
+    foldTurnStream({ type: 'reset' });
+    setStreamingContent('');
+    setStreamingThinking('');
+    setTyping(false);
+    setPendingApproval(null);
+    setSessionStart(null);
+    setOwnershipConflict(null);
+    setHistoryReady(false);
+  }, [foldTurnStream]);
+
+  const startNewThread = useCallback(() => {
+    // Mint + persist a fresh uuid; the abandoned thread's server session is
+    // intentionally left intact (unlike /clear, which deletes in place).
+    const id = newSessionId(agentAlias);
+    resetThreadView();
+    // Fresh uuid ⇒ no server history; skip the hydration fetch for it.
+    skipNextHydrationRef.current = true;
+    setMessages([]);
+    setSessionIdState(id);
+    rebuildSocket();
+  }, [agentAlias, resetThreadView, rebuildSocket]);
+
+  const switchThread = useCallback((id: string) => {
+    if (id === sessionIdRef.current) return;
+    setSessionId(agentAlias, id);
+    resetThreadView();
+    // Seed optimistically from the localStorage mirror; the hydration effect
+    // (keyed on sessionId) then replaces it from the server transcript.
+    const persisted = loadChatHistory(id);
+    setMessages(persisted.length > 0 ? persistedToUiMessages(persisted) : []);
+    setSessionIdState(id);
+    rebuildSocket();
+  }, [agentAlias, resetThreadView, rebuildSocket]);
+
   const addLocalMessage = useCallback((content: string) => {
     localMessageMutationVersionRef.current += 1;
     setMessages((prev) => [
@@ -881,6 +996,11 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     // Context window tracking (from "done" WS frames). See #7311.
     contextMaxTokens,
     contextInputTokens,
+    sessionId,
+    startNewThread,
+    switchThread,
+    sessionStart,
+    ownershipConflict,
   };
 
   return <AgentContext.Provider value={value}>{children}</AgentContext.Provider>;

@@ -40,6 +40,22 @@ export function getOrCreateSessionId(agentAlias: string): string {
   return id;
 }
 
+/** Mint a fresh session ID for the given agent alias, persist it as the
+ * alias's current thread, and return it. The previous ID is simply abandoned
+ * locally — its server-side session is left intact so the old thread stays
+ * browsable and resumable from the Threads panel. */
+export function newSessionId(agentAlias: string): string {
+  const id = generateUUID();
+  localStorage.setItem(`${SESSION_ID_KEY_PREFIX}.${agentAlias}`, id);
+  return id;
+}
+
+/** Point the given agent alias at an existing session ID (thread switch).
+ * The next WebSocket connect for this alias resumes that session. */
+export function setSessionId(agentAlias: string, id: string): void {
+  localStorage.setItem(`${SESSION_ID_KEY_PREFIX}.${agentAlias}`, id);
+}
+
 export class WebSocketClient {
   private ws: WebSocket | null = null;
   private currentDelay: number;

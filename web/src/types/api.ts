@@ -210,6 +210,28 @@ export interface Session {
   /** Owning channel as `<type>.<alias>` for channel-driven sessions
    * (Discord, Matrix, …). `null` for gateway WebSocket sessions. */
   channel_id: string | null;
+  /** Auth principal that created the session (e.g. `ws:<token-hash>`), when
+   * the backend records one. Absent/`null` for older rows and backends that
+   * don't stamp it. */
+  origin_principal?: string | null;
+}
+
+/** SSE lifecycle frame for the unified session store (`source: "sessions"`).
+ * The gateway emits `session_created` / `session_update` / `session_closed`
+ * on the public event bus; the Dashboard sessions tab and the chat Threads
+ * panel refresh their listings from these. */
+export interface SessionLifecycleEvent {
+  type: "session_created" | "session_update" | "session_closed";
+  source: "sessions";
+  /** Full DB key (`gw_<uuid>` or channel-composite). */
+  session_key: string;
+  /** Display id (`gw_` stripped for gateway sessions). */
+  session_id: string;
+  agent_alias?: string;
+  name?: string;
+  message_count?: number;
+  state?: string;
+  timestamp: string;
 }
 
 export type ChannelReadinessState = 'ready' | 'missing' | 'unknown';
@@ -272,6 +294,12 @@ export interface WsMessage {
   id?: string;
   message?: string;
   code?: string;
+  /** Machine-readable error key on `error` frames — e.g.
+   * `session_owned_by_other_agent` when the gateway refuses to resume a
+   * session owned by a different agent (pass `?adopt=true` to override). */
+  error?: string;
+  /** Owning agent alias accompanying `session_owned_by_other_agent`. */
+  owning_agent?: string;
   session_id?: string;
   resumed?: boolean;
   message_count?: number;
