@@ -2215,18 +2215,358 @@ pub async fn handle_api_session_abort(
 
 // ── Claude Code hook endpoint ────────────────────────────────────
 
+/// Header carrying the shared ingestion secret (`claude_code.hook_secret`).
+pub(crate) const CLAUDE_CODE_HOOK_SECRET_HEADER: &str = "X-ZC-Hook-Secret";
+/// Defensive pre-deserialization body cap. The router-wide
+/// `RequestBodyLimitLayer` (64 KiB) already bounds this route in production;
+/// this guard keeps the handler safe if it is ever mounted without it.
+const CLAUDE_CODE_HOOK_MAX_BODY_BYTES: usize = 256 * 1024;
+/// Byte cap for persisted `UserPromptSubmit` prompts.
+const CLAUDE_CODE_PROMPT_MAX_BYTES: usize = 16 * 1024;
+/// Byte cap for the persisted tool-input summary on tool rows.
+const CLAUDE_CODE_TOOL_SUMMARY_MAX_BYTES: usize = 512;
+
+#[derive(Debug, Deserialize)]
+pub struct ClaudeCodeHookQuery {
+    /// Agent alias to attribute ingested `cc_` sessions to. Required (and
+    /// validated against `config.agents`) whenever ingestion is active.
+    #[serde(default)]
+    pub agent: Option<String>,
+}
+
+/// Outcome of checking `X-ZC-Hook-Secret` against the boot-time hash.
+enum HookSecretCheck {
+    /// No secret configured: ingestion disabled, endpoint stays log-only.
+    Disabled,
+    /// Secret configured and the header matched.
+    Authorized,
+    /// Secret configured but the header is missing or wrong.
+    Rejected,
+}
+
+fn check_claude_code_hook_secret(state: &AppState, headers: &HeaderMap) -> HookSecretCheck {
+    let Some(ref secret_hash) = state.claude_code_hook_secret_hash else {
+        return HookSecretCheck::Disabled;
+    };
+    let presented = headers
+        .get(CLAUDE_CODE_HOOK_SECRET_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(crate::hash_webhook_secret);
+    match presented {
+        Some(hash)
+            if zeroclaw_runtime::security::pairing::constant_time_eq(
+                &hash,
+                secret_hash.as_ref(),
+            ) =>
+        {
+            HookSecretCheck::Authorized
+        }
+        _ => HookSecretCheck::Rejected,
+    }
+}
+
+/// `cc_` session ids come from an external process: accept only
+/// `[A-Za-z0-9_-]{1,64}` so the store never sees a hostile key.
+fn sanitize_claude_code_session_id(raw: &str) -> Option<&str> {
+    (!raw.is_empty()
+        && raw.len() <= 64
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+    .then_some(raw)
+}
+
+/// Truncate to at most `max_bytes` without splitting a UTF-8 code point.
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Collapse all whitespace runs (including newlines) into single spaces.
+fn single_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Last path component of a local or remote cwd. Handles both `/` and `\`
+/// separators because remote Claude Code launchers may run on Windows.
+fn last_path_component(path: &str) -> Option<&str> {
+    path.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .map(str::trim)
+        .filter(|component| !component.is_empty())
+}
+
+/// One normalized hook event. Both payload shapes — the legacy
+/// `ClaudeCodeHookEvent` and the native Claude Code hook JSON (discriminated
+/// by the presence of `hook_event_name`) — reduce to this.
+enum ClaudeCodeHookAction {
+    SessionStart { cwd: Option<String> },
+    UserPrompt { prompt: String },
+    ToolUse { tool_name: String, summary: String },
+    TurnEnd,
+    LogOnly,
+}
+
+struct NormalizedClaudeCodeHook {
+    session_id: String,
+    event_label: String,
+    action: ClaudeCodeHookAction,
+}
+
+fn normalize_claude_code_hook(value: &serde_json::Value) -> Option<NormalizedClaudeCodeHook> {
+    let session_id = value.get("session_id")?.as_str()?.to_string();
+    if let Some(event_name) = value.get("hook_event_name").and_then(|v| v.as_str()) {
+        // Native Claude Code hook payload (settings.json hooks).
+        let action = match event_name {
+            "SessionStart" => ClaudeCodeHookAction::SessionStart {
+                cwd: value.get("cwd").and_then(|v| v.as_str()).map(str::to_owned),
+            },
+            "UserPromptSubmit" => ClaudeCodeHookAction::UserPrompt {
+                prompt: value
+                    .get("prompt")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            },
+            "PostToolUse" => ClaudeCodeHookAction::ToolUse {
+                tool_name: value
+                    .get("tool_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("tool")
+                    .to_string(),
+                // Compact JSON is already single-line; `single_line` below
+                // also flattens any embedded literal whitespace runs.
+                summary: value
+                    .get("tool_input")
+                    .map(std::string::ToString::to_string)
+                    .unwrap_or_default(),
+            },
+            "Stop" | "SessionEnd" => ClaudeCodeHookAction::TurnEnd,
+            _ => ClaudeCodeHookAction::LogOnly,
+        };
+        return Some(NormalizedClaudeCodeHook {
+            session_id,
+            event_label: event_name.to_string(),
+            action,
+        });
+    }
+    // Legacy `ClaudeCodeHookEvent` payload (claude_code_runner shim).
+    let event_type = value.get("event_type")?.as_str()?.to_string();
+    let action = match event_type.as_str() {
+        "tool_use" | "tool_result" => ClaudeCodeHookAction::ToolUse {
+            tool_name: value
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("tool")
+                .to_string(),
+            summary: value
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        },
+        "completion" => ClaudeCodeHookAction::TurnEnd,
+        _ => ClaudeCodeHookAction::LogOnly,
+    };
+    Some(NormalizedClaudeCodeHook {
+        session_id,
+        event_label: event_type,
+        action,
+    })
+}
+
+/// Apply one normalized hook event to the session store and emit the
+/// matching lifecycle frame. Only called on the authenticated path.
+fn ingest_claude_code_event(
+    state: &AppState,
+    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    session_key: &str,
+    agent_alias: &str,
+    action: &ClaudeCodeHookAction,
+) -> std::io::Result<()> {
+    use crate::session_events::{SessionEventKind, emit_session_event_from_backend};
+    match action {
+        ClaudeCodeHookAction::SessionStart { cwd } => {
+            let existed = backend.session_exists(session_key);
+            // Upserts the metadata row, so name/state writes below land.
+            backend.set_session_agent_alias(session_key, agent_alias)?;
+            if backend.get_session_name(session_key)?.is_none() {
+                if let Some(component) = cwd.as_deref().and_then(last_path_component) {
+                    backend.set_session_name(session_key, &format!("cc:{component}"))?;
+                }
+            }
+            backend.set_session_state(session_key, "idle", None)?;
+            let kind = if existed {
+                SessionEventKind::Update
+            } else {
+                SessionEventKind::Created
+            };
+            emit_session_event_from_backend(state, kind, session_key);
+        }
+        ClaudeCodeHookAction::UserPrompt { prompt } => {
+            let content = truncate_utf8(prompt, CLAUDE_CODE_PROMPT_MAX_BYTES);
+            backend.append(session_key, &zeroclaw_providers::ChatMessage::user(content))?;
+            backend.set_session_state(session_key, "running", None)?;
+            emit_session_event_from_backend(state, SessionEventKind::Update, session_key);
+        }
+        ClaudeCodeHookAction::ToolUse { tool_name, summary } => {
+            let summary = single_line(summary);
+            let content = format!(
+                "{tool_name}: {}",
+                truncate_utf8(&summary, CLAUDE_CODE_TOOL_SUMMARY_MAX_BYTES)
+            );
+            backend.append(session_key, &zeroclaw_providers::ChatMessage::tool(content))?;
+            emit_session_event_from_backend(state, SessionEventKind::Update, session_key);
+        }
+        ClaudeCodeHookAction::TurnEnd => {
+            backend.set_session_state(session_key, "idle", None)?;
+            emit_session_event_from_backend(state, SessionEventKind::Update, session_key);
+        }
+        ClaudeCodeHookAction::LogOnly => {}
+    }
+    Ok(())
+}
+
+/// Validate the `?agent=` alias against `config.agents`. Returns a 400
+/// error body for a missing or unknown alias so ingestion never stores
+/// unattributed or misattributed `cc_` rows.
+fn validated_hook_agent(
+    state: &AppState,
+    query_agent: Option<&str>,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    let alias = query_agent
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing required ?agent= query parameter"})),
+        ))?;
+    let known = state.config.read().agent(alias).is_some();
+    if known {
+        Ok(alias.to_string())
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Unknown agent alias: {alias}")})),
+        ))
+    }
+}
+
 pub async fn handle_claude_code_hook(
     State(state): State<AppState>,
-    Json(payload): Json<zeroclaw_tools::claude_code_runner::ClaudeCodeHookEvent>,
+    headers: HeaderMap,
+    Query(query): Query<ClaudeCodeHookQuery>,
+    body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    // Do not require bearer-token auth: Claude Code subprocesses cannot easily
-    // obtain a pairing token, and the hook carries a session_id that ties it
-    // back to a session we spawned.
-    let _ = &state; // retained for future Slack update wiring
+    // No bearer-token auth: Claude Code subprocesses cannot easily obtain a
+    // pairing token. Instead, session ingestion is gated on the dedicated
+    // `claude_code.hook_secret`; without one the endpoint stays log-only.
+    let authorized = match check_claude_code_hook_secret(&state, &headers) {
+        HookSecretCheck::Disabled => false,
+        HookSecretCheck::Authorized => true,
+        HookSecretCheck::Rejected => {
+            // Exactly one WARN per rejected request — no log flood.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "claude-code hook: rejected — invalid or missing X-ZC-Hook-Secret"
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Unauthorized — invalid or missing X-ZC-Hook-Secret header"
+                })),
+            )
+                .into_response();
+        }
+    };
 
-    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"session_id": payload.session_id, "event_type": payload.event_type, "tool_name": payload.tool_name, "summary": payload.summary})), "Claude Code hook event received");
+    if body.len() > CLAUDE_CODE_HOOK_MAX_BODY_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({"error": "Hook payload too large"})),
+        )
+            .into_response();
+    }
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid JSON body"})),
+        )
+            .into_response();
+    };
+    let Some(hook) = normalize_claude_code_hook(&payload) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Expected a Claude Code hook payload (session_id plus hook_event_name or event_type)"
+            })),
+        )
+            .into_response();
+    };
 
-    Json(serde_json::json!({ "ok": true }))
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "session_id": hook.session_id,
+                "event_type": hook.event_label,
+                "tool_name": payload.get("tool_name").and_then(|v| v.as_str()),
+                "summary": payload.get("summary").and_then(|v| v.as_str()),
+            })
+        ),
+        "Claude Code hook event received"
+    );
+
+    if !authorized {
+        // No secret configured: today's log-only contract, nothing written.
+        return Json(serde_json::json!({ "ok": true })).into_response();
+    }
+
+    // ── Authenticated ingestion into the cc_ session family ──
+    let Some(session_id) = sanitize_claude_code_session_id(&hook.session_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Invalid session_id: expected [A-Za-z0-9_-]{1,64}"
+            })),
+        )
+            .into_response();
+    };
+    let agent_alias = match validated_hook_agent(&state, query.agent.as_deref()) {
+        Ok(alias) => alias,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(backend) = state.session_backend.clone() else {
+        // Persistence disabled: nothing to ingest into; stay log-only.
+        return Json(serde_json::json!({ "ok": true })).into_response();
+    };
+
+    let session_key = format!("cc_{session_id}");
+    match ingest_claude_code_event(
+        &state,
+        backend.as_ref(),
+        &session_key,
+        &agent_alias,
+        &hook.action,
+    ) {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to ingest hook event: {e}")})),
+        )
+            .into_response(),
+    }
 }
 
 // Shared test helper: `api_config` tests reuse this AppState builder for the
@@ -2430,6 +2770,7 @@ pub(crate) mod tests {
             ),
             auto_save: false,
             webhook_secret_hash: None,
+            claude_code_hook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -3789,6 +4130,219 @@ pub(crate) mod tests {
         assert_eq!(event["session_id"], "op-2");
         assert_eq!(event["message_count"], 1);
         assert!(event.get("content").is_none());
+    }
+
+    // ── Claude Code hook ingestion router tests ───────────────────────
+
+    const TEST_HOOK_SECRET: &str = "cc-hook-secret";
+
+    fn claude_hook_app(state: AppState) -> axum::Router {
+        axum::Router::new()
+            .route(
+                "/hooks/claude-code",
+                axum::routing::post(handle_claude_code_hook),
+            )
+            .with_state(state)
+    }
+
+    /// SQLite-backed state with `test-agent` configured and the hook secret
+    /// hash installed (ingestion enabled).
+    fn claude_hook_state() -> (tempfile::TempDir, AppState, Arc<dyn SessionBackend>) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = zeroclaw_infra::make_session_backend(tmp.path(), "sqlite").unwrap();
+        let mut state = test_state_with_session_backend(
+            with_test_agent(zeroclaw_config::schema::Config::default()),
+            backend.clone(),
+        );
+        state.claude_code_hook_secret_hash =
+            Some(Arc::from(crate::hash_webhook_secret(TEST_HOOK_SECRET)));
+        (tmp, state, backend)
+    }
+
+    fn hook_request(
+        uri: &str,
+        secret: Option<&str>,
+        body: &serde_json::Value,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut builder = axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(axum::http::header::CONTENT_TYPE, "application/json");
+        if let Some(secret) = secret {
+            builder = builder.header(CLAUDE_CODE_HOOK_SECRET_HEADER, secret);
+        }
+        builder
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn claude_hook_without_secret_config_stays_log_only() {
+        use tower::ServiceExt as _;
+
+        // No hook secret configured: legacy payloads still answer ok and
+        // nothing is written, even when a session backend is present.
+        let (_tmp, mut state, backend) = claude_hook_state();
+        state.claude_code_hook_secret_hash = None;
+
+        let legacy = serde_json::json!({
+            "session_id": "abc123",
+            "event_type": "tool_use",
+            "tool_name": "Bash",
+            "summary": "ls -la"
+        });
+        let response = claude_hook_app(state)
+            .oneshot(hook_request("/hooks/claude-code", None, &legacy))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["ok"], true);
+        assert!(
+            backend.list_sessions().is_empty(),
+            "log-only mode must not persist any session rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_hook_with_secret_rejects_missing_or_wrong_header() {
+        use tower::ServiceExt as _;
+
+        let (_tmp, state, backend) = claude_hook_state();
+        let payload = serde_json::json!({
+            "session_id": "abc123",
+            "hook_event_name": "SessionStart",
+            "cwd": "/home/user/proj"
+        });
+
+        for secret in [None, Some("wrong-secret")] {
+            let response = claude_hook_app(state.clone())
+                .oneshot(hook_request(
+                    "/hooks/claude-code?agent=test-agent",
+                    secret,
+                    &payload,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        assert!(backend.list_sessions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn claude_hook_sequence_ingests_cc_session() {
+        use tower::ServiceExt as _;
+
+        let (_tmp, state, backend) = claude_hook_state();
+        let uri = "/hooks/claude-code?agent=test-agent";
+        let events = [
+            serde_json::json!({
+                "session_id": "sess-1",
+                "hook_event_name": "SessionStart",
+                "cwd": "/home/user/projects/zeroclaw"
+            }),
+            serde_json::json!({
+                "session_id": "sess-1",
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "fix the flaky updater test"
+            }),
+            serde_json::json!({
+                "session_id": "sess-1",
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "cargo test -p updater"},
+                "tool_response": {"stdout": "ok"}
+            }),
+            serde_json::json!({
+                "session_id": "sess-1",
+                "hook_event_name": "Stop"
+            }),
+        ];
+        for event in &events {
+            let response = claude_hook_app(state.clone())
+                .oneshot(hook_request(uri, Some(TEST_HOOK_SECRET), event))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let meta = backend
+            .get_session_metadata("cc_sess-1")
+            .expect("cc_ session row exists");
+        assert_eq!(meta.agent_alias.as_deref(), Some("test-agent"));
+        assert_eq!(meta.name.as_deref(), Some("cc:zeroclaw"));
+        assert_eq!(meta.message_count, 2, "one user row plus one tool row");
+
+        let messages = backend.load("cc_sess-1");
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "fix the flaky updater test");
+        assert_eq!(messages[1].role, "tool");
+        assert!(
+            messages[1].content.starts_with("Bash: "),
+            "tool row is '{{tool_name}}: {{summary}}', got {:?}",
+            messages[1].content
+        );
+        assert!(messages[1].content.contains("cargo test -p updater"));
+
+        let session_state = backend
+            .get_session_state("cc_sess-1")
+            .unwrap()
+            .expect("state row");
+        assert_eq!(session_state.state, "idle");
+    }
+
+    #[tokio::test]
+    async fn claude_hook_rejects_unknown_agent_and_bad_session_id() {
+        use tower::ServiceExt as _;
+
+        let (_tmp, state, backend) = claude_hook_state();
+        let start = serde_json::json!({
+            "session_id": "sess-1",
+            "hook_event_name": "SessionStart"
+        });
+
+        // Unknown agent alias → 400.
+        let response = claude_hook_app(state.clone())
+            .oneshot(hook_request(
+                "/hooks/claude-code?agent=no-such-agent",
+                Some(TEST_HOOK_SECRET),
+                &start,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Missing agent → 400.
+        let response = claude_hook_app(state.clone())
+            .oneshot(hook_request(
+                "/hooks/claude-code",
+                Some(TEST_HOOK_SECRET),
+                &start,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Hostile session id → 400.
+        let bad = serde_json::json!({
+            "session_id": "../etc/passwd",
+            "hook_event_name": "SessionStart"
+        });
+        let response = claude_hook_app(state)
+            .oneshot(hook_request(
+                "/hooks/claude-code?agent=test-agent",
+                Some(TEST_HOOK_SECRET),
+                &bad,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        assert!(
+            backend.list_sessions().is_empty(),
+            "rejected requests must keep the store clean"
+        );
     }
 
     /// Seed three attributed sessions: one stamped for the caller's device,
