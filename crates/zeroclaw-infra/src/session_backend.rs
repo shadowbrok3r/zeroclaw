@@ -335,6 +335,10 @@ pub fn resolve_session_key(backend: &dyn SessionBackend, id: &str) -> Option<Str
     if backend.session_exists(&rpc) {
         return Some(rpc);
     }
+    let cc = format!("cc_{id}");
+    if backend.session_exists(&cc) {
+        return Some(cc);
+    }
     None
 }
 
@@ -404,7 +408,13 @@ mod tests {
             "discord.clamps_room_alice".to_string(),
             "gw_1234".to_string(),
             "rpc_abcd".to_string(),
+            "cc_wxyz".to_string(),
         ]);
+        assert_eq!(
+            resolve_session_key(&backend, "wxyz").as_deref(),
+            Some("cc_wxyz"),
+            "bare Claude Code session ids resolve through the cc_ arm"
+        );
         assert_eq!(
             resolve_session_key(&backend, "discord.clamps_room_alice").as_deref(),
             Some("discord.clamps_room_alice")

@@ -43,7 +43,7 @@ Architecture documentation for the overhaul:
 
 | File | Why |
 |---|---|
-| `crates/zeroclaw-gateway/src/api.rs` | Shared id resolution (verbatim key, then `gw_<id>`, then `rpc_<id>`) replaces the per-handler `gw_` hard-coding and the underscore heuristic in the messages handler. |
+| `crates/zeroclaw-gateway/src/api.rs` | Shared id resolution (verbatim key, then `gw_<id>`, then `rpc_<id>`, then `cc_<id>`) replaces the per-handler `gw_` hard-coding and the underscore heuristic in the messages handler. |
 
 ### Scoped hourly TTL sweeps
 
@@ -165,7 +165,7 @@ Re-check these after every upstream merge; they are easy to silently lose:
   identifiers, so this gate is a privacy boundary, not an optimization.
 - **The session-id resolution policy lives in `zeroclaw-infra`.** Gateway
   REST, the sessions CLI, and the agent-facing session tools all resolve
-  `verbatim -> gw_ -> rpc_` through one helper next to the `SessionBackend`
+  `verbatim -> gw_ -> rpc_ -> cc_` through one helper next to the `SessionBackend`
   trait. Do not reintroduce per-surface copies.
 - **`/hooks/claude-code` gains authenticated ingestion.** Upstream's handler
   logs and returns ok; ours additionally ingests `cc_<session_id>` session

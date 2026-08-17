@@ -140,7 +140,8 @@ endpoints require the pairing-derived bearer token.
 | `GET` | `/api/sessions/running` | List sessions currently mid-turn. |
 
 `{id}` resolution is uniform across all verbs: the id is tried verbatim as a
-store key first, then as `gw_<id>`, then as `rpc_<id>`. Channel-composite and
+store key first, then as `gw_<id>`, then as `rpc_<id>`, then as `cc_<id>`.
+Channel-composite and
 RPC sessions therefore get the same verb set as gateway WebSocket sessions.
 
 Session mutations also emit lifecycle frames on `/api/events` with

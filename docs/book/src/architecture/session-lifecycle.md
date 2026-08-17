@@ -167,7 +167,8 @@ and fall back to fetch-on-load when the frames are withheld.
 ### REST verb parity for non-`gw_` keys
 
 Every `/api/sessions/{id}` verb resolves the id the same way: try the id
-verbatim as a store key, then `gw_<id>`, then `rpc_<id>`. This replaces the
+verbatim as a store key, then `gw_<id>`, then `rpc_<id>`, then `cc_<id>`.
+This replaces the
 old per-handler behavior where rename, state, and abort hard-coded the `gw_`
 prefix and the messages handler guessed from whether the id contained an
 underscore. Channel and RPC sessions get the full verb set.
