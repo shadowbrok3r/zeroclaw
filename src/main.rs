@@ -407,6 +407,7 @@ mod security;
 mod security_status;
 #[cfg(feature = "agent-runtime")]
 mod service;
+mod sessions_cli;
 #[cfg(feature = "agent-runtime")]
 mod skillforge;
 #[cfg(feature = "agent-runtime")]
@@ -430,7 +431,8 @@ use config::Config;
 pub use zeroclaw::{
     AgentsCommands, ChannelCommands, ChannelsCommands, CronCommands, GatewayCommands,
     HardwareCommands, IntegrationCommands, MigrateCommands, PeripheralCommands, ProvidersCommands,
-    ServiceCommands, SkillBundleCommands, SkillCommands, SopCommands, SopGraphFormat,
+    ServiceCommands, SessionsCommands, SkillBundleCommands, SkillCommands, SopCommands,
+    SopGraphFormat,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -855,6 +857,12 @@ Examples:
     Channels {
         #[command(subcommand)]
         channels_command: ChannelsCommands,
+    },
+
+    /// Inspect and manage persisted sessions (list/show/search/rename/delete)
+    Sessions {
+        #[command(subcommand)]
+        sessions_command: SessionsCommands,
     },
 
     /// Browse 50+ integrations
@@ -4973,6 +4981,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
         }
         Commands::Channels { channels_command } => {
             Box::pin(alias_cli::handle_channels(channels_command, &mut config)).await
+        }
+        Commands::Sessions { sessions_command } => {
+            sessions_cli::handle_sessions(sessions_command, &config)
         }
 
         Commands::Integrations {

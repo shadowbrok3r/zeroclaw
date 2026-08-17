@@ -428,6 +428,68 @@ pub enum ChannelsCommands {
     },
 }
 
+/// Inspect and manage persisted sessions in the unified session store
+/// (`<data_dir>/sessions`). Read-mostly; `rename`/`delete` are the only
+/// writes. Every subcommand that prints data supports `--json` for
+/// machine-parseable stdout.
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SessionsCommands {
+    /// List sessions, most recently active first
+    List {
+        /// Only sessions owned by this agent alias
+        #[arg(long)]
+        agent: Option<String>,
+        /// Only sessions whose channel id starts with this prefix
+        /// (e.g. `discord` or `discord.clamps`)
+        #[arg(long)]
+        channel: Option<String>,
+        /// Maximum number of sessions to show
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Emit the raw metadata array as JSON on stdout
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a session transcript
+    Show {
+        /// Session id: a full key, or a bare gateway/RPC id
+        /// (`gw_`/`rpc_` prefixes are tried automatically)
+        id: String,
+        /// Show only the most recent N messages (0 = all)
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Emit structured messages as JSON on stdout
+        #[arg(long)]
+        json: bool,
+    },
+    /// Full-text search across session messages (sqlite backend only)
+    Search {
+        /// Keyword to search for
+        keyword: String,
+        /// Maximum number of matches to show
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Emit matching session metadata as JSON on stdout
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set the human-readable name of a session
+    Rename {
+        /// Session id (resolved like `show`)
+        id: String,
+        /// New name
+        name: String,
+    },
+    /// Delete a session and all of its messages
+    Delete {
+        /// Session id (resolved like `show`)
+        id: String,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
 /// Skills management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SkillCommands {
