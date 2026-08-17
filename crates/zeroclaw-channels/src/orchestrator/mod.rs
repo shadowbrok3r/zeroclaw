@@ -10483,13 +10483,19 @@ pub async fn start_channels(
         // Hourly channel-scoped TTL sweep (rows with a channel_id). Gateway
         // `gw_` rows are swept by the gateway's own sweep; RPC sessions are
         // never TTL'd here. The interval's first tick completes immediately,
-        // so a startup sweep runs before the hourly cadence.
+        // so a startup sweep runs before the hourly cadence. Ends with the
+        // orchestrator's cancellation token so daemon reloads do not
+        // accumulate sweep tasks.
         let ttl_hours = u64::from(config.channels.session_ttl_hours);
         let sweep_backend = Arc::clone(store);
+        let sweep_cancel = cancel.clone();
         zeroclaw_spawn::spawn!(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = sweep_cancel.cancelled() => break,
+                    _ = interval.tick() => {}
+                }
                 match sweep_backend.cleanup_stale_scoped(
                     ttl_hours,
                     zeroclaw_infra::session_backend::SessionCleanupScope::Channel,
