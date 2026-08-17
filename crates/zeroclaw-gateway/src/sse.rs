@@ -156,7 +156,15 @@ fn history_events_payload(buffer: &EventBuffer) -> serde_json::Value {
 }
 
 fn is_public_sse_event(event: &serde_json::Value) -> bool {
-    if event.get("source").and_then(serde_json::Value::as_str) == Some("observability") {
+    let source = event.get("source").and_then(serde_json::Value::as_str);
+    if source == Some("observability") {
+        return true;
+    }
+    // Session lifecycle frames (`session_events` emitter) carry a
+    // `session_id` discriminator but are metadata-only by contract — no
+    // message content — so they are deliverable on the public stream. The
+    // withhold below exists to keep chat CONTENT private, not session keys.
+    if source == Some("sessions") {
         return true;
     }
     event
@@ -570,6 +578,27 @@ mod tests {
         let frame = serde_json::json!({ "type": "message", "session_id": "operator-1" });
         assert!(sse_frame_for_stream(frame.clone(), true).is_none());
         assert!(sse_frame_for_stream(frame, false).is_none());
+    }
+
+    #[test]
+    fn session_lifecycle_frames_are_public_despite_session_id() {
+        // `source == "sessions"` frames are metadata-only by contract (see
+        // `session_events::tests::frames_carry_metadata_only_never_content`),
+        // so the session_id-based content withhold must not eat them.
+        let frame = crate::session_events::build_session_event(
+            crate::session_events::SessionEventKind::Update,
+            "gw_operator-1",
+            &crate::session_events::SessionEventFields::default(),
+        );
+        assert_eq!(frame["session_id"], "operator-1");
+        assert!(is_public_sse_event(&frame));
+        // A chat message frame with the same session_id stays withheld.
+        let chat = serde_json::json!({
+            "type": "message",
+            "session_id": "operator-1",
+            "content": "private",
+        });
+        assert!(!is_public_sse_event(&chat));
     }
 
     #[test]

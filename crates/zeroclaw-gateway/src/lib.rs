@@ -37,6 +37,7 @@ pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
 pub mod security_headers;
+pub(crate) mod session_events;
 pub mod session_queue;
 pub mod sse;
 pub mod static_files;

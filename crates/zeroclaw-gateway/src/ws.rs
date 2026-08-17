@@ -377,6 +377,25 @@ async fn handle_socket(
         // Stamp the agent alias so future /api/sessions queries and
         // per-agent filters can attribute this session to its agent.
         let _ = backend.set_session_agent_alias(&session_key, &agent_alias);
+
+        // Announce the session on the public event bus: resuming an existing
+        // transcript is an update, a fresh key is a creation.
+        let kind = if resumed {
+            crate::session_events::SessionEventKind::Update
+        } else {
+            crate::session_events::SessionEventKind::Created
+        };
+        crate::session_events::emit_session_event(
+            &state,
+            kind,
+            &session_key,
+            crate::session_events::SessionEventFields {
+                agent_alias: Some(agent_alias.clone()),
+                name: effective_name.clone(),
+                message_count: Some(u64::try_from(message_count).unwrap_or(u64::MAX)),
+                state: None,
+            },
+        );
     }
 
     // Send session_start message to client
@@ -749,9 +768,15 @@ async fn handle_socket(
 
             // ── Broadcast event (cron/heartbeat results) ──────────────
             event = broadcast_rx.recv() => {
+                // Session lifecycle frames (`source == "sessions"`) are
+                // dashboard metadata for the SSE stream; forwarding them here
+                // would interleave non-chat frame types into the chat
+                // protocol, so they are excluded like observability
+                // telemetry.
                 if let Ok(event) = event
                     && event_matches_session(&event, &session_id)
                     && !is_observability_telemetry(&event)
+                    && !is_session_lifecycle_event(&event)
                 {
                     let _ = sender.send(Message::Text(event.to_string().into())).await;
                 }
@@ -921,6 +946,10 @@ fn is_global_chat_event(event: &serde_json::Value) -> bool {
 
 fn is_observability_telemetry(event: &serde_json::Value) -> bool {
     event.get("source").and_then(serde_json::Value::as_str) == Some("observability")
+}
+
+fn is_session_lifecycle_event(event: &serde_json::Value) -> bool {
+    event.get("source").and_then(serde_json::Value::as_str) == Some("sessions")
 }
 
 /// Process a single chat message through the agent and send the response.
@@ -1327,6 +1356,11 @@ async fn process_chat_message(
             && backend.session_exists(session_key)
         {
             let _ = backend.set_session_state(session_key, "idle", None);
+            crate::session_events::emit_session_event_from_backend(
+                state,
+                crate::session_events::SessionEventKind::Update,
+                session_key,
+            );
         }
 
         // Broadcast agent_end event
@@ -1433,6 +1467,13 @@ async fn process_chat_message(
             // Set session state to idle
             if let Some(ref backend) = state.session_backend {
                 let _ = backend.set_session_state(session_key, "idle", None);
+                // Post-persist metadata refresh for the dashboard: the frame
+                // re-reads message_count so it reflects this turn's appends.
+                crate::session_events::emit_session_event_from_backend(
+                    state,
+                    crate::session_events::SessionEventKind::Update,
+                    session_key,
+                );
             }
 
             // Broadcast agent_end event

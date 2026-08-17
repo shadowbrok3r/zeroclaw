@@ -1629,6 +1629,29 @@ pub async fn handle_api_health(
 
 // ── Session API handlers ─────────────────────────────────────────
 
+/// Resolve a caller-supplied `{id}` path segment to the full session-store
+/// key. Tries the id verbatim first (channel-composite keys like
+/// `discord.clamps_room_alice` and already-prefixed `gw_`/`rpc_` keys), then
+/// the `gw_` gateway-WS prefix, then the `rpc_` RPC-chat prefix. Returns
+/// `None` when no session exists under any candidate key.
+fn resolve_session_key(
+    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    id: &str,
+) -> Option<String> {
+    if backend.session_exists(id) {
+        return Some(id.to_string());
+    }
+    let gw = format!("gw_{id}");
+    if backend.session_exists(&gw) {
+        return Some(gw);
+    }
+    let rpc = format!("rpc_{id}");
+    if backend.session_exists(&rpc) {
+        return Some(rpc);
+    }
+    None
+}
+
 /// GET /api/sessions — list gateway sessions
 pub async fn handle_api_sessions_list(
     State(state): State<AppState>,
@@ -1712,14 +1735,12 @@ pub async fn handle_api_session_messages(
         .into_response();
     };
 
-    // Accept either the full DB key (channel-driven sessions like
-    // `discord.clamps_…`) or the stripped form (legacy callers that pass
-    // just the UUID for gateway sessions).
-    let session_key = if id.starts_with("gw_") || id.contains('_') {
-        id.clone()
-    } else {
-        format!("gw_{id}")
-    };
+    // Accept the full DB key (channel-driven sessions like
+    // `discord.clamps_…`), the stripped gateway form (bare UUID), or a
+    // stripped RPC-chat id. Unknown ids keep the legacy `gw_` guess so the
+    // response shape stays an empty transcript rather than a 404.
+    let session_key =
+        resolve_session_key(backend.as_ref(), &id).unwrap_or_else(|| format!("gw_{id}"));
     let msgs = backend.load_with_timestamps(&session_key);
     let messages: Vec<serde_json::Value> = msgs
         .into_iter()
@@ -1767,18 +1788,18 @@ pub async fn handle_api_session_message_post(
             .into_response();
     };
 
-    let session_key = format!("gw_{id}");
-    if !backend
-        .list_sessions()
-        .iter()
-        .any(|key| key == &session_key)
-    {
+    let Some(session_key) = resolve_session_key(backend.as_ref(), &id) else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Session not found"})),
         )
             .into_response();
-    }
+    };
+    // Display form mirrors /api/sessions: `gw_` stripped, other keys as-is.
+    let display_id = session_key
+        .strip_prefix("gw_")
+        .unwrap_or(&session_key)
+        .to_string();
 
     let _session_guard = match state.session_queue.acquire(&session_key).await {
         Ok(guard) => guard,
@@ -1811,7 +1832,7 @@ pub async fn handle_api_session_message_post(
     // query parameter; the `gw_` storage key is only for persistence.
     let event = serde_json::json!({
         "type": "message",
-        "session_id": id.clone(),
+        "session_id": display_id.clone(),
         "role": "assistant",
         "content": body.content.clone(),
         "source": "api",
@@ -1819,9 +1840,16 @@ pub async fn handle_api_session_message_post(
     });
     let _ = state.event_tx.send(event);
 
+    // Metadata-only lifecycle frame so dashboards refresh message counts.
+    crate::session_events::emit_session_event_from_backend(
+        &state,
+        crate::session_events::SessionEventKind::Update,
+        &session_key,
+    );
+
     Json(serde_json::json!({
         "status": "ok",
-        "session_id": id,
+        "session_id": display_id,
         "message": {
             "role": "assistant",
             "content": message.content,
@@ -1849,10 +1877,12 @@ pub async fn handle_api_session_delete(
             .into_response();
     };
 
-    let session_key = if id.starts_with("gw_") || id.contains('_') {
-        id.clone()
-    } else {
-        format!("gw_{id}")
+    let Some(session_key) = resolve_session_key(backend.as_ref(), &id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response();
     };
 
     let token = state
@@ -1870,8 +1900,21 @@ pub async fn handle_api_session_delete(
         );
     }
 
+    // Capture metadata before the row is gone so the closed frame can still
+    // carry alias/name/count.
+    let closed_fields =
+        crate::session_events::fields_from_backend(backend.as_ref(), &session_key);
+
     match backend.delete_session(&session_key) {
-        Ok(true) => Json(serde_json::json!({"deleted": true, "session_id": id})).into_response(),
+        Ok(true) => {
+            crate::session_events::emit_session_event(
+                &state,
+                crate::session_events::SessionEventKind::Closed,
+                &session_key,
+                closed_fields,
+            );
+            Json(serde_json::json!({"deleted": true, "session_id": id})).into_response()
+        }
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Session not found"})),
@@ -1913,20 +1956,25 @@ pub async fn handle_api_session_rename(
             .into_response();
     }
 
-    let session_key = format!("gw_{id}");
-
-    // Verify the session exists before renaming
-    let sessions = backend.list_sessions();
-    if !sessions.contains(&session_key) {
+    // Resolve gateway (`gw_`), RPC (`rpc_`), and channel-composite keys so
+    // channel-driven sessions (Discord threads, ...) can be named too.
+    let Some(session_key) = resolve_session_key(backend.as_ref(), &id) else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Session not found"})),
         )
             .into_response();
-    }
+    };
 
     match backend.set_session_name(&session_key, name) {
-        Ok(()) => Json(serde_json::json!({"session_id": id, "name": name})).into_response(),
+        Ok(()) => {
+            crate::session_events::emit_session_event_from_backend(
+                &state,
+                crate::session_events::SessionEventKind::Update,
+                &session_key,
+            );
+            Json(serde_json::json!({"session_id": id, "name": name})).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to rename session: {e}")})),
@@ -1987,7 +2035,13 @@ pub async fn handle_api_session_state(
             .into_response();
     };
 
-    let session_key = format!("gw_{id}");
+    let Some(session_key) = resolve_session_key(backend.as_ref(), &id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response();
+    };
     match backend.get_session_state(&session_key) {
         Ok(Some(ss)) => {
             let mut resp = serde_json::json!({
@@ -2026,24 +2080,42 @@ pub async fn handle_api_session_abort(
         return e.into_response();
     }
 
-    let session_key = format!("gw_{id}");
+    // Resolve through the backend when persistence is on; otherwise (or for
+    // ids with no stored row) fall back to trying the candidate key forms
+    // directly — cancel tokens exist even with persistence disabled.
+    let candidates: Vec<String> = match state
+        .session_backend
+        .as_ref()
+        .and_then(|backend| resolve_session_key(backend.as_ref(), &id))
+    {
+        Some(key) => vec![key],
+        None => vec![id.clone(), format!("gw_{id}"), format!("rpc_{id}")],
+    };
 
     // Look up and cancel the token. Hold the lock only long enough to
     // clone the token — cancellation itself does not need the lock.
-    let token = state
-        .cancel_tokens
-        .lock()
-        .expect("cancel_tokens lock poisoned")
-        .get(&session_key)
-        .cloned();
+    let token = {
+        let tokens = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned");
+        candidates
+            .iter()
+            .find_map(|key| tokens.get(key).cloned().map(|token| (key.clone(), token)))
+    };
 
-    if let Some(token) = token {
+    if let Some((session_key, token)) = token {
         token.cancel();
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_attrs(::serde_json::json!({"session_key": session_key})),
             "session abort requested"
+        );
+        crate::session_events::emit_session_event_from_backend(
+            &state,
+            crate::session_events::SessionEventKind::Update,
+            &session_key,
         );
         Json(serde_json::json!({ "status": "aborted" })).into_response()
     } else {
@@ -3288,9 +3360,16 @@ pub(crate) mod tests {
         assert_eq!(event["content"], "deploy finished");
 
         let history = state.event_buffer.snapshot();
+        assert_eq!(
+            history.len(),
+            1,
+            "only the metadata-only lifecycle frame lands in global event history: {history:?}"
+        );
+        assert_eq!(history[0]["type"], "session_update");
+        assert_eq!(history[0]["source"], "sessions");
         assert!(
-            history.is_empty(),
-            "session-scoped chat messages stay out of global event history"
+            history[0].get("content").is_none(),
+            "session-scoped chat CONTENT stays out of global event history"
         );
     }
 
@@ -3407,6 +3486,213 @@ pub(crate) mod tests {
         let messages = backend.load("gw_operator-1");
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1].content, "queued notification");
+    }
+
+    // ── Session {id} resolution + lifecycle-event router tests ────────
+
+    fn sessions_app(state: AppState) -> axum::Router {
+        axum::Router::new()
+            .route("/api/sessions", axum::routing::get(handle_api_sessions_list))
+            .route(
+                "/api/sessions/{id}/messages",
+                axum::routing::get(handle_api_session_messages)
+                    .post(handle_api_session_message_post),
+            )
+            .route(
+                "/api/sessions/{id}",
+                axum::routing::delete(handle_api_session_delete)
+                    .put(handle_api_session_rename),
+            )
+            .route(
+                "/api/sessions/{id}/state",
+                axum::routing::get(handle_api_session_state),
+            )
+            .route(
+                "/api/sessions/{id}/abort",
+                axum::routing::post(handle_api_session_abort),
+            )
+            .with_state(state)
+    }
+
+    /// SQLite-backed state (name/state/metadata support) for resolver tests.
+    fn sqlite_session_state() -> (tempfile::TempDir, AppState, Arc<dyn SessionBackend>) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = zeroclaw_infra::make_session_backend(tmp.path(), "sqlite").unwrap();
+        let state = test_state_with_session_backend(
+            zeroclaw_config::schema::Config::default(),
+            backend.clone(),
+        );
+        (tmp, state, backend)
+    }
+
+    fn json_request(method: &str, uri: &str, body: serde_json::Value) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn empty_request(method: &str, uri: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn session_rename_resolves_channel_composite_key_and_emits_update() {
+        use tower::ServiceExt as _;
+
+        let (_tmp, state, backend) = sqlite_session_state();
+        let key = "discord.clamps_room1_alice";
+        backend
+            .append(key, &zeroclaw_providers::ChatMessage::user("hi"))
+            .unwrap();
+        let mut rx = state.event_tx.subscribe();
+
+        let response = sessions_app(state)
+            .oneshot(json_request(
+                "PUT",
+                &format!("/api/sessions/{key}"),
+                serde_json::json!({"name": "ops thread"}),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            backend.get_session_name(key).unwrap().as_deref(),
+            Some("ops thread"),
+            "rename must reach the channel-composite row"
+        );
+
+        let event = rx.try_recv().expect("session_update broadcast");
+        assert_eq!(event["type"], "session_update");
+        assert_eq!(event["source"], "sessions");
+        assert_eq!(event["session_key"], key);
+        assert_eq!(event["name"], "ops thread");
+        assert!(event.get("content").is_none());
+    }
+
+    #[tokio::test]
+    async fn session_messages_get_resolves_rpc_prefixed_key() {
+        use tower::ServiceExt as _;
+
+        let (_tmp, state, backend) = sqlite_session_state();
+        backend
+            .append(
+                "rpc_abc123",
+                &zeroclaw_providers::ChatMessage::assistant("rpc says hi"),
+            )
+            .unwrap();
+
+        let response = sessions_app(state)
+            .oneshot(empty_request("GET", "/api/sessions/abc123/messages"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let messages = json["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 1, "bare id must resolve to rpc_ key");
+        assert_eq!(messages[0]["content"], "rpc says hi");
+    }
+
+    #[tokio::test]
+    async fn session_state_resolves_bare_gateway_id_and_404s_unknown() {
+        use tower::ServiceExt as _;
+
+        let (_tmp, state, backend) = sqlite_session_state();
+        backend
+            .append("gw_op-1", &zeroclaw_providers::ChatMessage::user("hi"))
+            .unwrap();
+
+        let response = sessions_app(state.clone())
+            .oneshot(empty_request("GET", "/api/sessions/op-1/state"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["state"], "idle");
+
+        let response = sessions_app(state)
+            .oneshot(empty_request("GET", "/api/sessions/no-such-session/state"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn session_abort_resolves_bare_id_and_keeps_graceful_no_token_answer() {
+        use tower::ServiceExt as _;
+
+        let (_tmp, state, backend) = sqlite_session_state();
+        backend
+            .append("gw_op-1", &zeroclaw_providers::ChatMessage::user("hi"))
+            .unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .unwrap()
+            .insert("gw_op-1".to_string(), token.clone());
+        let mut rx = state.event_tx.subscribe();
+
+        let response = sessions_app(state.clone())
+            .oneshot(empty_request("POST", "/api/sessions/op-1/abort"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "aborted");
+        assert!(token.is_cancelled(), "bare id must cancel the gw_ token");
+
+        let event = rx.try_recv().expect("session_update broadcast");
+        assert_eq!(event["type"], "session_update");
+        assert_eq!(event["session_key"], "gw_op-1");
+
+        // Session with no registered token keeps the graceful answer.
+        backend
+            .append("gw_op-2", &zeroclaw_providers::ChatMessage::user("hi"))
+            .unwrap();
+        let response = sessions_app(state)
+            .oneshot(empty_request("POST", "/api/sessions/op-2/abort"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "no_active_response");
+    }
+
+    #[tokio::test]
+    async fn session_delete_resolves_key_and_emits_session_closed() {
+        use tower::ServiceExt as _;
+
+        let (_tmp, state, backend) = sqlite_session_state();
+        backend
+            .append("gw_op-2", &zeroclaw_providers::ChatMessage::user("bye"))
+            .unwrap();
+        let mut rx = state.event_tx.subscribe();
+
+        let response = sessions_app(state)
+            .oneshot(empty_request("DELETE", "/api/sessions/op-2"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["deleted"], true);
+        assert!(!backend.session_exists("gw_op-2"));
+
+        let event = rx.try_recv().expect("session_closed broadcast");
+        assert_eq!(event["type"], "session_closed");
+        assert_eq!(event["source"], "sessions");
+        assert_eq!(event["session_key"], "gw_op-2");
+        assert_eq!(event["session_id"], "op-2");
+        assert_eq!(event["message_count"], 1);
+        assert!(event.get("content").is_none());
     }
 
     #[tokio::test]
