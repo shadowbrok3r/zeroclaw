@@ -256,6 +256,12 @@ Contract rules:
   endpoint.
 - `cc_` rows are never TTL-swept; they persist until deleted through the
   session verbs.
+- Secret guessing is rate limited per client key through the gateway auth
+  limiter, matching the `/webhook` posture.
+- A transcript upload that parses to zero turns answers `replaced: false`
+  and leaves the live rows untouched; a real replacement runs as one SQLite
+  transaction (`SessionBackend::replace_messages`), so a mid-replace failure
+  keeps the previous transcript.
 
 The threads panel lists `cc_` sessions in a dedicated read-only "Claude
 Code" group (see the next section).

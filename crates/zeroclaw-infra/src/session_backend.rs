@@ -176,6 +176,23 @@ pub trait SessionBackend: Send + Sync {
         Ok(count)
     }
 
+    /// Replace a session's message rows with `messages`, keeping the metadata
+    /// row (name, agent alias, routing context). Returns the number of
+    /// messages written. The default implementation is a non-atomic
+    /// clear-then-append fallback; backends with transactions should override
+    /// so a mid-replace failure cannot leave a half-written transcript.
+    fn replace_messages(
+        &self,
+        session_key: &str,
+        messages: &[ChatMessage],
+    ) -> std::io::Result<usize> {
+        self.clear_messages(session_key)?;
+        for message in messages {
+            self.append(session_key, message)?;
+        }
+        Ok(messages.len())
+    }
+
     /// Delete all messages for a session. Returns `true` if the session existed.
     fn delete_session(&self, _session_key: &str) -> std::io::Result<bool> {
         Ok(false)

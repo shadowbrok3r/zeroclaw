@@ -174,3 +174,11 @@ Re-check these after every upstream merge; they are easy to silently lose:
   With no secret configured the unauthenticated log-only behavior is
   unchanged. A merge that restores upstream's handler silently drops
   ingestion with no compile error on the config knob.
+- **Hook endpoints are auth-rate-limited and wipe-safe.** Secret guessing on
+  both hook endpoints goes through the gateway auth limiter (mirroring
+  `/webhook`), a transcript upload that parses to zero turns never clears the
+  live rows (`replaced: false`), and SQLite transcript replacement is one
+  transaction (`SessionBackend::replace_messages`). The `claude_code_runner`
+  tool's own hook posting is legacy/best-effort: it cannot attach the secret
+  header or `?agent=`, so runner-spawned sessions do not ingest (documented
+  at the `hook_url` site in `claude_code_runner.rs`).

@@ -2461,8 +2461,42 @@ fn validated_hook_agent(
     }
 }
 
+/// Auth throttle shared by the two hook endpoints, mirroring
+/// `handle_webhook`'s posture: when a secret is configured, secret guessing
+/// is rate limited per client key BEFORE the constant-time compare, and every
+/// failed compare records an attempt. Returns the 429 response to send when
+/// the caller is throttled.
+fn claude_code_hook_rate_key(
+    state: &AppState,
+    peer_addr: std::net::SocketAddr,
+    headers: &HeaderMap,
+) -> String {
+    crate::client_key_from_request(Some(peer_addr), headers, state.trust_forwarded_headers)
+}
+
+fn claude_code_hook_throttled(
+    state: &AppState,
+    rate_key: &str,
+) -> Option<axum::response::Response> {
+    state.claude_code_hook_secret_hash.as_ref()?;
+    match state.auth_limiter.check_rate_limit(rate_key) {
+        Ok(()) => None,
+        Err(e) => Some(
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": format!("Too many auth attempts. Try again in {}s.", e.retry_after_secs),
+                    "retry_after": e.retry_after_secs,
+                })),
+            )
+                .into_response(),
+        ),
+    }
+}
+
 pub async fn handle_claude_code_hook(
     State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer_addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Query(query): Query<ClaudeCodeHookQuery>,
     body: axum::body::Bytes,
@@ -2470,11 +2504,17 @@ pub async fn handle_claude_code_hook(
     // No bearer-token auth: Claude Code subprocesses cannot easily obtain a
     // pairing token. Instead, session ingestion is gated on the dedicated
     // `claude_code.hook_secret`; without one the endpoint stays log-only.
+    let rate_key = claude_code_hook_rate_key(&state, peer_addr, &headers);
+    if let Some(throttled) = claude_code_hook_throttled(&state, &rate_key) {
+        return throttled;
+    }
     let authorized = match check_claude_code_hook_secret(&state, &headers) {
         HookSecretCheck::Disabled => false,
         HookSecretCheck::Authorized => true,
         HookSecretCheck::Rejected => {
-            // Exactly one WARN per rejected request — no log flood.
+            state.auth_limiter.record_attempt(&rate_key);
+            // Exactly one WARN per rejected request — no log flood; the auth
+            // limiter above caps how often a guessing client gets this far.
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2629,6 +2669,7 @@ fn parse_transcript_line(line: &str) -> Option<(String, String)> {
 
 pub async fn handle_claude_code_transcript(
     State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer_addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Query(query): Query<ClaudeCodeTranscriptQuery>,
     body: axum::body::Bytes,
@@ -2636,6 +2677,10 @@ pub async fn handle_claude_code_transcript(
     // Same secret gate as the hook endpoint, but stricter when unset: with
     // ingestion disabled there is nothing this endpoint could do, so it
     // answers as if it did not exist.
+    let rate_key = claude_code_hook_rate_key(&state, peer_addr, &headers);
+    if let Some(throttled) = claude_code_hook_throttled(&state, &rate_key) {
+        return throttled;
+    }
     match check_claude_code_hook_secret(&state, &headers) {
         HookSecretCheck::Disabled => {
             return (
@@ -2645,6 +2690,7 @@ pub async fn handle_claude_code_transcript(
                 .into_response();
         }
         HookSecretCheck::Rejected => {
+            state.auth_limiter.record_attempt(&rate_key);
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2697,26 +2743,39 @@ pub async fn handle_claude_code_transcript(
     let text = String::from_utf8_lossy(&body);
     let turns: Vec<(String, String)> = text.lines().filter_map(parse_transcript_line).collect();
 
-    // Full-fidelity replacement: drop the sparse live rows, append the
-    // parsed transcript in order. `clear_messages` keeps the metadata row,
-    // so name and agent alias survive (pinned by test).
     let session_key = format!("cc_{session_id}");
+    if turns.is_empty() {
+        // A corrupted or turn-free upload must not destroy the sparse live
+        // rows: they are the only record until a good transcript arrives.
+        // No clear, no metadata mutation; the client's final SessionEnd
+        // event flips the state idle on its own.
+        return Json(serde_json::json!({
+            "ok": true,
+            "session_key": session_key,
+            "messages": 0,
+            "replaced": false,
+        }))
+        .into_response();
+    }
+
+    // Full-fidelity replacement: swap the sparse live rows for the parsed
+    // transcript in one backend call (transactional on SQLite, so a
+    // mid-replace failure keeps the previous rows). Metadata survives, so
+    // name and agent alias are preserved (pinned by test).
+    let messages: Vec<zeroclaw_providers::ChatMessage> = turns
+        .iter()
+        .map(|(role, content)| zeroclaw_providers::ChatMessage {
+            role: role.clone(),
+            content: content.clone(),
+        })
+        .collect();
     let replace = || -> std::io::Result<()> {
         if backend.get_session_agent_alias(&session_key)?.is_none() {
             // Fresh or unattributed key: stamp the validated alias (upserts
             // the metadata row). An existing attribution is left untouched.
             backend.set_session_agent_alias(&session_key, &agent_alias)?;
         }
-        backend.clear_messages(&session_key)?;
-        for (role, content) in &turns {
-            backend.append(
-                &session_key,
-                &zeroclaw_providers::ChatMessage {
-                    role: role.clone(),
-                    content: content.clone(),
-                },
-            )?;
-        }
+        backend.replace_messages(&session_key, &messages)?;
         backend.set_session_state(&session_key, "idle", None)?;
         Ok(())
     };
@@ -4316,6 +4375,13 @@ pub(crate) mod tests {
                 axum::routing::post(handle_claude_code_hook),
             )
             .with_state(state)
+            // The production app is served with connect info; oneshot tests
+            // need the mock layer for the rate-key extractor.
+            .layer(axum::extract::connect_info::MockConnectInfo(
+                // Non-loopback: the auth limiter exempts loopback callers
+                // (the shim's forwards), so tests must look remote.
+                std::net::SocketAddr::from(([203, 0, 113, 9], 40000)),
+            ))
     }
 
     /// SQLite-backed state with `test-agent` configured and the hook secret
@@ -4532,6 +4598,13 @@ pub(crate) mod tests {
             .layer(tower_http::limit::RequestBodyLimitLayer::new(
                 CLAUDE_CODE_TRANSCRIPT_MAX_BODY_BYTES,
             ))
+            // The production app is served with connect info; oneshot tests
+            // need the mock layer for the rate-key extractor.
+            .layer(axum::extract::connect_info::MockConnectInfo(
+                // Non-loopback: the auth limiter exempts loopback callers
+                // (the shim's forwards), so tests must look remote.
+                std::net::SocketAddr::from(([203, 0, 113, 9], 40000)),
+            ))
     }
 
     fn transcript_request(
@@ -4598,6 +4671,85 @@ pub(crate) mod tests {
                 .as_deref(),
             Some("test-agent"),
             "fresh key gets stamped with the validated alias"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_hook_secret_guessing_is_rate_limited() {
+        use tower::ServiceExt as _;
+
+        let (_tmp, state, _backend) = claude_hook_state();
+        let start = serde_json::json!({
+            "session_id": "sess-rl",
+            "hook_event_name": "SessionStart",
+        });
+
+        // MAX_ATTEMPTS wrong-secret requests are each answered 401 (and
+        // recorded); the next one must be throttled with 429 before the
+        // constant-time compare runs.
+        for _ in 0..crate::auth_rate_limit::MAX_ATTEMPTS {
+            let response = claude_hook_app(state.clone())
+                .oneshot(hook_request(
+                    "/hooks/claude-code?agent=test-agent",
+                    Some("wrong-secret"),
+                    &start,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let response = claude_hook_app(state)
+            .oneshot(hook_request(
+                "/hooks/claude-code?agent=test-agent",
+                Some("wrong-secret"),
+                &start,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "secret guessing must hit the auth limiter"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_transcript_empty_upload_preserves_live_rows() {
+        use tower::ServiceExt as _;
+
+        let (_tmp, state, backend) = claude_hook_state();
+        backend
+            .set_session_agent_alias("cc_sess-e", "test-agent")
+            .unwrap();
+        backend
+            .append(
+                "cc_sess-e",
+                &zeroclaw_providers::ChatMessage::user("only record of this session"),
+            )
+            .unwrap();
+
+        // A body that parses to zero turns (progress lines + junk) must not
+        // wipe the live rows: they are the only record until a good
+        // transcript arrives.
+        let body = "not-json\n{\"type\":\"progress\"}\n{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"<local-command>x</local-command>\"}}\n";
+        let response = transcript_app(state)
+            .oneshot(transcript_request(
+                "/hooks/claude-code/transcript?session=sess-e&agent=test-agent",
+                Some(TEST_HOOK_SECRET),
+                body.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["replaced"], false);
+        assert_eq!(json["messages"], 0);
+
+        let messages = backend.load("cc_sess-e");
+        assert_eq!(
+            messages.len(),
+            1,
+            "an empty parse must leave the sparse live rows untouched"
         );
     }
 
