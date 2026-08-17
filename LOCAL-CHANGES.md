@@ -81,6 +81,19 @@ Architecture documentation for the overhaul:
 | `web/src/lib/i18n.ts` | Threads UI strings (web text contract). |
 | `web/src/lib/slashCommands.ts` | `/new` starts a fresh thread instead of deleting the current session. |
 
+### Claude Code session ingestion (`cc_` family)
+
+| File | Why |
+|---|---|
+| `crates/zeroclaw-config/src/schema.rs` | New `claude_code.hook_secret` knob (default unset; `#[secret]`): enables session ingestion on `/hooks/claude-code`. |
+| `crates/zeroclaw-gateway/src/lib.rs` | `AppState.claude_code_hook_secret_hash` (hashed at boot, plaintext never stored); registers the transcript backfill sub-router with its own 8 MiB body limit. |
+| `crates/zeroclaw-gateway/src/api.rs` | Reworked `handle_claude_code_hook` (dual payload shapes, `X-ZC-Hook-Secret` auth, ingestion into `cc_<session_id>` rows) plus the new `handle_claude_code_transcript` backfill handler. |
+| `crates/zeroclaw-gateway/src/api_config.rs`, `crates/zeroclaw-gateway/src/api_sections.rs` | Test `AppState` literals gain the new field. |
+| `web/src/components/ThreadsPanel.tsx` | Read-only "Claude Code" group for `cc_` keys above the TUI group. |
+| `web/src/lib/i18n.ts` | `threads.claude_code` string key. |
+| `docs/book/src/architecture/session-lifecycle.md` | `cc_` family row plus "Claude Code sessions" subsection (hook contract). |
+| `docs/book/src/gateway/api.md` | Claude Code hook endpoints table under session endpoints. |
+
 ### `zeroclaw sessions` CLI
 
 | File | Why |
@@ -154,3 +167,18 @@ Re-check these after every upstream merge; they are easy to silently lose:
   REST, the sessions CLI, and the agent-facing session tools all resolve
   `verbatim -> gw_ -> rpc_` through one helper next to the `SessionBackend`
   trait. Do not reintroduce per-surface copies.
+- **`/hooks/claude-code` gains authenticated ingestion.** Upstream's handler
+  logs and returns ok; ours additionally ingests `cc_<session_id>` session
+  rows when `claude_code.hook_secret` is configured and the caller presents
+  it via `X-ZC-Hook-Secret` (plus a transcript backfill sibling endpoint).
+  With no secret configured the unauthenticated log-only behavior is
+  unchanged. A merge that restores upstream's handler silently drops
+  ingestion with no compile error on the config knob.
+- **Hook endpoints are auth-rate-limited and wipe-safe.** Secret guessing on
+  both hook endpoints goes through the gateway auth limiter (mirroring
+  `/webhook`), a transcript upload that parses to zero turns never clears the
+  live rows (`replaced: false`), and SQLite transcript replacement is one
+  transaction (`SessionBackend::replace_messages`). The `claude_code_runner`
+  tool's own hook posting is legacy/best-effort: it cannot attach the secret
+  header or `?agent=`, so runner-spawned sessions do not ingest (documented
+  at the `hook_url` site in `claude_code_runner.rs`).

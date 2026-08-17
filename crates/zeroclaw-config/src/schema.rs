@@ -9026,6 +9026,15 @@ pub struct ClaudeCodeConfig {
     #[serde(default)]
     #[credential_class = "legacy_env_path"]
     pub env_passthrough: Vec<String>,
+    /// Shared secret that enables session ingestion on `/hooks/claude-code`
+    /// (and its transcript backfill sibling). Callers present it via the
+    /// `X-ZC-Hook-Secret` header; the gateway hashes it at boot and never
+    /// keeps the plaintext in state. When unset the endpoint stays log-only.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub hook_secret: Option<String>,
 }
 
 fn default_claude_code_timeout_secs() -> u64 {
@@ -9049,6 +9058,7 @@ impl Default for ClaudeCodeConfig {
             system_prompt: None,
             max_output_bytes: default_claude_code_max_output_bytes(),
             env_passthrough: Vec::new(),
+            hook_secret: None,
         }
     }
 }
@@ -23424,6 +23434,22 @@ max_height = 8
         assert_eq!(cfg.settle_ms, 250);
         assert_eq!(cfg.max_content_bytes, Some(65536));
         assert_eq!(cfg.events.len(), 4);
+    }
+
+    /// `claude_code.hook_secret` gates gateway hook ingestion: it must
+    /// default to unset (endpoint stays log-only) and round-trip through
+    /// TOML when configured.
+    #[::core::prelude::v1::test]
+    fn claude_code_hook_secret_defaults_unset_and_parses() {
+        let cfg = ClaudeCodeConfig::default();
+        assert!(cfg.hook_secret.is_none(), "hook ingestion defaults closed");
+
+        let empty: ClaudeCodeConfig = toml::from_str("").expect("empty claude_code section parses");
+        assert!(empty.hook_secret.is_none());
+
+        let parsed: ClaudeCodeConfig = toml::from_str("hook_secret = \"cc-hook-secret\"")
+            .expect("claude_code section with hook_secret parses");
+        assert_eq!(parsed.hook_secret.as_deref(), Some("cc-hook-secret"));
     }
     use super::*;
     use std::ffi::OsString;

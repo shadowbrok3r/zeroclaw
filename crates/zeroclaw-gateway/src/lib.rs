@@ -410,7 +410,7 @@ fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
         .and_then(parse_client_ip)
 }
 
-fn client_key_from_request(
+pub(crate) fn client_key_from_request(
     peer_addr: Option<SocketAddr>,
     headers: &HeaderMap,
     trust_forwarded_headers: bool,
@@ -456,6 +456,9 @@ pub struct AppState {
     pub auto_save: bool,
     /// SHA-256 hash of `X-Webhook-Secret` (hex-encoded), never plaintext.
     pub webhook_secret_hash: Option<Arc<str>>,
+    /// SHA-256 hash of `X-ZC-Hook-Secret` (hex-encoded), never plaintext.
+    /// `None` keeps `/hooks/claude-code` log-only (no session ingestion).
+    pub claude_code_hook_secret_hash: Option<Arc<str>>,
     pub pairing: Arc<PairingGuard>,
     pub trust_forwarded_headers: bool,
     pub rate_limiter: Arc<GatewayRateLimiter>,
@@ -998,6 +1001,17 @@ pub async fn run_gateway(
                 (!trimmed_secret.is_empty())
                     .then(|| Arc::<str>::from(hash_webhook_secret(trimmed_secret)))
             })
+        });
+    // Claude Code hook ingestion secret: hashed at boot exactly like the
+    // webhook secret; the plaintext never reaches AppState.
+    let claude_code_hook_secret_hash: Option<Arc<str>> = config
+        .claude_code
+        .hook_secret
+        .as_ref()
+        .and_then(|raw_secret| {
+            let trimmed_secret = raw_secret.trim();
+            (!trimmed_secret.is_empty())
+                .then(|| Arc::<str>::from(hash_webhook_secret(trimmed_secret)))
         });
 
     // WhatsApp channel instances (one per cloud-configured alias), keyed by
@@ -1629,6 +1643,7 @@ pub async fn run_gateway(
         memory_strategy,
         auto_save: config.memory.auto_save,
         webhook_secret_hash,
+        claude_code_hook_secret_hash,
         pairing,
         trust_forwarded_headers: config.gateway.trust_forwarded_headers,
         rate_limiter,
@@ -1716,6 +1731,9 @@ pub async fn run_gateway(
         .route("/webhook", post(handle_webhook))
         .merge(optional_channel_routes())
         // ── Claude Code runner hooks ──
+        // The transcript sibling `/hooks/claude-code/transcript` lives on its
+        // own sub-router below: it needs a larger body limit than the
+        // router-wide `RequestBodyLimitLayer`.
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
@@ -2044,6 +2062,24 @@ pub async fn run_gateway(
             Duration::from_secs(gateway_request_timeout_secs(&config.gateway)),
         ));
 
+    // Claude Code transcript backfill: same hook-secret auth as
+    // /hooks/claude-code, but transcript JSONL tails exceed the 64 KiB
+    // router-wide body cap, so the route carries its own streaming limit
+    // (8 MiB; oversized uploads answer 413 mid-stream, never fully buffered).
+    let claude_transcript_router: Router = Router::new()
+        .route(
+            "/hooks/claude-code/transcript",
+            post(api::handle_claude_code_transcript),
+        )
+        .with_state(state.clone())
+        .layer(RequestBodyLimitLayer::new(
+            api::CLAUDE_CODE_TRANSCRIPT_MAX_BODY_BYTES,
+        ))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(gateway_request_timeout_secs(&config.gateway)),
+        ));
+
     // Manual cron-trigger and A2A task routes live on their own sub-router so
     // they can opt out of the 30s gateway-wide TimeoutLayer. Both run a
     // synchronous agent turn inline. Layers attached here travel with the
@@ -2060,7 +2096,9 @@ pub async fn run_gateway(
             Duration::from_secs(gateway_long_running_request_timeout_secs(&config.gateway)),
         ));
 
-    let inner = inner.merge(long_running_router);
+    let inner = inner
+        .merge(claude_transcript_router)
+        .merge(long_running_router);
 
     // Nest under path prefix when configured (axum strips prefix before routing).
     // nest() at "/prefix" handles both "/prefix" and "/prefix/*" but not "/prefix/"
@@ -4498,6 +4536,7 @@ mod tests {
             )),
             auto_save: false,
             webhook_secret_hash: None,
+            claude_code_hook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(require_pairing, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -5127,6 +5166,7 @@ mod tests {
             )),
             auto_save: false,
             webhook_secret_hash: None,
+            claude_code_hook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -5215,6 +5255,7 @@ mod tests {
             )),
             auto_save: false,
             webhook_secret_hash: None,
+            claude_code_hook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -5810,6 +5851,7 @@ mod tests {
             )),
             auto_save: false,
             webhook_secret_hash: None,
+            claude_code_hook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -5916,6 +5958,7 @@ mod tests {
             )),
             auto_save: false,
             webhook_secret_hash: None,
+            claude_code_hook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6037,6 +6080,7 @@ mod tests {
             )),
             auto_save: false,
             webhook_secret_hash: None,
+            claude_code_hook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6138,6 +6182,7 @@ mod tests {
             )),
             auto_save: true,
             webhook_secret_hash: None,
+            claude_code_hook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6258,6 +6303,7 @@ mod tests {
             )),
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
+            claude_code_hook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6344,6 +6390,7 @@ mod tests {
             )),
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
+            claude_code_hook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6435,6 +6482,7 @@ mod tests {
             )),
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
+            claude_code_hook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6533,6 +6581,7 @@ mod tests {
             )),
             auto_save: false,
             webhook_secret_hash: None,
+            claude_code_hook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6629,6 +6678,7 @@ mod tests {
             )),
             auto_save: false,
             webhook_secret_hash: None,
+            claude_code_hook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6781,6 +6831,7 @@ mod tests {
             )),
             auto_save: false,
             webhook_secret_hash: None,
+            claude_code_hook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -7624,6 +7675,7 @@ mod tests {
             )),
             auto_save: false,
             webhook_secret_hash: None,
+            claude_code_hook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -7711,6 +7763,7 @@ mod tests {
             )),
             auto_save: false,
             webhook_secret_hash: None,
+            claude_code_hook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -7872,6 +7925,7 @@ mod tests {
             )),
             auto_save: false,
             webhook_secret_hash: None,
+            claude_code_hook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),

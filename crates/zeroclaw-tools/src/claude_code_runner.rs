@@ -180,7 +180,15 @@ impl Tool for ClaudeCodeRunnerTool {
         let session_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let session_name = self.session_name(&session_id);
 
-        // Build the hook URL for Claude Code to POST events to
+        // Build the hook URL for Claude Code to POST events to.
+        //
+        // Known limitation: `--hook-url` is not a documented Claude Code CLI
+        // flag, and when `claude_code.hook_secret` is configured the gateway
+        // additionally requires the X-ZC-Hook-Secret header and a validated
+        // `?agent=` — neither of which this spawn path can attach. Runner
+        // hook delivery is therefore best-effort/legacy; cc_ session
+        // ingestion is driven by launcher-configured settings.json hooks
+        // (see LOCAL-CHANGES.md).
         let hook_url = format!("{}/hooks/claude-code", self.gateway_url);
 
         // Build the claude command that will run inside tmux

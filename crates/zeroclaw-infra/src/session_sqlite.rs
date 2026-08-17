@@ -542,6 +542,45 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(count)
     }
 
+    fn replace_messages(
+        &self,
+        session_key: &str,
+        messages: &[ChatMessage],
+    ) -> std::io::Result<usize> {
+        let conn = self.conn.lock();
+        let now = Utc::now().to_rfc3339();
+        // One transaction: a mid-replace failure rolls back to the previous
+        // transcript instead of leaving a half-written one. Metadata keeps
+        // name/alias/routing; only count and activity are refreshed.
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(std::io::Error::other)?;
+        tx.execute(
+            "DELETE FROM sessions WHERE session_key = ?1",
+            params![session_key],
+        )
+        .map_err(std::io::Error::other)?;
+        for message in messages {
+            tx.execute(
+                "INSERT INTO sessions (session_key, role, content, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![session_key, message.role, message.content, now],
+            )
+            .map_err(std::io::Error::other)?;
+        }
+        tx.execute(
+            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count)
+             VALUES (?1, ?2, ?2, ?3)
+             ON CONFLICT(session_key) DO UPDATE SET
+                last_activity = excluded.last_activity,
+                message_count = excluded.message_count",
+            params![session_key, now, messages.len() as i64],
+        )
+        .map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(messages.len())
+    }
+
     fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         let conn = self.conn.lock();
 
@@ -1315,6 +1354,54 @@ mod tests {
             "an in-flight (running) session must never be swept mid-turn"
         );
         assert!(!backend.session_exists("gw_stale_idle"));
+    }
+
+    #[test]
+    fn replace_messages_swaps_rows_and_keeps_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend
+            .append("cc_s1", &ChatMessage::user("live-1"))
+            .unwrap();
+        backend
+            .append("cc_s1", &ChatMessage::user("live-2"))
+            .unwrap();
+        backend.set_session_name("cc_s1", "cc:proj").unwrap();
+        backend.set_session_agent_alias("cc_s1", "coder").unwrap();
+
+        let full = [
+            ChatMessage::user("prompt"),
+            ChatMessage {
+                role: "assistant".into(),
+                content: "reply".into(),
+            },
+            ChatMessage::user("prompt-2"),
+        ];
+        assert_eq!(backend.replace_messages("cc_s1", &full).unwrap(), 3);
+
+        let rows = backend.load("cc_s1");
+        assert_eq!(
+            rows.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            ["prompt", "reply", "prompt-2"],
+            "live rows are fully replaced, in order"
+        );
+        let meta = backend.get_session_metadata("cc_s1").unwrap();
+        assert_eq!(meta.message_count, 3, "count reflects the replacement");
+        assert_eq!(meta.name.as_deref(), Some("cc:proj"));
+        assert_eq!(meta.agent_alias.as_deref(), Some("coder"));
+
+        // Replacing with an empty slice clears rows but keeps the metadata.
+        assert_eq!(backend.replace_messages("cc_s1", &[]).unwrap(), 0);
+        assert!(backend.load("cc_s1").is_empty());
+        assert_eq!(
+            backend
+                .get_session_metadata("cc_s1")
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("cc:proj")
+        );
     }
 
     #[test]
