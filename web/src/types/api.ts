@@ -294,10 +294,13 @@ export interface WsMessage {
   id?: string;
   message?: string;
   code?: string;
-  /** Machine-readable error key on `error` frames — e.g.
-   * `session_owned_by_other_agent` when the gateway refuses to resume a
-   * session owned by a different agent (pass `?adopt=true` to override). */
-  error?: string;
+  /** Machine-readable error key on `error` frames:
+   * - `session_owned_by_other_agent`: the gateway refuses to resume a session
+   *   owned by a different agent (pass `?adopt=true` to override);
+   * - `session_owned_by_other_device`: device scoping refuses the resume
+   *   outright (`adopt` does not cross the device boundary). This frame
+   *   carries neither `message` nor `owning_agent`. */
+  error?: 'session_owned_by_other_agent' | 'session_owned_by_other_device' | (string & {});
   /** Owning agent alias accompanying `session_owned_by_other_agent`. */
   owning_agent?: string;
   session_id?: string;

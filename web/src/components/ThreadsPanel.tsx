@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Check, Hash, MessageSquare, Pencil, Plus, RefreshCw, Trash2, X } from 'lucide-react';
-import type { Session, SessionLifecycleEvent, SessionMessageRow } from '@/types/api';
+import type { SSEEvent, Session, SessionLifecycleEvent, SessionMessageRow } from '@/types/api';
 import { getSessions, getSessionMessages, deleteSession, renameSession } from '@/lib/api';
 import { useAgent } from '@/contexts/AgentContext';
 import { useSSE } from '@/hooks/useSSE';
@@ -25,13 +25,17 @@ export interface ThreadsPanelProps {
 }
 
 /**
- * Per-agent session browser, opened from the chat header. Two sections:
+ * Per-agent session browser, opened from the chat header. Three sections:
  *
- * - **Chat threads** (`channel_id` null — gateway WebSocket sessions): open
+ * - **Chat threads** (`gw_` session keys — gateway WebSocket sessions): open
  *   (switch the live chat onto that thread), rename, and delete; plus a
- *   "new thread" action. The current thread is highlighted.
+ *   "new thread" action. The current thread is highlighted. Only `gw_` keys
+ *   are switchable: the WS mints its key as `gw_<session_id>`, so switching
+ *   onto any other key would fork an empty lookalike session.
  * - **Channel conversations** (`channel_id` set — Discord etc.): read-only;
  *   clicking a row opens a transcript viewer via the session messages API.
+ * - **Other sessions** (neither a `gw_` key nor a `channel_id` — rpc_/TUI
+ *   sessions): read-only, same transcript viewer as channel conversations.
  *
  * The list refetches on mount (the panel is mounted only while open) and
  * refreshes live on `session_created` / `session_update` / `session_closed`
@@ -68,18 +72,45 @@ export default function ThreadsPanel({ agentAlias, onClose }: ThreadsPanelProps)
     filterTypes: ['session_created', 'session_update', 'session_closed'],
     autoConnect: true,
   });
+  // React batches several useSSE setEvents calls from one network chunk into a
+  // single render, so inspecting only the last element would drop a relevant
+  // frame whenever another agent's frame lands last in the batch. Track how far
+  // we have scanned and inspect every newly appended frame instead, firing at
+  // most one load() per batch.
+  const processedEventCountRef = useRef(0);
+  const lastProcessedEventRef = useRef<SSEEvent | null>(null);
   useEffect(() => {
-    if (events.length === 0) return;
-    const last = events[events.length - 1] as Partial<SessionLifecycleEvent> | undefined;
+    if (events.length === 0) {
+      processedEventCountRef.current = 0;
+      lastProcessedEventRef.current = null;
+      return;
+    }
+    let start = processedEventCountRef.current;
+    // The hook's buffer is bounded (oldest frames trimmed at the cap), so a
+    // stale count can point past the appended slice. Rescan from the start
+    // when the marker no longer lines up; load() is an idempotent refetch, so
+    // the rare extra scan is harmless.
+    if (start > events.length || (start > 0 && events[start - 1] !== lastProcessedEventRef.current)) {
+      start = 0;
+    }
+    const fresh = events.slice(start);
+    processedEventCountRef.current = events.length;
+    lastProcessedEventRef.current = events[events.length - 1] ?? null;
     // Skip frames attributed to a different agent; refresh on unattributed ones.
-    if (last?.agent_alias && last.agent_alias !== agentAlias) return;
-    load();
-  }, [events.length, events, agentAlias, load]);
+    const relevant = fresh.some((ev) => {
+      const frame = ev as Partial<SessionLifecycleEvent>;
+      return !frame.agent_alias || frame.agent_alias === agentAlias;
+    });
+    if (relevant) load();
+  }, [events, agentAlias, load]);
 
+  // Only gateway WebSocket sessions (gw_ keys) are switchable chat threads:
+  // the WS mints its key as `gw_<session_id>`, so switching onto an rpc_/TUI
+  // session would mint `gw_rpc_<uuid>` and fork an empty lookalike session.
   const chatThreads = useMemo(
     () =>
       (sessions ?? [])
-        .filter((s) => !s.channel_id)
+        .filter((s) => !s.channel_id && s.session_key.startsWith('gw_'))
         .sort((a, b) => b.last_activity.localeCompare(a.last_activity)),
     [sessions],
   );
@@ -87,6 +118,15 @@ export default function ThreadsPanel({ agentAlias, onClose }: ThreadsPanelProps)
     () =>
       (sessions ?? [])
         .filter((s) => !!s.channel_id)
+        .sort((a, b) => b.last_activity.localeCompare(a.last_activity)),
+    [sessions],
+  );
+  // Neither a gw_ key nor a channel: rpc_/TUI sessions. Browsable read-only
+  // through the same transcript viewer as channel conversations.
+  const otherSessions = useMemo(
+    () =>
+      (sessions ?? [])
+        .filter((s) => !s.channel_id && !s.session_key.startsWith('gw_'))
         .sort((a, b) => b.last_activity.localeCompare(a.last_activity)),
     [sessions],
   );
@@ -101,14 +141,22 @@ export default function ThreadsPanel({ agentAlias, onClose }: ThreadsPanelProps)
   const commitRename = async () => {
     if (!renaming || renameSaving) return;
     const { key, value } = renaming;
+    const trimmed = value.trim();
+    // Empty or unchanged input is a cancel, not a rename: the server rejects
+    // PUT {name: ''} with 400 "name is required", which would surface the
+    // panel error banner and leave the editor wedged open.
+    const currentName = sessions?.find((s) => s.session_key === key)?.name ?? '';
+    if (!trimmed || trimmed === currentName) {
+      setRenaming(null);
+      return;
+    }
     setRenameSaving(true);
     try {
-      const trimmed = value.trim();
       await renameSession(key, trimmed);
       setSessions((prev) =>
         prev
           ? prev.map((s) =>
-              s.session_key === key ? { ...s, name: trimmed || undefined } : s,
+              s.session_key === key ? { ...s, name: trimmed } : s,
             )
           : prev,
       );
@@ -429,6 +477,59 @@ export default function ThreadsPanel({ agentAlias, onClose }: ThreadsPanelProps)
                   </div>
                 )}
               </section>
+
+              {/* Other sessions (rpc_/TUI — neither gw_ key nor channel).
+                  Read-only transcript access only: switching onto a non-gw_
+                  key would fork an empty session (see chatThreads). */}
+              {otherSessions.length > 0 && (
+                <section>
+                  <h3
+                    className="text-xs font-semibold uppercase tracking-wider mb-2"
+                    style={{ color: 'var(--pc-text-muted)' }}
+                  >
+                    {t('threads.other_sessions')}
+                  </h3>
+                  <div className="space-y-2">
+                    {otherSessions.map((s) => (
+                      <button
+                        key={s.session_key}
+                        type="button"
+                        onClick={() => openViewer(s)}
+                        className="w-full text-left flex items-center gap-2 py-2 px-3 rounded-xl hover:bg-[var(--pc-hover)]"
+                        style={{
+                          background: 'var(--pc-bg-elevated)',
+                          border: '1px solid transparent',
+                        }}
+                        title={t('threads.view_transcript')}
+                      >
+                        <div className="flex-1 min-w-0">
+                          <span className="flex items-center gap-2 flex-wrap">
+                            <span
+                              className={`text-sm truncate ${s.name ? 'font-medium' : 'font-mono'}`}
+                              style={{ color: 'var(--pc-text-primary)' }}
+                            >
+                              {s.name || s.session_id}
+                            </span>
+                          </span>
+                          <span
+                            className="flex items-center gap-2 text-xs mt-0.5"
+                            style={{ color: 'var(--pc-text-muted)' }}
+                          >
+                            <span className="flex items-center gap-1">
+                              <MessageSquare className="h-3 w-3" />
+                              {s.message_count}
+                            </span>
+                            <span>{formatRelative(s.last_activity)}</span>
+                            <span style={{ color: 'var(--pc-text-faint)' }}>
+                              {t('threads.read_only')}
+                            </span>
+                          </span>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </section>
+              )}
             </>
           )}
         </div>

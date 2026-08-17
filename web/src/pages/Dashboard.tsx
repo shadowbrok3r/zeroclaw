@@ -1055,13 +1055,21 @@ function SessionsTab() {
   const commitRename = async () => {
     if (!renaming || renameSaving) return;
     const { key, value } = renaming;
+    const trimmed = value.trim();
+    // Empty or unchanged input is a cancel, not a rename: the server rejects
+    // PUT {name: ''} with 400 "name is required", which would surface the
+    // error banner and leave the editor wedged open.
+    const currentName = sessions.find((s) => s.session_key === key)?.name ?? "";
+    if (!trimmed || trimmed === currentName) {
+      setRenaming(null);
+      return;
+    }
     setRenameSaving(true);
     try {
-      const trimmed = value.trim();
       await renameSession(key, trimmed);
       setSessions((prev) =>
         prev.map((s) =>
-          s.session_key === key ? { ...s, name: trimmed || undefined } : s,
+          s.session_key === key ? { ...s, name: trimmed } : s,
         ),
       );
       setRenaming(null);

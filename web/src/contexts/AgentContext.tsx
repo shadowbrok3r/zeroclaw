@@ -92,10 +92,22 @@ interface AgentContextValue {
   /** Info from the gateway's `session_start` frame: whether this connect
    * resumed a persisted session, and how many messages it carried. */
   sessionStart: { resumed: boolean; messageCount: number } | null;
-  /** Set when the gateway refused to resume this thread because another agent
-   * owns it (`session_owned_by_other_agent`). Cleared on thread change. */
-  ownershipConflict: { owningAgent: string } | null;
+  /** Set when the gateway refused to resume this thread: another agent owns
+   * it (`session_owned_by_other_agent`, adoptable via adoptThread) or another
+   * device does (`session_owned_by_other_device`, never adoptable). The
+   * refusal is terminal for the connection — the socket is torn down so the
+   * client does not loop reconnect attempts. Cleared on thread change. */
+  ownershipConflict: OwnershipConflict | null;
+  /** Rebuild the connection once with `?adopt=true` so the gateway
+   * re-attributes the current thread to this agent. Only meaningful for the
+   * agent-ownership conflict; the device boundary cannot be adopted. */
+  adoptThread: () => void;
 }
+
+/** Why the gateway refused to resume the current thread. */
+export type OwnershipConflict =
+  | { kind: 'agent'; owningAgent: string }
+  | { kind: 'device' };
 
 const AgentContext = createContext<AgentContextValue | null>(null);
 
@@ -156,8 +168,8 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   const [contextInputTokens, setContextInputTokens] = useState<number | null>(null);
   // `session_start` frame info ({resumed, message_count}); reset on thread change.
   const [sessionStart, setSessionStart] = useState<{ resumed: boolean; messageCount: number } | null>(null);
-  // Gateway refused to resume: the thread belongs to another agent.
-  const [ownershipConflict, setOwnershipConflict] = useState<{ owningAgent: string } | null>(null);
+  // Gateway refused to resume: the thread belongs to another agent or device.
+  const [ownershipConflict, setOwnershipConflict] = useState<OwnershipConflict | null>(null);
 
   const wsRef = useRef<WebSocketClient | null>(null);
   // Canonical per-turn stream state. Every production transition that mutates
@@ -172,6 +184,11 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   // so the next hydration pass skips its fetch. This keeps the local
   // "new thread" notice from being wiped by an empty wholesale re-hydration.
   const skipNextHydrationRef = useRef(false);
+  // Set by adoptThread: the next socket is built with `adopt: true` so its
+  // connect sends `?adopt=true`. Cleared when the adopted connection's
+  // session_start arrives so routine reconnects/rebuilds never re-send the
+  // ownership override.
+  const adoptNextConnectRef = useRef(false);
 
   // Prime the model-provider catalog once so error formatting can resolve
   // display names from the backend registry rather than a local shadow list.
@@ -261,6 +278,11 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   const handleWsMessage = useCallback((msg: WsMessage) => {
     switch (msg.type) {
       case 'session_start':
+        // The adopt override (if any) has done its job once the gateway
+        // accepts the session; clear it on both the one-shot ref and the live
+        // client so routine reconnects never silently re-adopt.
+        adoptNextConnectRef.current = false;
+        if (wsRef.current) wsRef.current.adopt = false;
         // Record whether the gateway resumed a persisted session and how many
         // messages it carried, so the chat can show a "resumed thread · N
         // messages" indicator.
@@ -502,12 +524,37 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
 
       case 'error':
         // Ownership guard: the gateway refused to resume because the session
-        // belongs to a different agent. Surface a dedicated banner with a
-        // "start new thread" action instead of a generic error bubble; never
-        // auto-adopt (`?adopt=true`) on the user's behalf.
-        if (msg.error === 'session_owned_by_other_agent') {
-          setOwnershipConflict({ owningAgent: msg.owning_agent ?? '' });
+        // belongs to a different agent (adoptable via the banner action) or,
+        // with device scoping on, to a different device (never adoptable —
+        // its frame carries no `message`, so it must not fall through to the
+        // generic bubble below). Either refusal is terminal: the gateway
+        // closes right after the frame and every automatic retry is refused
+        // identically, so detach + disconnect the socket to stop the ~1s
+        // reconnect loop instead of appending an error bubble per attempt.
+        // Never auto-adopt (`?adopt=true`) on the user's behalf.
+        if (
+          msg.error === 'session_owned_by_other_agent'
+          || msg.error === 'session_owned_by_other_device'
+        ) {
+          setOwnershipConflict(
+            msg.error === 'session_owned_by_other_agent'
+              ? { kind: 'agent', owningAgent: msg.owning_agent ?? '' }
+              : { kind: 'device' },
+          );
           setTyping(false);
+          // Detach callbacks first so the socket's onClose cannot report a
+          // stale "connection closed" error over the conflict banner; the
+          // banner's actions (adopt / start new thread) rebuild the
+          // connection explicitly.
+          const ws = wsRef.current;
+          if (ws) {
+            ws.onOpen = null;
+            ws.onClose = null;
+            ws.onError = null;
+            ws.onMessage = null;
+            ws.disconnect();
+          }
+          setConnected(false);
           break;
         }
         const friendlyMessage = friendlyAgentError(msg.message);
@@ -890,7 +937,9 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       oldWs.onMessage = null;
       oldWs.disconnect();
     }
-    const ws = new WebSocketClient({ agentAlias });
+    // `adopt` is normally false; adoptThread arms it for exactly one rebuild
+    // and the next session_start clears it again.
+    const ws = new WebSocketClient({ agentAlias, adopt: adoptNextConnectRef.current });
     // Assign wsRef before connect() so a synchronous throw can't strand the
     // page on the old intentionally-closed socket (see switchModel).
     wsRef.current = ws;
@@ -909,6 +958,9 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     setPendingApproval(null);
     setSessionStart(null);
     setOwnershipConflict(null);
+    // A pending adopt intent belongs to the thread it was requested on; a
+    // thread change must not carry the override to an unrelated session.
+    adoptNextConnectRef.current = false;
     setHistoryReady(false);
   }, [foldTurnStream]);
 
@@ -935,6 +987,17 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     setSessionIdState(id);
     rebuildSocket();
   }, [agentAlias, resetThreadView, rebuildSocket]);
+
+  // User-confirmed thread adoption (agent-ownership conflict banner action):
+  // reconnect exactly once with `?adopt=true` so the gateway re-attributes the
+  // current thread to this agent. The one-shot flag is cleared when the
+  // adopted connection's session_start arrives (or on any thread change), so
+  // routine reconnects never re-send the override.
+  const adoptThread = useCallback(() => {
+    adoptNextConnectRef.current = true;
+    setOwnershipConflict(null);
+    rebuildSocket();
+  }, [rebuildSocket]);
 
   const addLocalMessage = useCallback((content: string) => {
     localMessageMutationVersionRef.current += 1;
@@ -1001,6 +1064,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     switchThread,
     sessionStart,
     ownershipConflict,
+    adoptThread,
   };
 
   return <AgentContext.Provider value={value}>{children}</AgentContext.Provider>;

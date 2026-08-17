@@ -1486,6 +1486,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_new_thread': 'Started a new thread. The previous thread is still available in the Threads panel.',
     'agent.resumed_thread': 'resumed thread · {count} messages',
     'agent.session_owned_by_other': 'This thread is owned by agent "{agent}". Start a new thread to continue chatting here.',
+    'agent.session_owned_by_other_device': 'This thread belongs to another device, so it cannot be resumed here. Start a new thread to continue chatting.',
+    'agent.adopt_thread': 'Move thread to this agent',
     'agent.start_new_thread': 'Start new thread',
     'agent.compact_mode': 'Compact',
     'agent.tool_activity_show': 'Show tool activity',
@@ -1521,6 +1523,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'threads.view_transcript': 'View transcript',
     'threads.transcript': 'Transcript',
     'threads.read_only': 'read-only',
+    'threads.other_sessions': 'Other sessions (TUI)',
 
     // Agent drawer / card
     'agent.detail_aria_prefix': 'Agent',

@@ -126,6 +126,7 @@ export function AgentChatInner({
     startNewThread,
     sessionStart,
     ownershipConflict,
+    adoptThread,
   } = useAgent();
 
   const { draft, saveDraft, clearDraft } = useDraft(`${DRAFT_KEY_PREFIX}.${agentAlias}`);
@@ -515,14 +516,23 @@ export function AgentChatInner({
       )}
 
       {/* Thread ownership conflict — the gateway refused to resume this
-          session because another agent owns it. Never auto-adopt; offer a
-          fresh thread instead. */}
+          session because another agent or device owns it. Never auto-adopt:
+          an agent conflict offers an explicit "move thread here" action
+          beside the fresh-thread escape hatch; the device boundary cannot be
+          adopted, so that banner offers a fresh thread only. */}
       {ownershipConflict && (
         <div className="px-4 py-2 border-b border-status-warning/30 bg-status-warning/10 flex items-center gap-2 text-sm animate-fade-in">
           <AlertCircle className="h-4 w-4 shrink-0 text-status-warning" />
           <span className="flex-1 min-w-0 text-pc-text">
-            {t('agent.session_owned_by_other').replace('{agent}', ownershipConflict.owningAgent)}
+            {ownershipConflict.kind === 'agent'
+              ? t('agent.session_owned_by_other').replace('{agent}', ownershipConflict.owningAgent)
+              : t('agent.session_owned_by_other_device')}
           </span>
+          {ownershipConflict.kind === 'agent' && (
+            <Button variant="ghost" size="sm" onClick={adoptThread}>
+              {t('agent.adopt_thread')}
+            </Button>
+          )}
           <Button variant="primary" size="sm" onClick={startNewThread}>
             {t('agent.start_new_thread')}
           </Button>
