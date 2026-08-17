@@ -6853,6 +6853,8 @@ pub struct GatewayConfig {
     /// created them. When enabled, `/api/sessions` lists only sessions whose
     /// origin principal is unset or matches the caller's token, and a
     /// WebSocket resume of a session created by another device is refused.
+    /// Requires `channels.session_backend = "sqlite"`; the jsonl backend
+    /// does not store origin principals, so this knob has no effect there.
     /// Default: false (all paired devices share all sessions).
     #[serde(default)]
     pub scope_sessions_to_device: bool,
@@ -6860,7 +6862,8 @@ pub struct GatewayConfig {
     /// Delete stale gateway (`gw_`) sessions whose last activity is older
     /// than N hours. The gateway sweeps hourly (plus once at startup) and
     /// removes matching rows permanently; channel and RPC sessions are not
-    /// touched. 0 = disabled. Default: 0.
+    /// touched. Requires `channels.session_backend = "sqlite"`; the jsonl
+    /// backend is never swept. 0 = disabled. Default: 0.
     #[serde(default)]
     pub session_ttl_hours: u32,
 
@@ -13260,8 +13263,9 @@ pub struct ChannelsConfig {
     /// Delete stale channel sessions (rows attributed to a channel) whose
     /// last activity is older than this many hours. The channel orchestrator
     /// sweeps hourly (plus once at startup) and removes matching rows
-    /// permanently; gateway and RPC sessions are not touched. `0` disables.
-    /// Default: `0`.
+    /// permanently; gateway and RPC sessions are not touched. Requires
+    /// `session_backend = "sqlite"`; the jsonl backend is never swept.
+    /// `0` disables. Default: `0`.
     #[serde(default)]
     pub session_ttl_hours: u32,
     /// Inbound message debounce window in milliseconds. When a sender fires

@@ -1462,9 +1462,32 @@ pub async fn run_gateway(
         .unwrap_or((owned_shutdown_tx, None));
     let mut shutdown_rx = shutdown_tx.subscribe();
 
+    if config.gateway.scope_sessions_to_device && config.channels.session_backend == "jsonl" {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "gateway.scope_sessions_to_device is enabled but channels.session_backend is \
+             \"jsonl\": device scoping requires the sqlite session backend — origin \
+             principals are never stored, so every device keeps seeing every session"
+        );
+    }
+
     if config.gateway.session_ttl_hours > 0
         && let Some(ref backend) = session_backend
     {
+        if config.channels.session_backend == "jsonl" {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "ttl_hours": config.gateway.session_ttl_hours,
+                    })),
+                "gateway.session_ttl_hours is set but channels.session_backend is \"jsonl\": \
+                 the TTL sweep requires the sqlite session backend and will delete nothing"
+            );
+        }
         // Hourly gateway-scoped TTL sweep. Scoped to `gw_` rows: channel
         // sessions are swept by their own subsystem
         // (channels.session_ttl_hours), RPC sessions are never TTL'd here.

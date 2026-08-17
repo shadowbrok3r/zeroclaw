@@ -10480,6 +10480,18 @@ pub async fn start_channels(
     if config.channels.session_ttl_hours > 0
         && let Some(ref store) = shared_session_store
     {
+        if config.channels.session_backend == "jsonl" {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "ttl_hours": config.channels.session_ttl_hours,
+                    })),
+                "channels.session_ttl_hours is set but channels.session_backend is \"jsonl\": \
+                 the TTL sweep requires the sqlite session backend and will delete nothing"
+            );
+        }
         // Hourly channel-scoped TTL sweep (rows with a channel_id). Gateway
         // `gw_` rows are swept by the gateway's own sweep; RPC sessions are
         // never TTL'd here. The interval's first tick completes immediately,

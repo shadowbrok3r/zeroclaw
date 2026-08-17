@@ -9,6 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::schema::{ChannelAliasInfo, Config};
+use zeroclaw_infra::session_backend::resolve_session_key;
 use zeroclaw_memory::MemoryEntry;
 
 const MEMORY_API_CONTENT_MAX_CHARS: usize = 4096;
@@ -1629,27 +1630,44 @@ pub async fn handle_api_health(
 
 // ── Session API handlers ─────────────────────────────────────────
 
-/// Resolve a caller-supplied `{id}` path segment to the full session-store
-/// key. Tries the id verbatim first (channel-composite keys like
-/// `discord.clamps_room_alice` and already-prefixed `gw_`/`rpc_` keys), then
-/// the `gw_` gateway-WS prefix, then the `rpc_` RPC-chat prefix. Returns
-/// `None` when no session exists under any candidate key.
-fn resolve_session_key(
-    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
-    id: &str,
-) -> Option<String> {
-    if backend.session_exists(id) {
-        return Some(id.to_string());
+/// The uniform 404 for session verbs. Also returned when device scoping
+/// hides a session from the caller, so a foreign device cannot distinguish
+/// "exists but not mine" from "does not exist" (no existence oracle).
+fn session_not_found_response() -> axum::response::Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "Session not found"})),
+    )
+        .into_response()
+}
+
+/// Whether device scoping hides `session_key` from this caller. True when
+/// `gateway.scope_sessions_to_device` is enabled AND the row is stamped with
+/// an origin principal AND the caller's `device:<sha256(token)>` (the same
+/// `PairingGuard::token_hash` path the list handler uses) does not match.
+/// Rows with no origin principal stay visible to every caller, mirroring the
+/// `/api/sessions` list filter.
+fn session_hidden_from_device(state: &AppState, headers: &HeaderMap, session_key: &str) -> bool {
+    if !state.config.read().gateway.scope_sessions_to_device {
+        return false;
     }
-    let gw = format!("gw_{id}");
-    if backend.session_exists(&gw) {
-        return Some(gw);
-    }
-    let rpc = format!("rpc_{id}");
-    if backend.session_exists(&rpc) {
-        return Some(rpc);
-    }
-    None
+    let Some(owner) = state
+        .session_backend
+        .as_ref()
+        .and_then(|backend| backend.get_session_metadata(session_key))
+        .and_then(|meta| meta.origin_principal)
+    else {
+        return false;
+    };
+    let caller_principal = extract_bearer_token(headers)
+        .filter(|token| !token.is_empty())
+        .map(|token| {
+            format!(
+                "device:{}",
+                zeroclaw_runtime::security::pairing::PairingGuard::token_hash(token)
+            )
+        });
+    caller_principal.as_deref() != Some(owner.as_str())
 }
 
 /// GET /api/sessions — list gateway sessions
@@ -1761,6 +1779,11 @@ pub async fn handle_api_session_messages(
     // response shape stays an empty transcript rather than a 404.
     let session_key =
         resolve_session_key(backend.as_ref(), &id).unwrap_or_else(|| format!("gw_{id}"));
+    // Device scoping: covers both the resolved key and the gw_ fallback key's
+    // metadata when such a row exists.
+    if session_hidden_from_device(&state, &headers, &session_key) {
+        return session_not_found_response();
+    }
     let msgs = backend.load_with_timestamps(&session_key);
     let messages: Vec<serde_json::Value> = msgs
         .into_iter()
@@ -1815,6 +1838,9 @@ pub async fn handle_api_session_message_post(
         )
             .into_response();
     };
+    if session_hidden_from_device(&state, &headers, &session_key) {
+        return session_not_found_response();
+    }
     // Display form mirrors /api/sessions: `gw_` stripped, other keys as-is.
     let display_id = session_key
         .strip_prefix("gw_")
@@ -1879,6 +1905,29 @@ pub async fn handle_api_session_message_post(
     .into_response()
 }
 
+/// Cancel and drop the in-flight cancel token for the first of `keys` that
+/// has one registered. Used by DELETE so an orphaned run (row already gone)
+/// or a normal delete also stops its turn.
+fn cancel_in_flight_turn(state: &AppState, keys: &[String]) {
+    let token = {
+        let mut tokens = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned");
+        keys.iter()
+            .find_map(|key| tokens.remove(key).map(|token| (key.clone(), token)))
+    };
+    if let Some((cancelled_key, token)) = token {
+        token.cancel();
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"session_key": cancelled_key})),
+            "cancelled in-flight turn for deleted session"
+        );
+    }
+}
+
 /// DELETE /api/sessions/{id} — delete a gateway session
 pub async fn handle_api_session_delete(
     State(state): State<AppState>,
@@ -1898,27 +1947,20 @@ pub async fn handle_api_session_delete(
     };
 
     let Some(session_key) = resolve_session_key(backend.as_ref(), &id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Session not found"})),
-        )
-            .into_response();
+        // Row already gone (e.g. TTL-swept) but a turn may still be burning
+        // tokens: cancel any orphaned run before the 404. With no metadata
+        // row there is no ownership left to check. Candidate keys mirror the
+        // abort handler's no-backend fallback: id verbatim, gw_<id>, rpc_<id>.
+        let candidates = [id.clone(), format!("gw_{id}"), format!("rpc_{id}")];
+        cancel_in_flight_turn(&state, &candidates);
+        return session_not_found_response();
     };
-
-    let token = state
-        .cancel_tokens
-        .lock()
-        .expect("cancel_tokens lock poisoned")
-        .remove(&session_key);
-    if let Some(token) = token {
-        token.cancel();
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"session_key": session_key})),
-            "cancelled in-flight turn for deleted session"
-        );
+    // Ownership gates the cancel side effect too: a scoped-out caller's
+    // DELETE must not abort the owning device's in-flight turn.
+    if session_hidden_from_device(&state, &headers, &session_key) {
+        return session_not_found_response();
     }
+    cancel_in_flight_turn(&state, std::slice::from_ref(&session_key));
 
     // Capture metadata before the row is gone so the closed frame can still
     // carry alias/name/count.
@@ -1984,6 +2026,9 @@ pub async fn handle_api_session_rename(
         )
             .into_response();
     };
+    if session_hidden_from_device(&state, &headers, &session_key) {
+        return session_not_found_response();
+    }
 
     match backend.set_session_name(&session_key, name) {
         Ok(()) => {
@@ -2019,9 +2064,27 @@ pub async fn handle_api_sessions_running(
         .into_response();
     };
 
+    // Device scoping mirrors the /api/sessions list filter: stamped rows are
+    // visible only to their origin device, unstamped rows to every caller.
+    let scope_to_device = state.config.read().gateway.scope_sessions_to_device;
+    let caller_principal = extract_bearer_token(&headers)
+        .filter(|token| !token.is_empty())
+        .map(|token| {
+            format!(
+                "device:{}",
+                zeroclaw_runtime::security::pairing::PairingGuard::token_hash(token)
+            )
+        });
     let running = backend.list_running_sessions();
     let sessions: Vec<serde_json::Value> = running
         .into_iter()
+        .filter(|meta| {
+            !scope_to_device
+                || match meta.origin_principal.as_deref() {
+                    None => true,
+                    Some(owner) => caller_principal.as_deref() == Some(owner),
+                }
+        })
         .filter_map(|meta| {
             let session_id = meta.key.strip_prefix("gw_")?;
             Some(serde_json::json!({
@@ -2061,6 +2124,9 @@ pub async fn handle_api_session_state(
         )
             .into_response();
     };
+    if session_hidden_from_device(&state, &headers, &session_key) {
+        return session_not_found_response();
+    }
     match backend.get_session_state(&session_key) {
         Ok(Some(ss)) => {
             let mut resp = serde_json::json!({
@@ -2107,7 +2173,12 @@ pub async fn handle_api_session_abort(
         .as_ref()
         .and_then(|backend| resolve_session_key(backend.as_ref(), &id))
     {
-        Some(key) => vec![key],
+        Some(key) => {
+            if session_hidden_from_device(&state, &headers, &key) {
+                return session_not_found_response();
+            }
+            vec![key]
+        }
         None => vec![id.clone(), format!("gw_{id}"), format!("rpc_{id}")],
     };
 
@@ -3810,6 +3881,277 @@ pub(crate) mod tests {
             vec!["gw_mine", "gw_shared"],
             "scoped listing shows only the caller's and unstamped sessions"
         );
+    }
+
+    fn authed_empty_request(
+        method: &str,
+        uri: &str,
+        token: &str,
+    ) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    fn authed_json_request(
+        method: &str,
+        uri: &str,
+        token: &str,
+        body: serde_json::Value,
+    ) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// Two-device state with scoping toggled by the caller: `gw_owned` is
+    /// stamped for `device-a-token`; both tokens are paired.
+    fn two_device_state(scoped: bool) -> (tempfile::TempDir, AppState, Arc<dyn SessionBackend>) {
+        let (tmp, mut state, backend) = sqlite_session_state();
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &["device-a-token".into(), "device-b-token".into()],
+        ));
+        state.config.write().gateway.scope_sessions_to_device = scoped;
+        backend
+            .append("gw_owned", &zeroclaw_providers::ChatMessage::user("hi"))
+            .unwrap();
+        backend
+            .set_session_agent_alias("gw_owned", "test-agent")
+            .unwrap();
+        backend
+            .set_session_origin_principal(
+                "gw_owned",
+                &format!("device:{}", PairingGuard::token_hash("device-a-token")),
+            )
+            .unwrap();
+        (tmp, state, backend)
+    }
+
+    #[tokio::test]
+    async fn id_addressed_verbs_hide_other_devices_sessions_when_scoped() {
+        use tower::ServiceExt as _;
+
+        let (_tmp, state, backend) = two_device_state(true);
+
+        // A second device gets the uniform missing-session 404 on every
+        // id-addressed verb — no existence oracle.
+        for request in [
+            authed_empty_request("GET", "/api/sessions/gw_owned/messages", "device-b-token"),
+            authed_empty_request("DELETE", "/api/sessions/gw_owned", "device-b-token"),
+            authed_json_request(
+                "PUT",
+                "/api/sessions/gw_owned",
+                "device-b-token",
+                serde_json::json!({"name": "hijack"}),
+            ),
+        ] {
+            let (method, uri) = (request.method().clone(), request.uri().clone());
+            let response = sessions_app(state.clone()).oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{method} {uri} must 404 for a foreign device"
+            );
+            let json = response_json(response).await;
+            assert_eq!(json["error"], "Session not found");
+        }
+        assert!(
+            backend.session_exists("gw_owned"),
+            "foreign DELETE must not remove the row"
+        );
+        assert!(
+            backend.get_session_name("gw_owned").unwrap().is_none(),
+            "foreign rename must not stick"
+        );
+
+        // The owner device still succeeds on the same verbs.
+        let response = sessions_app(state.clone())
+            .oneshot(authed_empty_request(
+                "GET",
+                "/api/sessions/gw_owned/messages",
+                "device-a-token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["messages"].as_array().unwrap().len(), 1);
+
+        let response = sessions_app(state.clone())
+            .oneshot(authed_json_request(
+                "PUT",
+                "/api/sessions/gw_owned",
+                "device-a-token",
+                serde_json::json!({"name": "mine"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = sessions_app(state)
+            .oneshot(authed_empty_request(
+                "DELETE",
+                "/api/sessions/gw_owned",
+                "device-a-token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!backend.session_exists("gw_owned"));
+    }
+
+    #[tokio::test]
+    async fn id_addressed_verbs_stay_shared_when_scoping_disabled() {
+        use tower::ServiceExt as _;
+
+        let (_tmp, state, backend) = two_device_state(false);
+
+        let response = sessions_app(state.clone())
+            .oneshot(authed_empty_request(
+                "GET",
+                "/api/sessions/gw_owned/messages",
+                "device-b-token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = sessions_app(state.clone())
+            .oneshot(authed_json_request(
+                "PUT",
+                "/api/sessions/gw_owned",
+                "device-b-token",
+                serde_json::json!({"name": "shared"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = sessions_app(state)
+            .oneshot(authed_empty_request(
+                "DELETE",
+                "/api/sessions/gw_owned",
+                "device-b-token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!backend.session_exists("gw_owned"));
+    }
+
+    #[tokio::test]
+    async fn running_list_filters_to_caller_device_when_scoped() {
+        let (_tmp, state, backend) = two_device_state(true);
+        backend
+            .set_session_state("gw_owned", "running", Some("t1"))
+            .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer device-b-token".parse().unwrap(),
+        );
+        let response = handle_api_sessions_running(State(state.clone()), headers)
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert!(
+            json["sessions"].as_array().unwrap().is_empty(),
+            "a second device must not see another device's running session"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer device-a-token".parse().unwrap(),
+        );
+        let response = handle_api_sessions_running(State(state), headers)
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["sessions"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_delete_cancels_orphaned_run_even_when_row_is_gone() {
+        use tower::ServiceExt as _;
+
+        let (_tmp, state, backend) = sqlite_session_state();
+        assert!(!backend.session_exists("gw_orphan"));
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .unwrap()
+            .insert("gw_orphan".to_string(), token.clone());
+
+        let response = sessions_app(state.clone())
+            .oneshot(empty_request("DELETE", "/api/sessions/orphan"))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "the row is gone, so DELETE still answers 404"
+        );
+        assert!(
+            token.is_cancelled(),
+            "an orphaned in-flight run must be stopped by DELETE even without a session row"
+        );
+        assert!(
+            !state
+                .cancel_tokens
+                .lock()
+                .unwrap()
+                .contains_key("gw_orphan"),
+            "the cancelled token is removed from the registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_foreign_delete_does_not_cancel_the_owners_run() {
+        use tower::ServiceExt as _;
+
+        let (_tmp, state, backend) = two_device_state(true);
+        backend
+            .set_session_state("gw_owned", "running", Some("t1"))
+            .unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .unwrap()
+            .insert("gw_owned".to_string(), token.clone());
+
+        let response = sessions_app(state.clone())
+            .oneshot(authed_empty_request(
+                "DELETE",
+                "/api/sessions/gw_owned",
+                "device-b-token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            !token.is_cancelled(),
+            "ownership must gate DELETE's cancel side effect: a scoped-out \
+             device cannot abort the owning device's in-flight turn"
+        );
+        assert!(
+            state.cancel_tokens.lock().unwrap().contains_key("gw_owned"),
+            "the owner's token stays registered after a foreign DELETE"
+        );
+        assert!(backend.session_exists("gw_owned"));
     }
 
     #[tokio::test]

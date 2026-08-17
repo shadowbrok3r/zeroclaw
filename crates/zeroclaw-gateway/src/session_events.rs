@@ -4,7 +4,9 @@
 //! `session_closed` frames on the shared event bus so the web dashboard can
 //! keep its session list live without polling. Frames carry session METADATA
 //! only — never message content — which is why `source == "sessions"` frames
-//! are allowed through the public SSE filter (see `sse::is_public_sse_event`).
+//! pass the content filter (see `sse::is_public_sse_event`). They still carry
+//! session keys and thread names, so delivery additionally requires an
+//! authenticated, unscoped stream (see `sse::withhold_sessions_frame`).
 //! Every emit mirrors `BroadcastObserver`'s dual write: the frame is pushed
 //! into the history ring buffer and fanned out on the live broadcast channel.
 

@@ -10,7 +10,9 @@ use anyhow::{Context, Result, bail};
 use std::io::Write as _;
 use zeroclaw::SessionsCommands;
 use zeroclaw_config::schema::Config;
-use zeroclaw_infra::session_backend::{SessionBackend, SessionMetadata, SessionQuery};
+use zeroclaw_infra::session_backend::{
+    SessionBackend, SessionMetadata, SessionQuery, resolve_session_key,
+};
 
 /// Resolve a `cli-*` Fluent key for sessions CLI output. Under `agent-runtime`
 /// (default + what CI/release build) this routes through Fluent; without it the
@@ -38,14 +40,6 @@ fn mta(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
     {
         fallback.to_string() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
     }
-}
-
-/// Resolve a user-supplied session id to a stored key: verbatim first, then
-/// the `gw_<id>` (gateway WS) and `rpc_<id>` (RPC chat) prefixed forms.
-fn resolve_session_key(backend: &dyn SessionBackend, id: &str) -> Option<String> {
-    [id.to_string(), format!("gw_{id}"), format!("rpc_{id}")]
-        .into_iter()
-        .find(|candidate| backend.session_exists(candidate))
 }
 
 /// Whether the configured backend name selects the legacy JSONL store.
@@ -365,54 +359,9 @@ pub fn handle_sessions(cmd: SessionsCommands, config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeroclaw_api::model_provider::ChatMessage;
 
-    struct FakeBackend(Vec<String>);
-
-    impl SessionBackend for FakeBackend {
-        fn load(&self, _session_key: &str) -> Vec<ChatMessage> {
-            Vec::new()
-        }
-        fn append(&self, _session_key: &str, _message: &ChatMessage) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
-            Ok(false)
-        }
-        fn list_sessions(&self) -> Vec<String> {
-            self.0.clone()
-        }
-        fn session_exists(&self, session_key: &str) -> bool {
-            self.0.iter().any(|k| k == session_key)
-        }
-    }
-
-    #[test]
-    fn resolve_session_key_tries_verbatim_then_gw_then_rpc() {
-        let backend = FakeBackend(vec![
-            "discord.clamps_room_alice".to_string(),
-            "gw_1234".to_string(),
-            "rpc_abcd".to_string(),
-        ]);
-        assert_eq!(
-            resolve_session_key(&backend, "discord.clamps_room_alice").as_deref(),
-            Some("discord.clamps_room_alice")
-        );
-        // Verbatim match wins for already-prefixed ids.
-        assert_eq!(
-            resolve_session_key(&backend, "gw_1234").as_deref(),
-            Some("gw_1234")
-        );
-        assert_eq!(
-            resolve_session_key(&backend, "1234").as_deref(),
-            Some("gw_1234")
-        );
-        assert_eq!(
-            resolve_session_key(&backend, "abcd").as_deref(),
-            Some("rpc_abcd")
-        );
-        assert_eq!(resolve_session_key(&backend, "missing"), None);
-    }
+    // Session-id resolution is pinned at its policy point:
+    // `zeroclaw_infra::session_backend::tests::resolve_session_key_tries_verbatim_then_gw_then_rpc`.
 
     #[test]
     fn render_table_aligns_columns_and_trims_trailing_space() {

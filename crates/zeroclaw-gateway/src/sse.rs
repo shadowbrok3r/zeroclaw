@@ -82,6 +82,11 @@ pub async fn handle_sse_events(
         }
     }
 
+    // Session lifecycle frames leak channel-composite keys (room + sender
+    // identifiers) and thread names, so they are withheld whenever device
+    // scoping is on — SSE has no per-device filter, so delivering them would
+    // undercut the scoped /api/sessions surface.
+    let sessions_scoped = state.config.read().gateway.scope_sessions_to_device;
     let rx = state.event_tx.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(
         move |result: Result<
@@ -89,7 +94,7 @@ pub async fn handle_sse_events(
             tokio_stream::wrappers::errors::BroadcastStreamRecvError,
         >| {
             match result {
-                Ok(value) => sse_frame_for_stream(value, auth_enforced)
+                Ok(value) => sse_frame_for_stream(value, auth_enforced, sessions_scoped)
                     .map(|v| Ok::<_, Infallible>(Event::default().data(v.to_string()))),
                 Err(_) => None, // Skip lagged messages
             }
@@ -114,6 +119,7 @@ pub async fn handle_sse_events(
 fn sse_frame_for_stream(
     mut value: serde_json::Value,
     auth_enforced: bool,
+    sessions_scoped: bool,
 ) -> Option<serde_json::Value> {
     if !is_public_sse_event(&value) {
         return None;
@@ -121,11 +127,30 @@ fn sse_frame_for_stream(
     if zeroclaw_log::frame_carries_ephemeral_credentials(&value) && !auth_enforced {
         return None;
     }
+    if withhold_sessions_frame(&value, auth_enforced, sessions_scoped) {
+        return None;
+    }
     // Strip the internal marker so the delivered public shape is unchanged.
     // Shared with every other broadcast consumer (RPC `logs/subscribe`) so the
     // credential boundary is enforced identically across the bus.
     zeroclaw_log::strip_ephemeral_broadcast_marker(&mut value);
     Some(value)
+}
+
+/// Fail-closed contract for session lifecycle frames (`source == "sessions"`):
+/// they carry session keys — channel-composite keys embed room + sender
+/// identifiers — plus thread names, so they are withheld when the stream is
+/// not authenticated (`require_pairing = false` makes `/api/events` public)
+/// OR when `gateway.scope_sessions_to_device` is enabled (every paired device
+/// would otherwise see every device's session keys, undermining the scoped
+/// REST surface).
+fn withhold_sessions_frame(
+    event: &serde_json::Value,
+    auth_enforced: bool,
+    sessions_scoped: bool,
+) -> bool {
+    event.get("source").and_then(serde_json::Value::as_str) == Some("sessions")
+        && (!auth_enforced || sessions_scoped)
 }
 
 /// GET /api/events/history — return buffered recent events as JSON.
@@ -136,10 +161,24 @@ pub async fn handle_events_history(
     if let Err(e) = super::api::require_auth(&state, &headers) {
         return e.into_response();
     }
-    Json(history_events_payload(&state.event_buffer)).into_response()
+    // `require_auth` alone is not sufficient: it passes everyone when pairing
+    // is off, so the sessions-frame withhold needs the real auth posture and
+    // the scoping flag, same as the live stream.
+    let auth_enforced = state.pairing.require_pairing();
+    let sessions_scoped = state.config.read().gateway.scope_sessions_to_device;
+    Json(history_events_payload(
+        &state.event_buffer,
+        auth_enforced,
+        sessions_scoped,
+    ))
+    .into_response()
 }
 
-fn history_events_payload(buffer: &EventBuffer) -> serde_json::Value {
+fn history_events_payload(
+    buffer: &EventBuffer,
+    auth_enforced: bool,
+    sessions_scoped: bool,
+) -> serde_json::Value {
     let events: Vec<_> = buffer
         .snapshot()
         .into_iter()
@@ -151,6 +190,7 @@ fn history_events_payload(buffer: &EventBuffer) -> serde_json::Value {
         // here in the first place — this filter fails closed as defense in
         // depth for the non-persistent credential boundary.
         .filter(|event| !zeroclaw_log::frame_carries_ephemeral_credentials(event))
+        .filter(|event| !withhold_sessions_frame(event, auth_enforced, sessions_scoped))
         .collect();
     serde_json::json!({ "events": events })
 }
@@ -510,7 +550,7 @@ mod tests {
             "phase": "ready"
         }));
 
-        let payload = history_events_payload(&buffer);
+        let payload = history_events_payload(&buffer, true, false);
         let events = payload["events"].as_array().expect("events array");
         assert_eq!(events.len(), 2);
         assert_eq!(events[0]["type"], "agent_start");
@@ -535,7 +575,7 @@ mod tests {
         // withheld entirely rather than fanned out to an anonymous subscriber.
         let frame = credential_login_frame();
         assert!(
-            sse_frame_for_stream(frame, /* auth_enforced */ false).is_none(),
+            sse_frame_for_stream(frame, /* auth_enforced */ false, false).is_none(),
             "pairing secret must never ride an unauthenticated /api/events stream"
         );
     }
@@ -544,9 +584,12 @@ mod tests {
     fn ephemeral_credential_frame_reaches_authenticated_stream_without_marker() {
         // Pairing enabled ⇒ every subscriber passed the bearer check, so the
         // credential may be delivered; the internal marker is stripped first.
-        let delivered =
-            sse_frame_for_stream(credential_login_frame(), /* auth_enforced */ true)
-                .expect("authenticated stream should receive the credential frame");
+        let delivered = sse_frame_for_stream(
+            credential_login_frame(),
+            /* auth_enforced */ true,
+            false,
+        )
+        .expect("authenticated stream should receive the credential frame");
         assert_eq!(
             delivered["attributes"]["login"]["qr_payload"], "SECRET-QR-PAYLOAD",
             "authenticated stream still renders the QR payload"
@@ -568,7 +611,7 @@ mod tests {
             "attributes": { "login": { "state": "connected" } },
         });
         assert!(
-            sse_frame_for_stream(frame, /* auth_enforced */ false).is_some(),
+            sse_frame_for_stream(frame, /* auth_enforced */ false, false).is_some(),
             "credential-free lifecycle frames are unaffected"
         );
     }
@@ -576,15 +619,19 @@ mod tests {
     #[test]
     fn session_scoped_frame_is_withheld_regardless_of_auth() {
         let frame = serde_json::json!({ "type": "message", "session_id": "operator-1" });
-        assert!(sse_frame_for_stream(frame.clone(), true).is_none());
-        assert!(sse_frame_for_stream(frame, false).is_none());
+        assert!(sse_frame_for_stream(frame.clone(), true, false).is_none());
+        assert!(sse_frame_for_stream(frame, false, false).is_none());
     }
 
     #[test]
-    fn session_lifecycle_frames_are_public_despite_session_id() {
+    fn session_lifecycle_frames_delivered_only_when_authed_and_unscoped() {
         // `source == "sessions"` frames are metadata-only by contract (see
         // `session_events::tests::frames_carry_metadata_only_never_content`),
-        // so the session_id-based content withhold must not eat them.
+        // so the session_id-based content withhold must not eat them — but
+        // they expose session keys (channel-composite keys embed room +
+        // sender identifiers) and thread names, so the full delivery
+        // contract is: delivered when auth_enforced && !scoped; withheld
+        // otherwise.
         let frame = crate::session_events::build_session_event(
             crate::session_events::SessionEventKind::Update,
             "gw_operator-1",
@@ -592,6 +639,21 @@ mod tests {
         );
         assert_eq!(frame["session_id"], "operator-1");
         assert!(is_public_sse_event(&frame));
+
+        assert!(
+            sse_frame_for_stream(frame.clone(), true, false).is_some(),
+            "authenticated + unscoped stream delivers lifecycle frames"
+        );
+        assert!(
+            sse_frame_for_stream(frame.clone(), false, false).is_none(),
+            "unauthenticated stream must not leak session keys"
+        );
+        assert!(
+            sse_frame_for_stream(frame.clone(), true, true).is_none(),
+            "device scoping withholds lifecycle frames even from paired devices"
+        );
+        assert!(sse_frame_for_stream(frame.clone(), false, true).is_none());
+
         // A chat message frame with the same session_id stays withheld.
         let chat = serde_json::json!({
             "type": "message",
@@ -599,6 +661,42 @@ mod tests {
             "content": "private",
         });
         assert!(!is_public_sse_event(&chat));
+    }
+
+    #[test]
+    fn history_applies_same_sessions_frame_contract_as_live_stream() {
+        let buffer = EventBuffer::new(8);
+        buffer.push(crate::session_events::build_session_event(
+            crate::session_events::SessionEventKind::Update,
+            "gw_operator-1",
+            &crate::session_events::SessionEventFields::default(),
+        ));
+        buffer.push(serde_json::json!({
+            "type": "agent_start",
+            "source": "observability",
+            "model_provider": "test",
+            "model": "test-model",
+        }));
+
+        for (auth_enforced, sessions_scoped, expect_sessions) in [
+            (true, false, true),
+            (false, false, false),
+            (true, true, false),
+            (false, true, false),
+        ] {
+            let payload = history_events_payload(&buffer, auth_enforced, sessions_scoped);
+            let events = payload["events"].as_array().expect("events array");
+            let has_sessions = events.iter().any(|e| e["source"] == "sessions");
+            assert_eq!(
+                has_sessions, expect_sessions,
+                "sessions frame delivery for auth_enforced={auth_enforced} \
+                 scoped={sessions_scoped} must be {expect_sessions}"
+            );
+            assert!(
+                events.iter().any(|e| e["type"] == "agent_start"),
+                "observability frames are unaffected"
+            );
+        }
     }
 
     #[test]
@@ -802,7 +900,7 @@ mod tests {
             turn_id: Some("turn-1".into()),
         });
 
-        let payload = history_events_payload(&buffer);
+        let payload = history_events_payload(&buffer, true, false);
         let events = payload["events"].as_array().expect("events array");
         assert_eq!(
             events.len(),
@@ -839,7 +937,7 @@ mod tests {
             "model": "test-model",
         }));
 
-        let payload = history_events_payload(&buffer);
+        let payload = history_events_payload(&buffer, true, false);
         let events = payload["events"].as_array().expect("events array");
         assert_eq!(
             events.len(),

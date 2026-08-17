@@ -423,6 +423,13 @@ async fn handle_socket(
         // per-agent filters can attribute this session to its agent.
         let _ = backend.set_session_agent_alias(&session_key, &agent_alias);
 
+        // Bump last_activity on resume so a just-resumed thread is never
+        // near the TTL cutoff — connect re-stamps name/alias/principal but
+        // none of those refresh the activity timestamp the sweep keys off.
+        if resumed {
+            let _ = backend.touch_session(&session_key);
+        }
+
         // Stamp the origin principal (first-writer wins in the backend) so
         // opt-in device scoping can attribute the session to this device.
         // Skipped when pairing is disabled: there is no token identity.

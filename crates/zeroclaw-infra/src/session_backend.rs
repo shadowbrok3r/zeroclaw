@@ -263,6 +263,14 @@ pub trait SessionBackend: Send + Sync {
         })
     }
 
+    /// Refresh a session's `last_activity` to now without touching anything
+    /// else. Called on WS resume so a just-resumed thread is never near the
+    /// TTL cutoff. Must not create a row for an unknown key. No-op for
+    /// backends that don't track activity timestamps.
+    fn touch_session(&self, _session_key: &str) -> std::io::Result<()> {
+        Ok(())
+    }
+
     /// Set the session state (e.g. "idle", "running", "error").
     /// `turn_id` identifies the current turn (set when running, cleared on idle).
     fn set_session_state(
@@ -288,6 +296,29 @@ pub trait SessionBackend: Send + Sync {
     fn list_stuck_sessions(&self, _threshold_secs: u64) -> Vec<SessionMetadata> {
         Vec::new()
     }
+}
+
+/// Resolve a caller-supplied session id to the full stored session key.
+///
+/// The one policy point for id → key resolution shared by the gateway API,
+/// the sessions CLI, and the inter-agent session tools. Tries the id
+/// verbatim first (channel-composite keys like `discord.clamps_room_alice`
+/// and already-prefixed `gw_`/`rpc_` keys), then the `gw_` gateway-WS
+/// prefix, then the `rpc_` RPC-chat prefix. Returns `None` when no session
+/// exists under any candidate key.
+pub fn resolve_session_key(backend: &dyn SessionBackend, id: &str) -> Option<String> {
+    if backend.session_exists(id) {
+        return Some(id.to_string());
+    }
+    let gw = format!("gw_{id}");
+    if backend.session_exists(&gw) {
+        return Some(gw);
+    }
+    let rpc = format!("rpc_{id}");
+    if backend.session_exists(&rpc) {
+        return Some(rpc);
+    }
+    None
 }
 
 /// Session state information.
@@ -328,5 +359,52 @@ mod tests {
         let q = SessionQuery::default();
         assert!(q.keyword.is_none());
         assert!(q.limit.is_none());
+    }
+
+    struct KeySetBackend(Vec<String>);
+
+    impl SessionBackend for KeySetBackend {
+        fn load(&self, _session_key: &str) -> Vec<ChatMessage> {
+            Vec::new()
+        }
+        fn append(&self, _session_key: &str, _message: &ChatMessage) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            self.0.clone()
+        }
+        fn session_exists(&self, session_key: &str) -> bool {
+            self.0.iter().any(|k| k == session_key)
+        }
+    }
+
+    #[test]
+    fn resolve_session_key_tries_verbatim_then_gw_then_rpc() {
+        let backend = KeySetBackend(vec![
+            "discord.clamps_room_alice".to_string(),
+            "gw_1234".to_string(),
+            "rpc_abcd".to_string(),
+        ]);
+        assert_eq!(
+            resolve_session_key(&backend, "discord.clamps_room_alice").as_deref(),
+            Some("discord.clamps_room_alice")
+        );
+        // Verbatim match wins for already-prefixed ids.
+        assert_eq!(
+            resolve_session_key(&backend, "gw_1234").as_deref(),
+            Some("gw_1234")
+        );
+        assert_eq!(
+            resolve_session_key(&backend, "1234").as_deref(),
+            Some("gw_1234")
+        );
+        assert_eq!(
+            resolve_session_key(&backend, "abcd").as_deref(),
+            Some("rpc_abcd")
+        );
+        assert_eq!(resolve_session_key(&backend, "missing"), None);
     }
 }

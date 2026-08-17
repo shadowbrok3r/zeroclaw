@@ -490,11 +490,15 @@ impl SessionBackend for SqliteSessionBackend {
             crate::session_backend::SessionCleanupScope::Channel => "channel_id IS NOT NULL",
         };
 
+        // Never sweep an in-flight session: a turn can outlive the TTL
+        // cutoff (last_activity is only bumped on message writes), and
+        // deleting the row mid-turn makes the persist guard drop the turn.
         let stale_keys: Vec<String> = {
             let mut stmt = conn
                 .prepare(&format!(
                     "SELECT session_key FROM session_metadata \
-                     WHERE last_activity < ?1 AND {scope_predicate}"
+                     WHERE last_activity < ?1 AND {scope_predicate} \
+                     AND COALESCE(state, 'idle') != 'running'"
                 ))
                 .map_err(std::io::Error::other)?;
             let rows = stmt
@@ -681,6 +685,18 @@ impl SessionBackend for SqliteSessionBackend {
         .ok()
     }
 
+    fn touch_session(&self, session_key: &str) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        let now = Utc::now().to_rfc3339();
+        // Existing rows only: a touch must never create a session.
+        conn.execute(
+            "UPDATE session_metadata SET last_activity = ?1 WHERE session_key = ?2",
+            params![now, session_key],
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
     fn set_session_state(
         &self,
         session_key: &str,
@@ -694,12 +710,33 @@ impl SessionBackend for SqliteSessionBackend {
         } else {
             None
         };
-        conn.execute(
-            "UPDATE session_metadata SET state = ?1, turn_id = ?2, turn_started_at = ?3
-             WHERE session_key = ?4",
-            params![state, turn_id, started_at, session_key],
-        )
-        .map_err(std::io::Error::other)?;
+        if state == "running" {
+            // Recreate the metadata row if it is missing (e.g. a TTL sweep
+            // removed it while the socket idled past the cutoff): the next
+            // turn's 'running' write restores the row so the persist guard
+            // no longer drops the turn. Deliberate mid-turn deletions are
+            // unaffected — their turns are already past this write.
+            conn.execute(
+                "INSERT INTO session_metadata
+                    (session_key, created_at, last_activity, message_count, state, turn_id, turn_started_at)
+                 VALUES (?1, ?2, ?2, 0, ?3, ?4, ?5)
+                 ON CONFLICT(session_key) DO UPDATE SET
+                    state = excluded.state,
+                    turn_id = excluded.turn_id,
+                    turn_started_at = excluded.turn_started_at,
+                    last_activity = excluded.last_activity",
+                params![session_key, now, state, turn_id, started_at],
+            )
+            .map_err(std::io::Error::other)?;
+        } else {
+            conn.execute(
+                "UPDATE session_metadata
+                 SET state = ?1, turn_id = ?2, turn_started_at = ?3, last_activity = ?4
+                 WHERE session_key = ?5",
+                params![state, turn_id, started_at, now, session_key],
+            )
+            .map_err(std::io::Error::other)?;
+        }
         Ok(())
     }
 
@@ -1244,6 +1281,96 @@ mod tests {
             backend.session_exists("rpc_stale"),
             "rpc_ rows have no TTL owner and must survive"
         );
+    }
+
+    #[test]
+    fn cleanup_stale_scoped_skips_running_sessions() {
+        use crate::session_backend::SessionCleanupScope;
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        seed_aged_session(&backend, "gw_stale_running", 100, None);
+        seed_aged_session(&backend, "gw_stale_idle", 100, None);
+        backend
+            .set_session_state("gw_stale_running", "running", Some("turn-1"))
+            .unwrap();
+        // Re-age the row: the 'running' write refreshes last_activity.
+        {
+            let conn = backend.conn.lock();
+            let stamp = (Utc::now() - Duration::hours(100)).to_rfc3339();
+            conn.execute(
+                "UPDATE session_metadata SET last_activity = ?1 \
+                 WHERE session_key = 'gw_stale_running'",
+                params![stamp],
+            )
+            .unwrap();
+        }
+
+        let cleaned = backend
+            .cleanup_stale_scoped(48, SessionCleanupScope::Gateway)
+            .unwrap();
+        assert_eq!(cleaned, 1, "only the idle stale row is swept");
+        assert!(
+            backend.session_exists("gw_stale_running"),
+            "an in-flight (running) session must never be swept mid-turn"
+        );
+        assert!(!backend.session_exists("gw_stale_idle"));
+    }
+
+    #[test]
+    fn touch_session_bumps_last_activity_without_creating_rows() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        seed_aged_session(&backend, "gw_old", 100, None);
+        backend.touch_session("gw_old").unwrap();
+        let meta = backend.get_session_metadata("gw_old").unwrap();
+        assert!(
+            Utc::now() - meta.last_activity < Duration::minutes(1),
+            "touch must move last_activity to now (was {})",
+            meta.last_activity
+        );
+
+        // A touch on an unknown key must not conjure a session row.
+        backend.touch_session("gw_ghost").unwrap();
+        assert!(!backend.session_exists("gw_ghost"));
+    }
+
+    #[test]
+    fn running_state_write_recreates_deleted_row_and_append_persists() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("gw_s1", &ChatMessage::user("hi")).unwrap();
+        assert!(backend.delete_session("gw_s1").unwrap());
+        assert!(!backend.session_exists("gw_s1"));
+
+        // The next turn's 'running' transition restores the metadata row so
+        // the ws.rs persist guard (which refuses to write when the row is
+        // gone) no longer drops the turn.
+        backend
+            .set_session_state("gw_s1", "running", Some("turn-2"))
+            .unwrap();
+        assert!(backend.session_exists("gw_s1"));
+        let state = backend.get_session_state("gw_s1").unwrap().unwrap();
+        assert_eq!(state.state, "running");
+        assert_eq!(state.turn_id.as_deref(), Some("turn-2"));
+        assert!(state.turn_started_at.is_some());
+
+        backend
+            .append("gw_s1", &ChatMessage::user("after resurrect"))
+            .unwrap();
+        let msgs = backend.load("gw_s1");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "after resurrect");
+        let meta = backend.get_session_metadata("gw_s1").unwrap();
+        assert_eq!(meta.message_count, 1);
+
+        // Non-running writes stay UPDATE-only: they never create a row.
+        backend
+            .set_session_state("gw_missing", "idle", None)
+            .unwrap();
+        assert!(!backend.session_exists("gw_missing"));
     }
 
     #[test]
