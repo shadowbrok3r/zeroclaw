@@ -28,8 +28,10 @@ All chat-shaped sessions share one SQLite database:
 - The legacy JSONL implementation lives in
   `crates/zeroclaw-infra/src/session_store.rs` and is still selectable via
   `[channels].session_backend`.
-- The factory is `make_session_backend` in `crates/zeroclaw-infra/src/lib.rs`;
-  channels, gateway, and RPC all receive the same shared backend instance.
+- The factory is `make_session_backend` in `crates/zeroclaw-infra/src/lib.rs`.
+  Channels, gateway, RPC, tools, and the CLI each open their own connection to
+  the same database file; cross-connection consistency comes from SQLite WAL,
+  not shared memory.
 
 ```mermaid
 flowchart LR
@@ -150,12 +152,16 @@ The field contract, pinned by tests in `session_events.rs`:
 | `state` | `idle` / `running` / `error`; omitted when unknown |
 
 The first five fields are always present; the rest are omitted (not `null`)
-when unknown. Frames carry session metadata only, never message content:
-`/api/events` is the public stream, and the metadata-only rule is what makes
-admitting `source == "sessions"` frames safe.
+when unknown. Frames carry session metadata only, never message content.
+Because channel-composite keys embed room and sender identifiers, delivery is
+gated: lifecycle frames are withheld from `/api/events` (stream and history)
+when the stream is unauthenticated (`require_pairing = false`) or when
+`gateway.scope_sessions_to_device` is enabled, since every paired device
+shares one event stream.
 
 The web dashboard subscribes to exactly these three types
-(`web/src/pages/Dashboard.tsx`), so thread listings update without polling.
+(`web/src/pages/Dashboard.tsx`), so thread listings update without polling
+and fall back to fetch-on-load when the frames are withheld.
 
 ### REST verb parity for non-`gw_` keys
 
@@ -167,17 +173,32 @@ underscore. Channel and RPC sessions get the full verb set.
 
 ### Hourly scoped TTL sweeps
 
-TTL enforcement runs as an hourly sweep in the gateway, scoped by key family:
+TTL enforcement runs as hourly sweeps, one per owning subsystem, scoped by key
+family:
 
-| Knob | Sweeps | Default |
-|---|---|---|
-| `gateway.session_ttl_hours` | `gw_` rows only | `0` (disabled) |
-| `channels.session_ttl_hours` | Channel-composite rows only | `0` (disabled) |
+| Knob | Sweeps | Runs in | Default |
+|---|---|---|---|
+| `gateway.session_ttl_hours` | `gw_` rows only | Gateway (`run_gateway`) | `0` (disabled) |
+| `channels.session_ttl_hours` | Channel-composite rows only | Channel orchestrator (`start_channels`) | `0` (disabled) |
 
 `0` disables the corresponding sweep. `rpc_` rows and the ACP store are never
 TTL-swept. Upstream applies `gateway.session_ttl_hours` exactly once at
 startup as an unscoped delete of every stale row and never reads the channels
 knob; both behaviors change here.
+
+Sweep safety rules:
+
+- Sweeps skip sessions whose per-turn state is `running`, so an in-flight turn
+  can never lose its row mid-stream.
+- A WS resume refreshes `last_activity`, so an actively resumed thread is
+  never near the cutoff.
+- If a sweep removes a row while a socket sits idle past the TTL, the next
+  turn's `running` transition recreates the metadata row and the turn persists
+  normally (expired history stays expired; new turns are never dropped).
+- Sweep tasks end with their subsystem (gateway shutdown signal, orchestrator
+  cancellation token), so `/admin/reload` does not accumulate sweepers.
+- Scoped sweeps are SQLite-only; on the legacy JSONL backend the knobs log a
+  warning and do nothing.
 
 ### Origin principals and resume guards
 
@@ -189,19 +210,24 @@ knob; both behaviors change here.
 - Resuming a WS session whose stamped `agent_alias` differs from the
   connecting agent is refused unless the client passes `adopt=true`.
   Previously the connect path re-stamped the alias unconditionally, silently
-  reassigning threads between agents.
+  reassigning threads between agents. The web chat surfaces the refusal as a
+  banner with an explicit "move thread to this agent" action.
 - `gateway.scope_sessions_to_device` (default `false`) restricts session
-  listing and resume to sessions whose `origin_principal` matches the calling
-  token. Off by default because upstream semantics are "any paired device sees
-  every session".
+  listing, resume, and every id-addressed REST verb (messages, rename, state,
+  abort, delete) to sessions whose `origin_principal` matches the calling
+  token; non-matching sessions answer 404. Off by default because upstream
+  semantics are "any paired device sees every session". Principal stamping is
+  SQLite-only; on the JSONL backend the knob logs a warning and does nothing.
 
 ### Web threads UI
 
 The dashboard chat gains a threads panel
 (`web/src/components/ThreadsPanel.tsx`): list, switch, rename, and delete
-sessions per agent, live-updated from the SSE lifecycle events. The `/new`
-slash command now starts a fresh thread under a new `gw_` key and leaves the
-previous thread listed; upstream's `/new` deleted the current session.
+`gw_` threads per agent, live-updated from the SSE lifecycle events, with
+read-only transcript viewers for channel conversations (Discord and friends)
+and RPC/TUI sessions. The `/new` slash command now starts a fresh thread under
+a new `gw_` key and leaves the previous thread listed; upstream's `/new`
+deleted the current session.
 
 ### `zeroclaw sessions` CLI
 

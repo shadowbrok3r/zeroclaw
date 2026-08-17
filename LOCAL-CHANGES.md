@@ -61,9 +61,11 @@ Architecture documentation for the overhaul:
 |---|---|
 | `crates/zeroclaw-infra/src/session_backend.rs` | `origin_principal` in session metadata contract. |
 | `crates/zeroclaw-infra/src/session_sqlite.rs` | Additive `origin_principal` column migration and read/write support. |
-| `crates/zeroclaw-gateway/src/ws.rs` | Stamps the auth-subject principal on first append; refuses cross-agent resume unless `adopt=true` (replaces unconditional alias re-stamp). |
-| `crates/zeroclaw-gateway/src/api.rs` | Honors `gateway.scope_sessions_to_device` when listing/resolving sessions. |
+| `crates/zeroclaw-gateway/src/ws.rs` | Stamps the auth-subject principal on first append; refreshes `last_activity` on resume; refuses cross-agent resume unless `adopt=true` (replaces unconditional alias re-stamp). |
+| `crates/zeroclaw-gateway/src/api.rs` | Honors `gateway.scope_sessions_to_device` on listing and on every id-addressed session verb (non-matching sessions answer 404). |
+| `crates/zeroclaw-gateway/src/sse.rs` | Withholds `source == "sessions"` frames from unauthenticated streams and whenever device scoping is enabled. |
 | `crates/zeroclaw-config/src/schema.rs` | New opt-in `gateway.scope_sessions_to_device` knob (default `false`). |
+| `crates/zeroclaw-tools/src/sessions.rs` | Session-id resolution delegates to the shared `zeroclaw-infra` helper (gains the `rpc_` arm). |
 
 ### Web threads UI
 
@@ -139,3 +141,16 @@ Re-check these after every upstream merge; they are easy to silently lose:
 - **`/new` in the web UI no longer deletes.** Upstream's `/new` deletes the
   current session; ours starts a new thread and keeps the old one. A merge
   taking upstream's `slashCommands.ts` restores destructive `/new`.
+- **TTL sweeps have safety rules.** Scoped sweeps skip `state = 'running'`
+  rows, WS resume refreshes `last_activity`, and a `running` state write
+  recreates a swept metadata row so no turn is silently dropped. A merge that
+  reverts the SQLite `set_session_state`/sweep predicates reopens the
+  delete-mid-turn race.
+- **Session SSE frames are gated.** `source == "sessions"` lifecycle frames
+  are withheld from `/api/events` when the stream is unauthenticated or when
+  `gateway.scope_sessions_to_device` is on; channel keys embed room/sender
+  identifiers, so this gate is a privacy boundary, not an optimization.
+- **The session-id resolution policy lives in `zeroclaw-infra`.** Gateway
+  REST, the sessions CLI, and the agent-facing session tools all resolve
+  `verbatim -> gw_ -> rpc_` through one helper next to the `SessionBackend`
+  trait. Do not reintroduce per-surface copies.
