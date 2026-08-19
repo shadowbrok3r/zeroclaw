@@ -1115,6 +1115,30 @@ fn normalize_token_count_float(value: f64) -> Option<u64> {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
+    /// Why generation stopped. Absent on providers that omit it, hence the
+    /// `default` — see [`is_length_truncation`].
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+/// Appended to a reply the model was forced to cut short.
+///
+/// Deliberately contains no square brackets and no filesystem path: zeroclaw's
+/// Discord dispatcher promotes `[IMAGE:…]`-shaped text and bare paths into
+/// media markers (`canonicalize_tool_result_media_markers_for`), and a warning
+/// that got promoted would replace the reply with a delivery failure.
+const TRUNCATION_NOTICE: &str = "\n\n\u{26a0}\u{fe0f} reply cut short \u{2014} the model hit its max_tokens limit. Raise max_tokens for this provider, or ask it to continue.";
+
+/// True when generation stopped at the output-token ceiling rather than
+/// finishing normally.
+///
+/// Without this the truncation is silent: every other consumer treats a
+/// `length` stop exactly like a `stop`, so a half-written answer ships as if
+/// it were complete. OpenAI-compatible servers spell it `length`; some
+/// (llama.cpp, vLLM) also emit `max_tokens`. `stop` and `tool_calls` are
+/// normal endings and must NOT match.
+fn is_length_truncation(finish_reason: Option<&str>) -> bool {
+    matches!(finish_reason, Some("length" | "max_tokens"))
 }
 
 /// Remove `<think>...</think>` blocks from model output.
@@ -1786,6 +1810,7 @@ fn sse_bytes_to_events_for_contract(
         let mut used_tool_call_ids = std::collections::HashSet::new();
         let mut emitted_tool_calls = false;
         let mut saw_completion = false;
+        let mut saw_length_truncation = false;
 
         match response.error_for_status_ref() {
             Ok(_) => {}
@@ -1900,6 +1925,9 @@ fn sse_bytes_to_events_for_contract(
                             if choice.finish_reason.as_deref() == Some("tool_calls") {
                                 should_emit_tool_calls = true;
                             }
+                            if is_length_truncation(choice.finish_reason.as_deref()) {
+                                saw_length_truncation = true;
+                            }
                         }
 
                         if let Some(usage) = chunk.usage.clone() {
@@ -1943,6 +1971,23 @@ fn sse_bytes_to_events_for_contract(
                 if tx.send(Ok(StreamEvent::ToolCall(tool_call))).await.is_err() {
                     return;
                 }
+            }
+        }
+
+        // Emitted after any tool calls so it is the last thing appended to the
+        // assistant text, and before the stream is finished so consumers see it
+        // as an ordinary delta — no new StreamEvent variant, so every existing
+        // channel renders it without changes.
+        if saw_length_truncation {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "compatible: stream truncated at max_tokens"
+            );
+            let notice = StreamChunk::delta(TRUNCATION_NOTICE.to_string());
+            if tx.send(Ok(StreamEvent::TextDelta(notice))).await.is_err() {
+                return;
             }
         }
 
@@ -2916,7 +2961,26 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             anyhow::Error::msg(format!("No response from {}", self.name))
         })?;
 
+        let truncated = is_length_truncation(choice.finish_reason.as_deref());
         let text = choice.message.effective_content_optional();
+        let text = if truncated {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"model_provider": &self.name})),
+                "compatible: response truncated at max_tokens"
+            );
+            Some(match text {
+                Some(text) => format!("{text}{TRUNCATION_NOTICE}"),
+                // An empty answer that hit the ceiling is the pure form of
+                // this bug: thinking consumed the whole budget. Say so rather
+                // than delivering nothing.
+                None => TRUNCATION_NOTICE.trim_start().to_string(),
+            })
+        } else {
+            text
+        };
         let reasoning_content = choice.message.reasoning_content;
         let mut used_tool_call_ids = std::collections::HashSet::new();
         let tool_calls = choice
@@ -3945,6 +4009,75 @@ mod tests {
         assert_eq!(
             resp.choices[0].message.content,
             Some("Hello from Venice!".to_string())
+        );
+    }
+
+    #[test]
+    fn length_truncation_is_recognised_across_provider_spellings() {
+        // OpenAI/Ollama say "length"; llama.cpp and vLLM also emit "max_tokens".
+        assert!(is_length_truncation(Some("length")));
+        assert!(is_length_truncation(Some("max_tokens")));
+    }
+
+    #[test]
+    fn normal_stop_reasons_are_never_treated_as_truncation() {
+        // A false positive here would staple a scary warning onto every
+        // healthy reply, which is worse than the silence it replaces.
+        for ok in [
+            "stop",
+            "tool_calls",
+            "function_call",
+            "content_filter",
+            "",
+            "STOP",
+            "Length",
+        ] {
+            assert!(
+                !is_length_truncation(Some(ok)),
+                "{ok:?} must not be truncation"
+            );
+        }
+        assert!(
+            !is_length_truncation(None),
+            "an absent reason is not truncation"
+        );
+    }
+
+    #[test]
+    fn choice_reads_finish_reason_and_defaults_when_absent() {
+        let json = r#"{"choices":[{"message":{"content":"cut"},"finish_reason":"length"}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("length"));
+        assert!(is_length_truncation(
+            resp.choices[0].finish_reason.as_deref()
+        ));
+
+        // Providers that omit the field must still deserialize (the whole
+        // response used to parse without it at all).
+        let json = r#"{"choices":[{"message":{"content":"fine"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.choices[0].finish_reason, None);
+        assert!(!is_length_truncation(
+            resp.choices[0].finish_reason.as_deref()
+        ));
+    }
+
+    #[test]
+    fn the_truncation_notice_cannot_be_promoted_into_a_media_marker() {
+        // zeroclaw's Discord dispatcher turns `[IMAGE:…]`-shaped text and bare
+        // filesystem paths into attachments. If this notice were promoted, the
+        // reply would be replaced by a delivery-failure note.
+        assert!(!TRUNCATION_NOTICE.contains('['), "no square brackets");
+        assert!(!TRUNCATION_NOTICE.contains(']'), "no square brackets");
+        assert!(!TRUNCATION_NOTICE.contains('/'), "no path separators");
+        assert!(!TRUNCATION_NOTICE.contains("IMAGE"));
+        assert!(
+            TRUNCATION_NOTICE.starts_with("\n\n"),
+            "separates from the cut sentence"
+        );
+        assert!(
+            TRUNCATION_NOTICE.contains("max_tokens"),
+            "names the knob to raise"
         );
     }
 

@@ -102,6 +102,15 @@ Architecture documentation for the overhaul:
 | `src/main.rs` | Subcommand registration and dispatch. |
 | `crates/zeroclaw-runtime/locales/en/cli.ftl` | Fluent strings for the CLI output (CLI text policy). |
 
+### Provider truncation surfacing
+
+Unrelated to the session overhaul; carried here because it is a one-file
+provider fix this deployment depends on.
+
+| File | Why |
+|---|---|
+| `crates/zeroclaw-providers/src/compatible.rs` | Adds `finish_reason` to the non-streaming `Choice` (upstream omits the field entirely) and surfaces a `length` stop on both the streaming and non-streaming paths as a `WARN` plus a visible notice appended to the reply. |
+
 ### Documentation
 
 | File | Why |
@@ -182,3 +191,16 @@ Re-check these after every upstream merge; they are easy to silently lose:
   tool's own hook posting is legacy/best-effort: it cannot attach the secret
   header or `?agent=`, so runner-spawned sessions do not ingest (documented
   at the `hook_url` site in `claude_code_runner.rs`).
+- **A `max_tokens` stop is no longer silent.** Upstream parses `finish_reason`
+  but only ever compares it to `"tool_calls"`, and the non-streaming `Choice`
+  has no `finish_reason` field at all — so a reply cut off at the output-token
+  ceiling ships as though it were complete, and a reply whose whole budget went
+  to thinking ships as nothing. Ours logs a `WARN` and appends
+  `TRUNCATION_NOTICE` on both paths. The notice is emitted as an ordinary
+  `StreamEvent::TextDelta`, deliberately NOT a new enum variant (that enum has
+  ~168 references across 15 files), so every channel renders it unchanged. It
+  carries no square brackets and no filesystem path because the Discord
+  dispatcher promotes `[IMAGE:...]`-shaped text and bare paths into media
+  markers; a promoted warning would replace the reply with a delivery failure.
+  A merge that restores upstream's `Choice` struct drops the non-streaming half
+  with no compile error.
