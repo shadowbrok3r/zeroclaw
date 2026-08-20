@@ -9026,6 +9026,15 @@ pub struct ClaudeCodeConfig {
     #[serde(default)]
     #[credential_class = "legacy_env_path"]
     pub env_passthrough: Vec<String>,
+    /// Passed to the subprocess as `--mcp-config`: a JSON file naming the only
+    /// MCP servers the session should load.
+    #[serde(default)]
+    pub mcp_config: Option<String>,
+    /// Pass `--strict-mcp-config` so the subprocess loads ONLY `mcp_config` and
+    /// ignores user- and project-scoped MCP registrations. Halves the cost of a
+    /// delegated session on hosts carrying many registered connectors.
+    #[serde(default)]
+    pub strict_mcp_config: bool,
     /// Shared secret that enables session ingestion on `/hooks/claude-code`
     /// (and its transcript backfill sibling). Callers present it via the
     /// `X-ZC-Hook-Secret` header; the gateway hashes it at boot and never
@@ -9058,6 +9067,8 @@ impl Default for ClaudeCodeConfig {
             system_prompt: None,
             max_output_bytes: default_claude_code_max_output_bytes(),
             env_passthrough: Vec::new(),
+            mcp_config: None,
+            strict_mcp_config: false,
             hook_secret: None,
         }
     }

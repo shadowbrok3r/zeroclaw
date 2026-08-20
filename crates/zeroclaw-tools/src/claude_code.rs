@@ -196,6 +196,13 @@ impl Tool for ClaudeCodeTool {
         cmd.arg("-p").arg(prompt);
         cmd.arg("--output-format").arg("json");
 
+        if let Some(ref path) = self.config.mcp_config {
+            cmd.arg("--mcp-config").arg(path);
+        }
+        if self.config.strict_mcp_config {
+            cmd.arg("--strict-mcp-config");
+        }
+
         if !allowed_tools.is_empty() {
             for tool in &allowed_tools {
                 cmd.arg("--allowedTools").arg(tool);
