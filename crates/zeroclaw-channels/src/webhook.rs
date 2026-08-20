@@ -15,6 +15,8 @@ const DEFAULT_RETRY_MAX_DELAY_MS: u64 = 30_000;
 pub struct WebhookChannel {
     alias: String,
     listen_port: u16,
+    /// Inbound bind address; `0.0.0.0` unless the operator narrows it.
+    bind_address: String,
     listen_path: String,
     send_url: Option<String>,
     send_method: String,
@@ -49,6 +51,7 @@ impl WebhookChannel {
     pub fn new(
         alias: String,
         listen_port: u16,
+        bind_address: Option<String>,
         listen_path: Option<String>,
         send_url: Option<String>,
         send_method: Option<String>,
@@ -69,6 +72,10 @@ impl WebhookChannel {
         Self {
             alias,
             listen_port,
+            bind_address: bind_address
+                .map(|b| b.trim().to_string())
+                .filter(|b| !b.is_empty())
+                .unwrap_or_else(|| "0.0.0.0".to_string()),
             listen_path,
             send_url,
             send_method: send_method
@@ -486,13 +493,30 @@ impl Channel for WebhookChannel {
             .route(&listen_path, post(handle_webhook))
             .with_state(state);
 
-        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], self.listen_port));
+        // A typo in a security knob must not silently widen the bind.
+        let ip: std::net::IpAddr = self.bind_address.parse().map_err(|_| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "alias": self.alias,
+                        "bind_address": self.bind_address,
+                    })),
+                "Webhook channel bind_address is not an IP address"
+            );
+            anyhow::Error::msg(format!(
+                "channels.webhook.{}.bind_address is not an IP address: {}",
+                self.alias, self.bind_address
+            ))
+        })?;
+        let addr = std::net::SocketAddr::new(ip, self.listen_port);
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             &format!(
-                "Webhook channel listening on http://0.0.0.0:{}{} ...",
-                self.listen_port, self.listen_path
+                "Webhook channel listening on http://{}:{}{} ...",
+                self.bind_address, self.listen_port, self.listen_path
             )
         );
 
@@ -535,6 +559,7 @@ mod tests {
         WebhookChannel::new(
             "test-hook".into(),
             8080,
+            None,
             Some("/webhook".into()),
             Some("https://example.com/callback".into()),
             None,
@@ -551,6 +576,7 @@ mod tests {
             "test-hook".into(),
             8080,
             None,
+            None,
             Some("https://example.com/callback".into()),
             None,
             None,
@@ -566,6 +592,7 @@ mod tests {
         WebhookChannel::new(
             "test-hook".into(),
             8080,
+            None,
             None,
             Some(url.into()),
             None,
@@ -590,8 +617,63 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(ch.listen_path, "/webhook");
+    }
+
+    #[test]
+    fn default_bind_address_is_all_interfaces() {
+        let ch = WebhookChannel::new(
+            "test-hook".into(),
+            8080,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(ch.bind_address, "0.0.0.0");
+    }
+
+    #[test]
+    fn blank_bind_address_falls_back_to_default() {
+        let ch = WebhookChannel::new(
+            "test-hook".into(),
+            8080,
+            Some("   ".into()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(ch.bind_address, "0.0.0.0");
+    }
+
+    #[test]
+    fn bind_address_is_trimmed() {
+        let ch = WebhookChannel::new(
+            "test-hook".into(),
+            8080,
+            Some(" 127.0.0.1 ".into()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(ch.bind_address, "127.0.0.1");
     }
 
     #[test]
@@ -599,6 +681,7 @@ mod tests {
         let ch = WebhookChannel::new(
             "test-hook".into(),
             8080,
+            None,
             Some("hooks/incoming".into()),
             None,
             None,
@@ -622,6 +705,7 @@ mod tests {
         let ch = WebhookChannel::new(
             "test-hook".into(),
             8080,
+            None,
             None,
             Some("https://example.com".into()),
             Some("put".into()),
@@ -648,6 +732,7 @@ mod tests {
             "test-hook".into(),
             8080,
             None,
+            None,
             Some("https://example.com".into()),
             None,
             None,
@@ -666,6 +751,7 @@ mod tests {
         let ch = WebhookChannel::new(
             "test-hook".into(),
             8080,
+            None,
             None,
             Some("https://example.com".into()),
             None,
@@ -690,6 +776,7 @@ mod tests {
         let ch = WebhookChannel::new(
             "test-hook".into(),
             8080,
+            None,
             None,
             Some("https://example.com".into()),
             None,
@@ -973,6 +1060,7 @@ mod tests {
             "test-hook".into(),
             8080,
             None,
+            None,
             Some(format!("{}/cb", mock.uri())),
             None,
             None,
@@ -1020,6 +1108,7 @@ mod tests {
             "test-hook".into(),
             8080,
             None,
+            None,
             Some(format!("{}/cb", mock.uri())),
             None,
             None,
@@ -1064,6 +1153,7 @@ mod tests {
             "test-hook".into(),
             8080,
             None,
+            None,
             Some(format!("{}/cb", mock.uri())),
             None,
             None,
@@ -1099,6 +1189,7 @@ mod tests {
         let ch = WebhookChannel::new(
             "test-hook".into(),
             8080,
+            None,
             None,
             Some(format!("{}/cb", mock.uri())),
             None,

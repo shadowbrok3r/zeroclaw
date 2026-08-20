@@ -10004,6 +10004,7 @@ fn collect_configured_channels(
                 Arc::new(WebhookChannel::new(
                     alias.clone(),
                     wh.port,
+                    wh.bind_address.clone(),
                     wh.listen_path.clone(),
                     wh.send_url.clone(),
                     wh.send_method.clone(),
@@ -11463,6 +11464,7 @@ pub async fn deliver_announcement(
             let ch = WebhookChannel::new(
                 alias.to_string(),
                 wh.port,
+                wh.bind_address.clone(),
                 wh.listen_path.clone(),
                 wh.send_url.clone(),
                 wh.send_method.clone(),

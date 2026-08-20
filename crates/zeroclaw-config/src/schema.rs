@@ -14398,6 +14398,12 @@ pub struct WebhookConfig {
     #[tab(Advanced)]
     #[serde(default = "default_webhook_channel_port")]
     pub port: u16,
+    /// Address the inbound listener binds to. Default: `0.0.0.0` (every
+    /// interface). Set `127.0.0.1` when only a process on this host posts here;
+    /// an unparseable value refuses to start rather than widening the bind.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub bind_address: Option<String>,
     /// URL path to listen on (default: `/webhook`).
     #[tab(Advanced)]
     #[serde(default)]
@@ -27590,6 +27596,7 @@ bot_token = "xoxb-tok"
         let wc = WebhookConfig {
             enabled: true,
             port: 8080,
+            bind_address: None,
             listen_path: None,
             send_url: Some("https://example.com/cb".into()),
             send_method: None,

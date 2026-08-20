@@ -12,7 +12,11 @@ Full field reference: [config reference](../reference/config.md#channels).
 
 ## Inbound
 
-The channel binds `0.0.0.0:{port}` and routes `POST {listen_path}`.
+The channel binds `{bind_address}:{port}` and routes `POST {listen_path}`.
+`bind_address` defaults to `0.0.0.0` (every interface); set it to `127.0.0.1`
+when only a process on the same host posts to the listener. A value that is
+not a valid IP address refuses to start rather than falling back to a wider
+bind.
 
 Request body (JSON):
 
