@@ -386,12 +386,14 @@ impl Channel for WebhookChannel {
             tx: tokio::sync::mpsc::Sender<ChannelMessage>,
             secret: Option<String>,
             counter: Arc<AtomicU64>,
+            alias: String,
         }
 
         let state = Arc::new(WebhookState {
             tx: tx.clone(),
             secret: self.secret.clone(),
             counter: counter.clone(),
+            alias: self.alias.clone(),
         });
 
         let listen_path = self.listen_path.clone();
@@ -472,7 +474,7 @@ impl Channel for WebhookChannel {
                 reply_target,
                 content: payload.content,
                 channel: "webhook".to_string(),
-                channel_alias: None,
+                channel_alias: Some(state.alias.clone()),
                 timestamp,
                 thread_ts: payload.thread_id,
                 interruption_scope_id: None,

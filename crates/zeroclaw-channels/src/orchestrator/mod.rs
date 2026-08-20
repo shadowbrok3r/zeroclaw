@@ -2090,6 +2090,18 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
         );
     }
 
+    // Channel sessions carry no agent attribution otherwise: only the gateway,
+    // websocket and RPC rails stamp their own. First writer wins.
+    if let Some(ref store) = ctx.session_store
+        && store
+            .get_session_agent_alias(sender_key)
+            .ok()
+            .flatten()
+            .is_none()
+    {
+        let _ = store.set_session_agent_alias(sender_key, ctx.agent_alias.as_str());
+    }
+
     // Use the user-configured max_history_messages (fall back to
     // MAX_CHANNEL_HISTORY when the config value is 0 or absent).
     let max_history = {
