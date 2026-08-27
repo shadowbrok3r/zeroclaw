@@ -1141,6 +1141,19 @@ fn is_length_truncation(finish_reason: Option<&str>) -> bool {
     matches!(finish_reason, Some("length" | "max_tokens"))
 }
 
+/// A completed turn that carries nothing to act on: no visible text and no
+/// tool call, without having hit the `max_tokens` ceiling. Reasoning models
+/// reach this by spending an entire generation inside their reasoning channel
+/// and then emitting EOS — the caller is left with nothing to deliver, so the
+/// channel layer falls back to a placeholder and the turn is lost. Truncated
+/// turns are excluded on purpose: those hit a real limit and already carry
+/// [`TRUNCATION_NOTICE`], so resampling would only burn the budget again.
+fn is_empty_turn(text: Option<&str>, tool_calls: &[ProviderToolCall], truncated: bool) -> bool {
+    !truncated
+        && tool_calls.is_empty()
+        && text.is_none_or(|t| t.trim().is_empty())
+}
+
 /// Remove `<think>...</think>` blocks from model output.
 /// Some reasoning models (e.g. MiniMax) embed their chain-of-thought inline
 /// in the `content` field rather than a separate `reasoning_content` field.
@@ -2914,99 +2927,137 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         );
 
         let url = self.chat_completions_url();
-        let response = match self
-            .apply_auth_header(
-                self.http_client().post(&url).json(&request),
-                credential.as_deref(),
-            )
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
+
+        // A turn that comes back with no text, no tool calls and no length
+        // cutoff means the model spent its whole generation inside its
+        // reasoning channel and then hit EOS. Nothing is left to deliver, so
+        // the channel layer substitutes its empty-reply placeholder and the
+        // turn is simply lost. Take one more sample before accepting that.
+        // The retry re-sends an identical prompt, so the upstream prompt cache
+        // serves the (expensive) prefill and only generation is paid twice.
+        // Deliberately NOT retried when `truncated`: that is a real ceiling,
+        // already carries TRUNCATION_NOTICE, and resampling would just burn
+        // the same budget again.
+        const EMPTY_TURN_RETRIES: u32 = 1;
+        let mut empty_turn_attempts: u32 = 0;
+
+        loop {
+            let response = match self
+                .apply_auth_header(
+                    self.http_client().post(&url).json(&request),
+                    credential.as_deref(),
+                )
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!(
+                            "{} native tool call transport failed: {error}; falling back to history path",
+                            self.name
+                        )
+                    );
+                    let text = self.chat_with_history(messages, model, temperature).await?;
+                    return Ok(ProviderChatResponse {
+                        text: Some(text),
+                        tool_calls: vec![],
+                        usage: None,
+                        reasoning_content: None,
+                    });
+                }
+            };
+
+            if !response.status().is_success() {
+                return Err(super::api_error(&self.name, response).await);
+            }
+
+            let body = response.text().await?;
+            let chat_response = parse_chat_response_body(&self.name, &body)?;
+            let usage = chat_response.usage.map(UsageInfo::into_provider_usage);
+            let choice = chat_response.choices.into_iter().next().ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"model_provider": &self.name})),
+                    "compatible: empty choices in response"
+                );
+                anyhow::Error::msg(format!("No response from {}", self.name))
+            })?;
+
+            let truncated = is_length_truncation(choice.finish_reason.as_deref());
+            let text = choice.message.effective_content_optional();
+            let text = if truncated {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                    &format!(
-                        "{} native tool call transport failed: {error}; falling back to history path",
-                        self.name
-                    )
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"model_provider": &self.name})),
+                    "compatible: response truncated at max_tokens"
                 );
-                let text = self.chat_with_history(messages, model, temperature).await?;
-                return Ok(ProviderChatResponse {
-                    text: Some(text),
-                    tool_calls: vec![],
-                    usage: None,
-                    reasoning_content: None,
-                });
-            }
-        };
-
-        if !response.status().is_success() {
-            return Err(super::api_error(&self.name, response).await);
-        }
-
-        let body = response.text().await?;
-        let chat_response = parse_chat_response_body(&self.name, &body)?;
-        let usage = chat_response.usage.map(UsageInfo::into_provider_usage);
-        let choice = chat_response.choices.into_iter().next().ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"model_provider": &self.name})),
-                "compatible: empty choices in response"
-            );
-            anyhow::Error::msg(format!("No response from {}", self.name))
-        })?;
-
-        let truncated = is_length_truncation(choice.finish_reason.as_deref());
-        let text = choice.message.effective_content_optional();
-        let text = if truncated {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"model_provider": &self.name})),
-                "compatible: response truncated at max_tokens"
-            );
-            Some(match text {
-                Some(text) => format!("{text}{TRUNCATION_NOTICE}"),
-                // An empty answer that hit the ceiling is the pure form of
-                // this bug: thinking consumed the whole budget. Say so rather
-                // than delivering nothing.
-                None => TRUNCATION_NOTICE.trim_start().to_string(),
-            })
-        } else {
-            text
-        };
-        let reasoning_content = choice.message.reasoning_content;
-        let mut used_tool_call_ids = std::collections::HashSet::new();
-        let tool_calls = choice
-            .message
-            .tool_calls
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|tc| {
-                let function = tc.function?;
-                let name = function.name?;
-                let arguments = function.arguments.unwrap_or_else(|| "{}".to_string());
-                Some(ProviderToolCall {
-                    id: self.reserve_tool_call_id(tc.id, &mut used_tool_call_ids),
-                    name,
-                    arguments,
-                    extra_content: tc.extra_content,
+                Some(match text {
+                    Some(text) => format!("{text}{TRUNCATION_NOTICE}"),
+                    // An empty answer that hit the ceiling is the pure form of
+                    // this bug: thinking consumed the whole budget. Say so rather
+                    // than delivering nothing.
+                    None => TRUNCATION_NOTICE.trim_start().to_string(),
                 })
-            })
-            .collect::<Vec<_>>();
+            } else {
+                text
+            };
+            let reasoning_content = choice.message.reasoning_content;
+            let mut used_tool_call_ids = std::collections::HashSet::new();
+            let tool_calls = choice
+                .message
+                .tool_calls
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|tc| {
+                    let function = tc.function?;
+                    let name = function.name?;
+                    let arguments = function.arguments.unwrap_or_else(|| "{}".to_string());
+                    Some(ProviderToolCall {
+                        id: self.reserve_tool_call_id(tc.id, &mut used_tool_call_ids),
+                        name,
+                        arguments,
+                        extra_content: tc.extra_content,
+                    })
+                })
+                .collect::<Vec<_>>();
 
-        Ok(ProviderChatResponse {
-            text,
-            tool_calls,
-            usage,
-            reasoning_content,
-        })
+            if is_empty_turn(text.as_deref(), &tool_calls, truncated)
+                && empty_turn_attempts < EMPTY_TURN_RETRIES
+            {
+                empty_turn_attempts += 1;
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "model_provider": &self.name,
+                            "model": model,
+                            "attempt": empty_turn_attempts,
+                            "finish_reason": choice.finish_reason,
+                            "reasoning_chars": reasoning_content
+                                .as_deref()
+                                .map_or(0, str::len),
+                        })),
+                    "compatible: model produced no text and no tool calls; resampling once"
+                );
+                continue;
+            }
+
+            return Ok(ProviderChatResponse {
+                text,
+                tool_calls,
+                usage,
+                reasoning_content,
+            });
+        }
     }
 
     async fn chat(
@@ -4010,6 +4061,41 @@ mod tests {
             resp.choices[0].message.content,
             Some("Hello from Venice!".to_string())
         );
+    }
+
+    fn tool_call_fixture() -> ProviderToolCall {
+        ProviderToolCall {
+            id: "call_1".to_string(),
+            name: "shell".to_string(),
+            arguments: "{}".to_string(),
+            extra_content: None,
+        }
+    }
+
+    #[test]
+    fn empty_turn_detected_when_model_returns_only_reasoning() {
+        // The 2026-08-22 comfy failure: 1594 tokens generated, clean EOS, no
+        // content and no tool call. Nothing is left to deliver.
+        assert!(is_empty_turn(None, &[], false));
+        assert!(is_empty_turn(Some(""), &[], false));
+        assert!(is_empty_turn(Some("   \n  "), &[], false));
+    }
+
+    #[test]
+    fn empty_turn_excludes_turns_that_carry_work() {
+        // Visible text is a real reply.
+        assert!(!is_empty_turn(Some("here you go"), &[], false));
+        // A tool call with no prose is a normal agentic turn, not an empty one.
+        assert!(!is_empty_turn(None, &[tool_call_fixture()], false));
+        assert!(!is_empty_turn(Some(""), &[tool_call_fixture()], false));
+    }
+
+    #[test]
+    fn empty_turn_never_matches_a_length_cutoff() {
+        // Truncated turns hit a real ceiling and already carry
+        // TRUNCATION_NOTICE; resampling them would burn the budget again.
+        assert!(!is_empty_turn(None, &[], true));
+        assert!(!is_empty_turn(Some(""), &[], true));
     }
 
     #[test]
