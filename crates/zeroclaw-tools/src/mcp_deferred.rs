@@ -6,7 +6,9 @@ use std::sync::Arc;
 use crate::mcp_client::McpRegistry;
 use crate::mcp_protocol::McpToolDef;
 use crate::mcp_tool::McpToolWrapper;
+use crate::tool_search::ToolAccessPolicy;
 use zeroclaw_api::tool::{Tool, ToolSpec};
+use zeroclaw_config::policy::SecurityPolicy;
 
 // ── DeferredMcpToolStub ──────────────────────────────────────────────────
 
@@ -37,8 +39,21 @@ impl DeferredMcpToolStub {
     }
 
     /// Materialize this stub into a live [`McpToolWrapper`].
-    pub fn activate(&self, registry: Arc<McpRegistry>) -> McpToolWrapper {
-        McpToolWrapper::new(self.prefixed_name.clone(), self.def.clone(), registry)
+    ///
+    /// `security` is the execution-scope [`SecurityPolicy`] snapshot (source of
+    /// truth for the workspace path used when materializing MCP `resource`+`blob`
+    /// results) — an immutable `Arc`, not a reloadable live handle.
+    pub fn activate(
+        &self,
+        registry: Arc<McpRegistry>,
+        security: Arc<SecurityPolicy>,
+    ) -> McpToolWrapper {
+        McpToolWrapper::new(
+            self.prefixed_name.clone(),
+            self.def.clone(),
+            registry,
+            security,
+        )
     }
 }
 
@@ -52,11 +67,13 @@ pub struct DeferredMcpToolSet {
     pub stubs: Vec<DeferredMcpToolStub>,
     /// Shared registry — exposed for test construction.
     pub registry: Arc<McpRegistry>,
+    /// Security policy handle for activated wrappers (workspace at use time).
+    pub security: Arc<SecurityPolicy>,
 }
 
 impl DeferredMcpToolSet {
     /// Build the set from a connected [`McpRegistry`].
-    pub async fn from_registry(registry: Arc<McpRegistry>) -> Self {
+    pub async fn from_registry(registry: Arc<McpRegistry>, security: Arc<SecurityPolicy>) -> Self {
         let names = registry.tool_names();
         let mut stubs = Vec::with_capacity(names.len());
         for name in names {
@@ -64,7 +81,11 @@ impl DeferredMcpToolSet {
                 stubs.push(DeferredMcpToolStub::new(name, def));
             }
         }
-        Self { stubs, registry }
+        Self {
+            stubs,
+            registry,
+            security,
+        }
     }
 
     /// All stub names (for rendering in the system prompt).
@@ -83,6 +104,27 @@ impl DeferredMcpToolSet {
     /// Whether the set is empty.
     pub fn is_empty(&self) -> bool {
         self.stubs.is_empty()
+    }
+
+    /// Return a copy of this set with stubs whose `prefixed_name` is
+    /// not allowed by `policy` removed. `policy == None` is a no-op
+    /// (the set is returned unchanged) — this matches the
+    /// `if let Some(policy) = ...` pattern at every production
+    /// call site. Centralizes the per-stub filter logic so the
+    /// prompt-side claim and the `ToolSearchTool` constructor see
+    /// exactly the same tool set.
+    pub fn filter_by_policy(&self, policy: Option<&ToolAccessPolicy>) -> Self {
+        let filtered_stubs: Vec<DeferredMcpToolStub> = self
+            .stubs
+            .iter()
+            .filter(|stub| policy.is_none_or(|p| p.is_tool_allowed(&stub.prefixed_name)))
+            .cloned()
+            .collect();
+        Self {
+            stubs: filtered_stubs,
+            registry: Arc::clone(&self.registry),
+            security: Arc::clone(&self.security),
+        }
     }
 
     /// Look up stubs by exact name. Used for `select:name1,name2` queries.
@@ -130,7 +172,7 @@ impl DeferredMcpToolSet {
     /// Activate a stub by name, returning a boxed [`Tool`].
     pub fn activate(&self, name: &str) -> Option<Box<dyn Tool>> {
         self.get_by_name(name).map(|stub| {
-            let wrapper = stub.activate(Arc::clone(&self.registry));
+            let wrapper = stub.activate(Arc::clone(&self.registry), Arc::clone(&self.security));
             Box::new(wrapper) as Box<dyn Tool>
         })
     }
@@ -138,7 +180,7 @@ impl DeferredMcpToolSet {
     /// Return the full [`ToolSpec`] for a stub (for inclusion in `tool_search` results).
     pub fn tool_spec(&self, name: &str) -> Option<ToolSpec> {
         self.get_by_name(name).map(|stub| {
-            let wrapper = stub.activate(Arc::clone(&self.registry));
+            let wrapper = stub.activate(Arc::clone(&self.registry), Arc::clone(&self.security));
             wrapper.spec()
         })
     }
@@ -275,6 +317,10 @@ pub fn build_deferred_tools_section_excluding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy::default())
+    }
 
     fn make_stub(name: &str, desc: &str) -> DeferredMcpToolStub {
         let def = McpToolDef {
@@ -445,6 +491,7 @@ mod tests {
                     .block_on(McpRegistry::connect_all(&[]))
                     .unwrap(),
             ),
+            security: test_security(),
         };
         assert!(build_deferred_tools_section(&set).is_empty());
     }
@@ -463,6 +510,7 @@ mod tests {
                     .block_on(McpRegistry::connect_all(&[]))
                     .unwrap(),
             ),
+            security: test_security(),
         };
         let section = build_deferred_tools_section(&set);
         assert!(section.contains("<available-deferred-tools>"));
@@ -482,6 +530,7 @@ mod tests {
                     .block_on(McpRegistry::connect_all(&[]))
                     .unwrap(),
             ),
+            security: test_security(),
         };
         let section = build_deferred_tools_section(&set);
         assert!(
@@ -509,6 +558,7 @@ mod tests {
                     .block_on(McpRegistry::connect_all(&[]))
                     .unwrap(),
             ),
+            security: test_security(),
         };
         let section = build_deferred_tools_section(&set);
         assert!(section.contains("server_a__list"));
@@ -534,6 +584,7 @@ mod tests {
                     .block_on(McpRegistry::connect_all(&[]))
                     .unwrap(),
             ),
+            security: test_security(),
         };
         let exclude: HashSet<String> = ["fs__read_file".to_string()].into_iter().collect();
         let section = build_deferred_tools_section_excluding(&set, None, &exclude);
@@ -555,6 +606,7 @@ mod tests {
                     .block_on(McpRegistry::connect_all(&[]))
                     .unwrap(),
             ),
+            security: test_security(),
         };
         let exclude: HashSet<String> = ["fs__read_file".to_string()].into_iter().collect();
         assert!(build_deferred_tools_section_excluding(&set, None, &exclude).is_empty());
@@ -575,6 +627,7 @@ mod tests {
                     .block_on(McpRegistry::connect_all(&[]))
                     .unwrap(),
             ),
+            security: test_security(),
         };
 
         // "file read" should rank fs__read_file highest (2 hits vs 1)
@@ -597,6 +650,7 @@ mod tests {
                     .block_on(McpRegistry::connect_all(&[]))
                     .unwrap(),
             ),
+            security: test_security(),
         };
         assert!(set.get_by_name("a__one").is_some());
         assert!(set.get_by_name("nonexistent").is_none());
@@ -616,6 +670,7 @@ mod tests {
                     .block_on(McpRegistry::connect_all(&[]))
                     .unwrap(),
             ),
+            security: test_security(),
         };
 
         // "read" should match stubs from both servers
@@ -631,5 +686,63 @@ mod tests {
         let results = set.search("config database", 10);
         assert!(!results.is_empty());
         assert_eq!(results[0].prefixed_name, "server_b__read_config");
+    }
+
+    #[test]
+    fn filter_by_policy_none_returns_unchanged() {
+        // The centralized filter helper must be a no-op when no
+        // policy is set (the common case for callers that do not
+        // configure a `ToolAccessPolicy`).
+        let stubs = vec![
+            make_stub("fs__read_file", "Read a file"),
+            make_stub("git__status", "Git status"),
+        ];
+        let set = DeferredMcpToolSet {
+            stubs: stubs.clone(),
+            registry: std::sync::Arc::new(empty_registry()),
+            security: test_security(),
+        };
+        let filtered = set.filter_by_policy(None);
+        assert_eq!(filtered.stubs.len(), stubs.len());
+    }
+
+    #[test]
+    fn filter_by_policy_denied_removes_stubs() {
+        // A policy that denies a tool by name must drop that stub
+        // from the filtered set. The stub registry is irrelevant to
+        // the policy decision (it is the named filter), so an empty
+        // registry is fine.
+        let stubs = vec![
+            make_stub("srv__visible", "Visible tool"),
+            make_stub("srv__hidden", "Hidden tool"),
+        ];
+        let set = DeferredMcpToolSet {
+            stubs,
+            registry: std::sync::Arc::new(empty_registry()),
+            security: test_security(),
+        };
+        let policy = ToolAccessPolicy {
+            denied: Some(vec!["srv__hidden".into()]),
+            ..ToolAccessPolicy::default()
+        };
+        let filtered = set.filter_by_policy(Some(&policy));
+        let names: Vec<&str> = filtered
+            .stubs
+            .iter()
+            .map(|s| s.prefixed_name.as_str())
+            .collect();
+        assert!(names.contains(&"srv__visible"));
+        assert!(!names.contains(&"srv__hidden"));
+    }
+
+    /// Build an empty [`McpRegistry`] for tests that exercise the
+    /// stub set independently of any backing MCP server. The
+    /// `filter_by_policy` helper does not consult the registry, so
+    /// an empty one is sufficient.
+    fn empty_registry() -> McpRegistry {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(McpRegistry::connect_all(&[]))
+            .unwrap()
     }
 }

@@ -62,7 +62,9 @@ export default function ThreadsPanel({ agentAlias, onClose }: ThreadsPanelProps)
         setSessions(rows.filter((r) => r.agent_alias === agentAlias));
         setError(null);
       })
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+      .catch((e) =>
+        setError(`${t('threads.load_error')}: ${e instanceof Error ? e.message : String(e)}`),
+      );
   }, [agentAlias]);
 
   useEffect(() => {
@@ -150,8 +152,13 @@ export default function ThreadsPanel({ agentAlias, onClose }: ThreadsPanelProps)
 
   const handleOpenThread = (s: Session) => {
     // The display `session_id` (gw_ stripped) is the raw uuid the WebSocket
-    // connects with; switchThread persists it and reconnects.
-    if (s.session_id !== sessionId) switchThread(s.session_id);
+    // connects with; switchThread persists it and reconnects. It refuses while
+    // session storage is unconfirmed, so say so rather than closing the panel
+    // on a click that did nothing.
+    if (s.session_id !== sessionId && !switchThread(s.session_id)) {
+      setError(t('agent.sessions_unavailable'));
+      return;
+    }
     onClose();
   };
 
@@ -260,7 +267,10 @@ export default function ThreadsPanel({ agentAlias, onClose }: ThreadsPanelProps)
               variant="primary"
               size="sm"
               onClick={() => {
-                startNewThread();
+                if (!startNewThread()) {
+                  setError(t('agent.sessions_unavailable'));
+                  return;
+                }
                 onClose();
               }}
             >
@@ -283,7 +293,7 @@ export default function ThreadsPanel({ agentAlias, onClose }: ThreadsPanelProps)
         <div className="flex-1 overflow-y-auto p-4 space-y-5">
           {error && (
             <p className="text-sm" style={{ color: 'var(--color-status-error)' }}>
-              {t('threads.load_error')}: {error}
+              {error}
             </p>
           )}
           {sessions === null && !error && (

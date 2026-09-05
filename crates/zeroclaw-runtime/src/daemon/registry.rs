@@ -8,6 +8,7 @@ use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::{Config, MqttConfig};
 
+use super::{GatewayReadinessReporter, SocketReadinessReporter};
 use crate::rpc::context::RpcContext;
 use crate::rpc::tui_identity::TuiRegistry;
 
@@ -27,6 +28,7 @@ pub type GatewayStarter = Box<
             Option<broadcast::Sender<Value>>,
             Option<GatewayReloadControls>,
             Option<Arc<TuiRegistry>>,
+            Option<GatewayReadinessReporter>,
         ) -> StarterFuture
         + Send
         + Sync,
@@ -34,6 +36,18 @@ pub type GatewayStarter = Box<
 
 /// Starts the supervised channel orchestrator for one daemon run/reload iteration.
 pub type ChannelsStarter = Box<dyn Fn(Config, CancellationToken) -> StarterFuture + Send + Sync>;
+
+/// Starts the local IPC transport and optionally reports its secured bind.
+pub type SocketStarter = Box<
+    dyn Fn(
+            Arc<RpcContext>,
+            CancellationToken,
+            Arc<AtomicUsize>,
+            Option<SocketReadinessReporter>,
+        ) -> StarterFuture
+        + Send
+        + Sync,
+>;
 
 /// Starts an RPC transport using the shared daemon RPC context.
 pub type RpcStarter = Box<
@@ -47,8 +61,10 @@ pub type MqttStarter = Box<dyn Fn(MqttConfig) -> StarterFuture + Send + Sync>;
 pub struct DaemonRegistry {
     gateway_start: Option<GatewayStarter>,
     channels_start: Option<ChannelsStarter>,
-    socket_start: Option<RpcStarter>,
+    socket_start: Option<SocketStarter>,
     wss_start: Option<RpcStarter>,
+    relay_start: Option<RpcStarter>,
+    enroll_start: Option<RpcStarter>,
     mqtt_start: Option<MqttStarter>,
     /// Shared SOP engine built by the daemon reload loop. Passed through to
     /// RpcContext so RPC/TUI agent sessions share the same engine.
@@ -83,7 +99,7 @@ impl DaemonRegistry {
         self.channels_start.is_some()
     }
 
-    pub fn register_socket(&mut self, starter: RpcStarter) -> &mut Self {
+    pub fn register_socket(&mut self, starter: SocketStarter) -> &mut Self {
         self.socket_start = Some(starter);
         self
     }
@@ -99,6 +115,35 @@ impl DaemonRegistry {
 
     pub(crate) fn has_wss_start(&self) -> bool {
         self.wss_start.is_some()
+    }
+
+    pub fn register_relay(&mut self, starter: RpcStarter) -> &mut Self {
+        self.relay_start = Some(starter);
+        self
+    }
+
+    pub(crate) fn has_relay_start(&self) -> bool {
+        self.relay_start.is_some()
+    }
+
+    pub(crate) fn take_relay_start(&mut self) -> Option<RpcStarter> {
+        self.relay_start.take()
+    }
+
+    /// Register the certificate enrollment endpoint (the bootstrap surface a
+    /// certless client reaches for its first cert). Supervised like the WSS
+    /// listener; the starter parks when `[enroll]` is disabled.
+    pub fn register_enroll(&mut self, starter: RpcStarter) -> &mut Self {
+        self.enroll_start = Some(starter);
+        self
+    }
+
+    pub(crate) fn has_enroll_start(&self) -> bool {
+        self.enroll_start.is_some()
+    }
+
+    pub(crate) fn take_enroll_start(&mut self) -> Option<RpcStarter> {
+        self.enroll_start.take()
     }
 
     pub fn register_mqtt(&mut self, starter: MqttStarter) -> &mut Self {
@@ -119,7 +164,7 @@ impl DaemonRegistry {
         self.channels_start.take()
     }
 
-    pub(crate) fn take_socket_start(&mut self) -> Option<RpcStarter> {
+    pub(crate) fn take_socket_start(&mut self) -> Option<SocketStarter> {
         self.socket_start.take()
     }
 
@@ -157,11 +202,15 @@ mod tests {
     use super::*;
 
     fn gateway_starter() -> GatewayStarter {
-        Box::new(|_, _, _, _, _, _| Box::pin(async { Ok(()) }))
+        Box::new(|_, _, _, _, _, _, _| Box::pin(async { Ok(()) }))
     }
 
     fn channels_starter() -> ChannelsStarter {
         Box::new(|_, _| Box::pin(async { Ok(()) }))
+    }
+
+    fn socket_starter() -> SocketStarter {
+        Box::new(|_, _, _, _| Box::pin(async { Ok(()) }))
     }
 
     fn rpc_starter() -> RpcStarter {
@@ -189,7 +238,7 @@ mod tests {
         registry
             .register_gateway(gateway_starter())
             .register_channels(channels_starter())
-            .register_socket(rpc_starter())
+            .register_socket(socket_starter())
             .register_wss(rpc_starter())
             .register_mqtt(mqtt_starter());
 
@@ -206,7 +255,7 @@ mod tests {
         registry
             .register_gateway(gateway_starter())
             .register_channels(channels_starter())
-            .register_socket(rpc_starter())
+            .register_socket(socket_starter())
             .register_wss(rpc_starter())
             .register_mqtt(mqtt_starter());
 

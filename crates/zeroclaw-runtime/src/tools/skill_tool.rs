@@ -2,6 +2,7 @@
 
 use crate::platform::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
+use crate::tools::shell_env::SAFE_SHELL_ENV_VARS;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,30 +15,6 @@ use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 const SKILL_SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1 MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
-
-#[cfg(not(target_os = "windows"))]
-const SAFE_ENV_VARS: &[&str] = &[
-    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
-];
-
-#[cfg(target_os = "windows")]
-const SAFE_ENV_VARS: &[&str] = &[
-    "PATH",
-    "PATHEXT",
-    "HOME",
-    "USERPROFILE",
-    "HOMEDRIVE",
-    "HOMEPATH",
-    "SYSTEMROOT",
-    "SYSTEMDRIVE",
-    "WINDIR",
-    "COMSPEC",
-    "TEMP",
-    "TMP",
-    "TERM",
-    "LANG",
-    "USERNAME",
-];
 
 const MAX_TOOL_NAME_LEN: usize = 64;
 
@@ -193,7 +170,11 @@ impl Tool for SkillShellTool {
 
         // Security validation — always requires explicit approval (approved=true)
         // since skill tools are user-defined and should be treated as medium-risk.
-        match self.security.validate_command_execution(&command, true) {
+        match self.security.validate_command_execution_for_shell(
+            &command,
+            true,
+            self.runtime.shell_dialect(),
+        ) {
             Ok(_) => {}
             Err(reason) => {
                 return Ok(ToolResult {
@@ -204,7 +185,10 @@ impl Tool for SkillShellTool {
             }
         }
 
-        if let Some(path) = self.security.forbidden_path_argument(&command) {
+        if let Some(path) = self
+            .security
+            .forbidden_workspace_path_argument_for_shell(&command, self.runtime.shell_dialect())
+        {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -221,14 +205,16 @@ impl Tool for SkillShellTool {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(format!("Failed to build runtime command: {e}")),
+                    error: Some(super::runtime_command_error::format_runtime_command_error(
+                        &e,
+                    )),
                 });
             }
         };
         cmd.env_clear();
 
         // Only pass safe environment variables
-        for var in SAFE_ENV_VARS {
+        for var in SAFE_SHELL_ENV_VARS {
             if let Ok(val) = std::env::var(var) {
                 cmd.env(var, val);
             }
@@ -298,8 +284,11 @@ pub struct SkillBuiltinTool {
     tool_description: String,
     target_tool: Arc<dyn zeroclaw_api::tool::Tool>,
     locked_args: serde_json::Map<String, serde_json::Value>,
-    /// Target schema with the locked keys removed (precomputed at construction).
-    advertised_schema: serde_json::Value,
+    /// Target schema with the locked keys removed (precomputed at
+    /// construction). `Arc`-shared so per-iteration spec assembly hands out
+    /// reference counts instead of deep-cloning the (possibly MCP-derived,
+    /// tens-of-KB) tree — see the invariant on `Tool::spec`.
+    advertised_schema: Arc<serde_json::Value>,
 }
 
 impl SkillBuiltinTool {
@@ -313,7 +302,7 @@ impl SkillBuiltinTool {
             .into_iter()
             .map(|(k, v)| (k, serde_json::Value::String(v)))
             .collect();
-        let advertised_schema = narrow_schema(target_tool.parameters_schema(), &locked);
+        let advertised_schema = Arc::new(narrow_schema(target_tool.parameters_schema(), &locked));
         Self {
             tool_name: composed_tool_name(skill_name, &tool.name),
             tool_description: tool.description.clone(),
@@ -378,7 +367,20 @@ impl Tool for SkillBuiltinTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        self.advertised_schema.clone()
+        (*self.advertised_schema).clone()
+    }
+
+    // Hand out the stored schema by `Arc::clone` instead of the trait
+    // default's per-call deep clone — specs are rebuilt every agent-loop
+    // iteration and elevated skill tools can front MCP-derived schemas.
+    fn spec(&self) -> zeroclaw_api::tool::ToolSpec {
+        zeroclaw_api::tool::ToolSpec {
+            name: self.tool_name.clone(),
+            description: self.tool_description.clone(),
+            parameters: Arc::clone(&self.advertised_schema),
+            output: None,
+            param_domains: std::collections::BTreeMap::new(),
+        }
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -404,8 +406,11 @@ impl Tool for SkillBuiltinTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::DockerRuntime;
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use crate::skills::SkillTool;
+    use zeroclaw_api::attribution::{Attributable, ToolProvenance};
+    use zeroclaw_config::schema::DockerRuntimeConfig;
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -614,6 +619,74 @@ mod tests {
         assert!(result.output.contains("hello-skill"));
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn skill_shell_tool_executes_powershell_safe_pipeline_with_sanitized_env() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        });
+        let skill = SkillTool {
+            name: "safe_pipeline".to_string(),
+            description: "Run a safe PowerShell pipeline".to_string(),
+            kind: "shell".to_string(),
+            command: "Write-Output \"quoted safe value\" | Select-Object -First 1".to_string(),
+            args: HashMap::new(),
+            target: None,
+            locked_args: HashMap::new(),
+            timeout_secs: None,
+        };
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(NativeRuntime::with_shell("powershell".into()));
+        let tool = SkillShellTool::new_with_runtime("test", &skill, security, runtime);
+
+        let result = tool
+            .execute(serde_json::json!({}))
+            .await
+            .expect("safe PowerShell pipeline should return a tool result");
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            result.output.contains("quoted safe value"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_shell_tool_reports_invalid_docker_workspace_root() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir should be created");
+        let missing_root = workspace.path().join("missing-root");
+        let missing_root_text = missing_root.to_string_lossy().into_owned();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        let runtime = Arc::new(DockerRuntime::new(DockerRuntimeConfig {
+            allowed_workspace_roots: vec![missing_root_text.clone()],
+            ..DockerRuntimeConfig::default()
+        }));
+        let tool =
+            SkillShellTool::new_with_runtime("test", &sample_skill_tool(), security, runtime);
+
+        let result = tool
+            .execute(serde_json::json!({"file": "src/main.rs", "format": "text"}))
+            .await
+            .expect("invalid Docker root should return a tool result");
+
+        assert!(!result.success);
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(error.contains("Failed to canonicalize Docker workspace root"));
+        assert!(error.contains(missing_root_text.as_str()));
+    }
+
     #[test]
     fn skill_shell_tool_uses_default_timeout_when_unset() {
         // `timeout_secs = None` in the manifest falls back to the 60s default.
@@ -670,6 +743,13 @@ mod tests {
         assert_eq!(spec.name, "my_skill__run_lint");
         assert_eq!(spec.description, "Run the linter on a file");
         assert_eq!(spec.parameters["type"], "object");
+    }
+
+    #[test]
+    fn manifest_loaded_skill_shell_is_an_extension() {
+        let tool = SkillShellTool::new("browser", &sample_skill_tool(), test_security());
+
+        assert_eq!(tool.tool_provenance(), ToolProvenance::Extension);
     }
 
     // ─── SkillBuiltinTool tests ──────────────────────────────────────────────
@@ -746,6 +826,55 @@ mod tests {
             HashMap::new(),
         );
         assert_eq!(tool.name(), "my_skill__use_shell");
+    }
+
+    #[test]
+    fn skill_builtin_tool_is_extension_even_when_target_is_native() {
+        struct NativeMockBuiltinTool(MockBuiltinTool);
+
+        impl ::zeroclaw_api::attribution::Attributable for NativeMockBuiltinTool {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                self.0.role()
+            }
+
+            fn alias(&self) -> &str {
+                self.0.alias()
+            }
+
+            fn tool_provenance(&self) -> ToolProvenance {
+                ToolProvenance::Native
+            }
+        }
+
+        #[async_trait]
+        impl Tool for NativeMockBuiltinTool {
+            fn name(&self) -> &str {
+                self.0.name()
+            }
+
+            fn description(&self) -> &str {
+                self.0.description()
+            }
+
+            fn parameters_schema(&self) -> serde_json::Value {
+                self.0.parameters_schema()
+            }
+
+            async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                self.0.execute(args).await
+            }
+        }
+
+        let target: Arc<dyn Tool> =
+            Arc::new(NativeMockBuiltinTool(MockBuiltinTool::new("browser")));
+        let tool = SkillBuiltinTool::new(
+            "skill_browser",
+            &sample_builtin_skill_tool(),
+            target,
+            HashMap::new(),
+        );
+
+        assert_eq!(tool.tool_provenance(), ToolProvenance::Extension);
     }
 
     #[test]
@@ -1008,6 +1137,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn skill_elevated_spec_shares_schema_across_calls() {
+        let target: Arc<dyn Tool> = Arc::new(EchoArgsTool {
+            name: "composio".into(),
+        });
+        let mut locked = HashMap::new();
+        locked.insert("action".to_string(), "execute".to_string());
+        let st = elevation_skill_tool("builtin", "composio", locked.clone());
+        let tool = SkillBuiltinTool::new("sk", &st, target, locked);
+
+        assert!(
+            Arc::ptr_eq(&tool.spec().parameters, &tool.spec().parameters),
+            "spec() must hand out the stored Arc, not deep-clone the \
+             advertised schema every agent-loop iteration"
+        );
+        assert_eq!(
+            *tool.spec().parameters,
+            tool.parameters_schema(),
+            "shared spec schema and legacy owned accessor must agree"
+        );
+    }
+
     #[tokio::test]
     async fn skill_elevated_mcp_delegates_with_locked_scope() {
         // A `kind = "mcp"` skill tool resolves to an MCP wrapper (mocked here as
@@ -1096,6 +1247,7 @@ mod tests {
             }],
             prompts: vec![],
             slash_options: Vec::new(),
+            always: false,
             location: None,
         };
         crate::tools::register_skill_tools_with_context(

@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <a href="https://docs.zeroclawlabs.ai/master/en/introduction.html">Docs</a> ·
+  <a href="https://docs.zeroclaw.com/master/en/introduction.html">Docs</a> ·
   <a href="docs/book/src/philosophy/index.md">Philosophy</a> ·
   <a href="docs/book/src/getting-started/quickstart.md">Quick start</a> ·
   <a href="docs/book/src/architecture/overview.md">Architecture</a> ·
@@ -33,21 +33,22 @@ Read the [Philosophy](docs/book/src/philosophy/index.md) for the four opinions t
 
 ## Install
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
+### Unix (recommended)
+
+<!-- >>> generated:readme-unix-fast by `cargo generate installers` - do not edit <<< -->
+```sh
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh
+"${CARGO_HOME:-$HOME/.cargo}/bin/zeroclaw" quickstart
 ```
+<!-- >>> end generated:readme-unix-fast <<< -->
 
-Or clone and run:
+### Windows (recommended)
 
-```bash
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
-./install.sh
-```
+Use the Rust-free [prebuilt PowerShell path](docs/book/src/setup/windows.md#option-1-prebuilt-binary-recommended) in the Windows setup guide. It installs the current release, updates PATH, and runs Quickstart.
 
-The piped installer uses a prebuilt binary when one is available and falls back to a source build otherwise. It skips interactive setup and prints `zeroclaw quickstart` as the next step.
+For the guided Unix installer, source builds, app and feature selection, and PATH behavior, compare the [installation paths](docs/book/src/getting-started/quickstart.md#install).
 
-When the platform maps to a supported prebuilt target, running `./install.sh` from a clone in an interactive terminal offers prebuilt or source installation; other platforms build from source. The source path also lets you select apps and optional features. For an unconfigured install, the installer then offers CLI or browser-based Quickstart. Use `--skip-quickstart` when you only want to install.
+Run `./install.sh --help` for the complete Unix installer flag reference.
 
 > **Working on the docs?** The translated documentation catalogues live in a
 > git submodule (`docs/book/po`). The Rust build does not need it, but building
@@ -57,25 +58,6 @@ When the platform maps to a supported prebuilt target, running `./install.sh` fr
 > git clone --recurse-submodules https://github.com/zeroclaw-labs/zeroclaw.git
 > git submodule update --init docs/book/po   # existing clone
 > ```
-
-Flags:
-
-```
-./install.sh --prebuilt              # always prebuilt; don't ask
-./install.sh --source                # always build from source
-./install.sh --preset minimal        # kernel-only source preset (~6.6 MB)
-./install.sh --minimal               # alias for --preset minimal
-./install.sh --source --features agent-runtime,channel-discord  # custom feature set
-./install.sh --apps zerocode         # select apps to install; use "none" to skip all
-./install.sh --without-tui           # skip building zerocode
-./install.sh --with-gateway          # force gateway support on
-./install.sh --without-gateway       # force gateway support off
-./install.sh --prefix /tmp/zc-test   # install under a custom prefix
-./install.sh --dry-run --prebuilt    # preview without installing
-./install.sh --skip-quickstart       # install only, run `zeroclaw quickstart` later
-./install.sh --list-features         # print available feature flags
-./install.sh --uninstall             # remove ZeroClaw
-```
 
 Platform-specific notes: [Linux](docs/book/src/setup/linux.md) · [macOS](docs/book/src/setup/macos.md) · [Windows](docs/book/src/setup/windows.md) · [FreeBSD](docs/book/src/setup/freebsd.md) · [NixOS](docs/book/src/setup/nixos.md) · [Docker](docs/book/src/setup/container.md)
 
@@ -107,7 +89,7 @@ One TOML file at `~/.zeroclaw/config.toml`. Pointers:
 - [Provider configuration](docs/book/src/providers/configuration.md) — the universal `[providers.models.<type>.<alias>]` schema
 - [Channels overview](docs/book/src/channels/overview.md) — per-channel `[channels.<type>.<alias>]` blocks
 - [Security overview](docs/book/src/security/overview.md) — autonomy, sandboxing, tool receipts
-- [Full config reference](https://docs.zeroclawlabs.ai/master/en/reference/config.html) — generated from the live schema; every key documented
+- [Full config reference](https://docs.zeroclaw.com/master/en/reference/config.html) — generated from the live schema; every key documented
 
 A V3 config has at minimum four section headers (`<type>.<alias>` shaped) — a provider entry, an agent that references it, and a risk profile the agent gates against. See [Provider Configuration → Minimal working example](docs/book/src/providers/configuration.md#minimal-working-example) for the canonical four-section form with inline type/alias commentary.
 

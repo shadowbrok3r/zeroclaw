@@ -1,23 +1,28 @@
-//! `cargo generate installers` - render install surfaces (setup.bat,
-//! Containerfile, Dockerfiles, packaging, ...) from the canonical spec.
-//! install.sh@HEAD is the behavioral reference. The spec is the single source
-//! of truth; surfaces are derived and drift-checked. Surfaces are registered in
+//! `cargo generate installers` - render install surfaces from canonical route
+//! semantics and deterministic renderer bodies. The spec owns route policy;
+//! renderers own generated surface content; content outside generated zones is
+//! hand-authored. Every tracked surface is registered below and drift-checked.
 
 pub mod container;
 pub mod container_base;
 pub mod docker_tags;
+pub mod docs;
 pub mod flake;
 pub mod install_sh;
 pub mod packaging;
+pub mod runtime_locales;
 pub mod setup_bat;
+pub mod sop_syntax;
 pub mod spec;
+pub mod tools_ftl;
+pub mod zerocode_themes;
 
 use container::ContainerSurface;
 use spec::Selection as Sel;
 use std::path::{Path, PathBuf};
 
 /// A render: given the workspace root and the file's current content, produce
-/// the regenerated content (splicing only sentinel zones).
+/// either a whole-file rendering or a rendering with sentinel zones spliced.
 type Render = fn(&Path, &str) -> anyhow::Result<String>;
 
 /// One registered surface: a canonical name and the file it owns + how to
@@ -42,6 +47,46 @@ fn registry() -> Vec<Surface> {
             render: |root, cur| setup_bat::render_file(root, cur),
         },
         Surface {
+            name: "install-docs",
+            file: "docs/book/src/_snippets/install.md",
+            render: docs::render_file,
+        },
+        Surface {
+            name: "runtime-locales",
+            file: "crates/zeroclaw-runtime/src/generated_locales.rs",
+            render: runtime_locales::render_file,
+        },
+        Surface {
+            name: "tools-en-ftl",
+            file: "crates/zeroclaw-tools/locales/en/tools.ftl",
+            render: tools_ftl::render_file,
+        },
+        Surface {
+            name: "readme-unix-fast",
+            file: "README.md",
+            render: docs::render_readme_unix_fast_zone,
+        },
+        Surface {
+            name: "linux-unix-fast",
+            file: "docs/book/src/setup/linux.md",
+            render: docs::render_unix_fast_command_zone,
+        },
+        Surface {
+            name: "macos-unix-fast",
+            file: "docs/book/src/setup/macos.md",
+            render: docs::render_unix_fast_command_zone,
+        },
+        Surface {
+            name: "hardware-unix-fast",
+            file: "docs/book/src/hardware/subsystem.md",
+            render: docs::render_unix_fast_command_zone,
+        },
+        Surface {
+            name: "windows-prebuilt-guide",
+            file: "docs/book/src/setup/windows.md",
+            render: docs::render_windows_guide,
+        },
+        Surface {
             name: "containerfile",
             file: "Containerfile",
             render: |root, cur| containerfile_surface().render(root, cur),
@@ -57,9 +102,19 @@ fn registry() -> Vec<Surface> {
             render: |root, cur| render_docker_arg(root, cur),
         },
         Surface {
+            name: "dockerfile-alpine",
+            file: "Dockerfile.alpine",
+            render: |root, cur| render_docker_arg(root, cur),
+        },
+        Surface {
             name: "pkgbuild",
             file: "dist/aur/PKGBUILD",
             render: |root, cur| packaging::render_pkgbuild(root, cur),
+        },
+        Surface {
+            name: "aur-srcinfo",
+            file: "dist/aur/.SRCINFO",
+            render: |root, cur| packaging::render_srcinfo(root, cur),
         },
         Surface {
             name: "scoop",
@@ -75,6 +130,11 @@ fn registry() -> Vec<Surface> {
             name: "docker-tags",
             file: "dev/ci/docker-tags.toml",
             render: |root, cur| docker_tags::render_file(root, cur),
+        },
+        Surface {
+            name: "zerocode-themes",
+            file: "apps/zerocode/src/generated_themes.rs",
+            render: zerocode_themes::render_file,
         },
     ]
 }

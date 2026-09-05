@@ -14,13 +14,15 @@ That is the whole install. Run it from a clone, or pipe it from `curl`:
 
 #### sh
 
+<!-- >>> generated:unix-fast-command by `cargo generate installers` - do not edit <<< -->
 ```sh
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh
 ```
+<!-- >>> end generated:unix-fast-command <<< -->
 
 </div>
 
-When the platform maps to a supported prebuilt target, an interactive run offers prebuilt or source installation; other platforms build from source. Source installs also offer app and optional-feature choices. For an unconfigured install, the installer then offers CLI or browser-based setup. The piped `curl | bash` path is noninteractive: it selects a prebuilt binary when available, falls back to a source build otherwise, skips the setup prompt, and prints [`zeroclaw quickstart`](../getting-started/quickstart.md) as the next step. Both paths install to Cargo's bin directory, usually `~/.cargo/bin/zeroclaw`. Pass `--help` for the full flag reference, or `--skip-quickstart` to install only.
+The [canonical installation paths](../getting-started/quickstart.md#install) explain the fast and guided routes, source fallback, app selection, PATH handoff, and the next Quickstart step.
 
 ### Homebrew
 
@@ -58,7 +60,7 @@ Most features work with a stock macOS install. Optional extras:
 |---|---|
 | Docs translation | `brew install gettext` |
 | Browser tool | Playwright pulls Chromium automatically on first use |
-| Hardware | No native GPIO on macOS; use a USB peripheral like Aardvark. See [Hardware → Aardvark](../hardware/aardvark.md) |
+| Hardware | No native GPIO on macOS; use a USB-attached board. See [Hardware](../hardware/index.md) |
 | iMessage channel | Requires macOS 11+. See [Channels → Other chat platforms](../channels/chat-others.md) |
 
 ## Running as a service
@@ -113,7 +115,7 @@ Re-run the installer, it detects the existing install and upgrades in place:
 #### sh
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash -s -- --skip-quickstart
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh -s -- --skip-quickstart
 zeroclaw service restart
 ```
 

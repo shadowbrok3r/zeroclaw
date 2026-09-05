@@ -167,7 +167,7 @@ import EntityLink from "@/components/EntityLink";
 import EntityEnabledToggle from "@/components/EntityEnabledToggle";
 import { useSSE } from "@/hooks/useSSE";
 import { usePolling } from "@/hooks/usePolling";
-import { setSessionId } from "@/lib/ws";
+import { setActiveSessionId } from "@/lib/chatSessions";
 import { t } from "@/lib/i18n";
 import { StatCard, PageHeader, ConfirmDialog } from "@/components/ui";
 
@@ -1048,7 +1048,7 @@ function SessionsTab() {
   // with a known owning agent.
   const openInChat = (session: Session) => {
     if (!session.agent_alias) return;
-    setSessionId(session.agent_alias, session.session_id);
+    setActiveSessionId(session.agent_alias, session.session_id);
     navigate(`/agent/${encodeURIComponent(session.agent_alias)}`);
   };
 

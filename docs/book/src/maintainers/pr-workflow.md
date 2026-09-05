@@ -16,10 +16,10 @@ The control loop that delivers this is layered on purpose:
 
 - **Intake classification**: path/size/risk labels route the PR to the right depth.
 - **Deterministic validation**: the merge gate depends on reproducible checks, not subjective comments.
-- **Risk-based review depth**: high-risk paths get deep review, low-risk paths stay fast.
+- **Risk-based review depth**: high-risk consequences and security boundaries get deep review, while low-risk work stays fast.
 - **Rollback-first merge contract**: every merge path includes a concrete recovery story.
 
-Automation handles path/scope labels, manual issue-dashboard planning reports, and CI gating. Risk, size, type, and contributor-tier labels are maintainer intake decisions unless a maintained workflow explicitly owns them. Final merge accountability stays with human maintainers and PR authors.
+Automation handles path/scope labels, manual issue-dashboard planning reports, and CI gating. Risk, size, type, and contributor-tier labels are maintainer intake decisions unless a maintained workflow explicitly owns them. Final merge accountability stays with human maintainers and PR authors. A PR carrying either `risk:high` or `domain:security` requires deep review and two independent Core Team approvals; automated review does not count as a Core Team approval.
 
 ## Project board contract
 
@@ -35,7 +35,7 @@ Do not mirror native PR review state into manual board lanes. GitHub PR state ow
 
 This keeps the board useful without asking maintainers to update it after every push, review, or CI run.
 
-Risk and size auto-labeling is a separate workflow question. If it is added later, it should recalculate on PR updates so labels describe the current diff, and risk automation must honor `risk:manual` until a maintainer removes that override. The issue-dashboard planner does not apply or recalculate PR risk, size, or type labels.
+Size and risk auto-labeling are separate workflow questions. #9345 may recalculate deterministic size labels on PR updates. Its risk classifier remains report-only until maintainers review the evidence and separately enable risk-label mutation. Risk automation must honor `risk:manual` until a maintainer removes that override. The issue-dashboard planner does not apply or recalculate PR risk, size, or type labels.
 
 ### Issue routing evidence
 
@@ -45,7 +45,7 @@ Issues need contributor-visible routing evidence when a special state would othe
 
 Use these meanings consistently:
 
-| Signal | Means | Does not mean |
+| Routing signal | Means | Does not mean |
 |---|---|---|
 | Assignee | Someone is actively implementing, investigating, or shepherding the immediate work. | Permanent area ownership or passive responsibility for every related issue. |
 | Routing evidence | A visible issue comment, body section, public field, board field, or linked tracker records the reason for special handling and the next decision surface. | Automatic implementation ownership or permanent area ownership. |
@@ -72,6 +72,28 @@ When a tracker marker label is needed, use `type:tracker`. It applies to issue-o
 
 If none of those exists and the issue is not an active tracker or RFC, the issue can still stay open while triage continues, but it should not rely on `status:no-stale` as a permanent shield. Until the stale-exemption audit lands, missing reason or routing evidence is an audit finding and proposed correction, not an automatic stale-closure trigger.
 
+### Named milestone policy
+
+Named milestones are finite delivery cohorts for bounded outcomes within capability domains, not permanent domain backlogs. For this policy, a named milestone is organized around an outcome rather than a numbered release; `Parking Lot` and `Icebox` are holding areas, not named milestones. Name each new milestone as `Domain: Bounded Outcome`. Prefer `RPC Client: Authentication & Authorization` over a broad reusable name such as `Auth`. A combined title occupies each domain it names.
+
+Treat every open named milestone as active. Before opening another, maintainers must explicitly confirm that coordination and review capacity exists for the added cohort. Record why the cohort cannot wait and which current milestone is expected to close next. When capacity is exhausted, do not open another named milestone until one closes or the proposed work is consolidated into an existing cohort. Reassess capacity whenever maintainer availability or review load materially changes.
+
+Keep at most one active named milestone per domain. An explicit maintainer exception may allow independent outcomes in the same domain to proceed in parallel when the decision records why the added coordination cost is justified.
+
+Every named milestone needs an explicit scope and close criteria, though a due date is optional. Do not leave a paused cohort open: reroute its unfinished work and close the milestone. Before closing any named milestone, close or reroute every unfinished issue and add a closure note stating whether the outcome was completed, canceled, or superseded. Closed named milestones stay closed. Follow-on work can form a new named milestone only when enough coherent scope exists to define another finite outcome. Name that milestone for the outcome; do not create rolling `v2`, `v2.1`, or similar successors by default.
+
+GitHub allows an issue or pull request to belong to only one milestone. Work required to complete a named cohort stays in that named milestone through completion, even when it ships in a numbered release. Record release inclusion in the release tracker and changelog. Use numbered release milestones for urgent bugs, maintenance, and other release-bound work outside a named cohort.
+
+Once a named milestone is active, limit new intake to work required to finish its stated cohort: direct scope, blockers, dependencies, and regressions. Route other work by intent:
+
+| Destination | Use for |
+|---|---|
+| Current named milestone | Work required to complete the milestone's defined cohort. |
+| Numbered release milestone | Urgent bugs, maintenance, or other release-bound work outside a named cohort. |
+| RFC or design issue | Work whose design or governance direction is not settled. |
+| `Parking Lot` | Short-term routing while maintainers decide the next concrete home. |
+| `Icebox` | Valid future work for a domain with an active named milestone when it is outside the current cohort and is not scheduled soon. |
+
 ## PR lanes
 
 PR lanes are routing expectations, not another required label family. Use them to decide how much review depth, sequencing, and maintainer attention a PR needs. CODEOWNERS, native GitHub review state, CI, labels, linked issues, and explicit relationship keywords still carry the actual routing data.
@@ -81,7 +103,7 @@ PR lanes are routing expectations, not another required label family. Use them t
 | A: maintenance fast lane | Docs-only corrections, small tests that leave behavior unchanged, metadata/template fixes, narrow examples, CI/tooling fixes that preserve permissions and release behavior | Lightest review; fast merge once CI, template, labels, and privacy checks are clean. Usually `risk:low` and `size:XS` or `size:S`. |
 | B: narrow bug/fix lane | Small bug fixes with clear failing behavior, targeted provider/channel/tool fixes with focused validation, compatibility fixes that preserve behavior outside the reported path | Normal review by one subsystem-aware reviewer unless risk or ownership says otherwise. Merge when the linked issue is actually satisfied, validation is credible, and CI is green. |
 | C: feature slice lane | Additive feature work, new provider/channel/tool support, new config surface, scoped user-visible behavior changes | Normal review plus boundary-specific validation. Milestone fit matters, and the PR should say whether it implements, depends on, or is related to a tracker. |
-| D: architecture, migration, and high-risk lane | Runtime, gateway, security, tool-execution, workflow, broad crate migration, lifecycle, persistence, provider payload, channel behavior, permission, MSRV/toolchain floor, or release-infrastructure changes | Deep review, evidence matched to the changed risk, rollback and compatibility analysis, and possible milestone sequencing or second-maintainer review. |
+| D: architecture, migration, and elevated-review lane | Concrete trust, credential, compatibility, governance, release-authority, migration, lifecycle, persistence, permission, or toolchain-floor boundary; any PR carrying `risk:high` or `domain:security` | Deep review, evidence matched to the changed risk, and rollback and compatibility analysis. A PR carrying `risk:high` or `domain:security` also requires two independent Core Team approvals. |
 | E: supersede, replacement, and overlap lane | Multiple PRs solving the same issue, newer PRs replacing older ones, contributor work carried forward from another PR, old PR made obsolete by current `master` | Coordinate before deep review. Choose one canonical path when possible, use `Supersedes #N` only when accurate, and preserve attribution when work is materially carried forward. |
 
 Do not build a separate manual PR board for these lanes unless native GitHub state and CODEOWNERS stop answering the routing question. Check native GitHub merge state before normal lane review: `DIRTY` means resolve conflicts first; `BEHIND` alone is mergeability housekeeping, not an author-facing blocker.
@@ -115,8 +137,8 @@ Before requesting review, the PR has all of these:
 Before merge:
 
 - `CI Required Gate` is green.
-- Required reviewers approved (including any CODEOWNERS paths).
-- Risk labels match touched paths. See [Labels](./labels.md).
+- Required reviewers approved (including any CODEOWNERS paths); a PR carrying `risk:high` or `domain:security` has two independent Core Team approvals.
+- Risk labels match the actual diff and consequence rather than broad component location. See [Labels](./labels.md).
 - Migration / compatibility impact is documented.
 - Rollback path is concrete and fast.
 
@@ -128,6 +150,7 @@ Every merge:
 - CI gate is green.
 - Docs-quality checks are green when docs changed.
 - Security and privacy fields are complete; evidence is redacted / anonymized.
+- A PR carrying `risk:high` or `domain:security` has two independent Core Team approvals; automated review does not count.
 - Agent-workflow notes are sufficient for reproducibility (if AI-assisted).
 - Rollback plan is explicit.
 - Commit title follows Conventional Commits.
@@ -167,29 +190,32 @@ For AI-heavy PRs, reviewers focus on:
 
 For stacked work, require explicit `Depends on #...` so review order is deterministic.
 
+Apply that deterministic order operationally: prioritize and review a parent before its children; when a parent is not reviewable, defer deep child review unless a bounded independent slice benefits from early review; after the parent lands, refresh and revalidate the child. A parent becoming reviewable does not make previously collected child evidence current.
+
+For a report-only snapshot of the live GitHub queues, run `python3 scripts/github/pr_review_queue.py --queue all --older-than-days 7 --format table`. The `--queue` values are `near-ready`, `maintainer`, `second-core`, `author-action`, `stacked`, `mine`, and `all`; `--format` accepts `table`, `json`, or `links`. `near-ready` narrows the maintainer lane to PRs whose GitHub search status is successful, so maintainers can start with candidates that may need less work before merge; it does not establish mergeability or approval sufficiency. `all` runs the shared lanes independently, so one PR can appear in more than one lane; add `--author LOGIN` to include the `mine` lane. GitHub search supplies the candidate lists. Only `author-action` reads timeline detail to estimate unanswered-request age, and only `second-core` reads reviews to find one Core approval on the current head. The command never writes queue state or mutates GitHub, and it reports missing or ambiguous detail as unknown. It is a work-selection aid, not merge-readiness evidence.
+
 For replacements, require explicit `Supersedes #...`. See [Superseding PRs](./superseding.md) for attribution and template rules.
 
 The reviewer-side queue management, backlog pruning order, stale handling, label hygiene, is in [Reviewer Playbook](./reviewer-playbook.md).
 
 ## Security and stability rules
 
-These paths require stricter review and stronger test evidence. The canonical
-high-risk path set is defined in [Labels → Risk labels](./labels.md#risk-labels).
-In review terms that set covers:
+Review these paths attentively because they often contain boundary-relevant behavior:
 
 - `crates/zeroclaw-runtime/` (including `src/security/`)
 - `crates/zeroclaw-gateway/` (ingress, authentication, pairing)
 - `crates/zeroclaw-tools/` (anything with execution capability)
 - `.github/workflows/` and the release pipeline
 
-Filesystem access boundaries and network/authentication behavior inside those
-crates carry the same scrutiny even when the diff looks small.
+Path location alone does not select `risk:high`. Classify the actual diff and consequence under [Labels → Risk labels](./labels.md#risk-labels). A trust, credential, compatibility, governance, release-authority, or cross-cutting security boundary receives deep review when the PR carries `risk:high` or `domain:security`.
 
-**Minimum for risky PRs:** threat / risk statement, mitigation notes, rollback steps.
+Filesystem access boundaries and network or authentication behavior inside these crates deserve particular attention even when the diff is small.
 
-**Recommended for high-risk PRs:** a focused test proving boundary behavior, plus one explicit failure-mode scenario with expected degradation.
+**Minimum for `risk:high` or `domain:security` PRs:** threat or risk statement, mitigation notes, rollback steps, and two independent Core Team approvals.
 
-For agent-assisted contributions on these paths, reviewers also verify the author can talk through runtime behavior and blast radius, not just paste validation output.
+**Recommended for `risk:high` or `domain:security` PRs:** a focused test proving boundary behavior, plus one explicit failure-mode scenario with expected degradation.
+
+For agent-assisted contributions that cross these boundaries, reviewers also verify the author can talk through runtime behavior and blast radius, not just paste validation output.
 
 ## Failure recovery
 

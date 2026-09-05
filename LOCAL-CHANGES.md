@@ -102,6 +102,13 @@ Architecture documentation for the overhaul:
 | `src/main.rs` | Subcommand registration and dispatch. |
 | `crates/zeroclaw-runtime/locales/en/cli.ftl` | Fluent strings for the CLI output (CLI text policy). |
 
+### Webhook channel
+
+| File | Why |
+|---|---|
+| `crates/zeroclaw-channels/src/webhook.rs` | Two deltas. The listener binds a configurable address (`channels.webhook.bind_address`) instead of a hard-coded one, and a webhook post is treated as a direct message so it reaches the agent without a mention. `WebhookChannel::new` therefore takes one more parameter than upstream's; the two call sites live in `orchestrator/mod.rs`. |
+| `docs/book/src/channels/webhook.md` | Documents the bind address. |
+
 ### Provider truncation surfacing
 
 Unrelated to the session overhaul; carried here because it is a one-file
@@ -143,6 +150,9 @@ Conflicts concentrate in the shared files below.
 | `crates/zeroclaw-gateway/src/lib.rs` | Hourly TTL task replacing the one-shot startup sweep; `session_events` module wiring | Take upstream for unrelated router/daemon churn; keep our sweep task and module wiring. Watch for upstream edits to the old startup `cleanup_stale` block, which we removed. |
 | `crates/zeroclaw-channels/src/orchestrator/mod.rs` | Channel-family TTL sweep near the shared-store setup in `start_channels` | Keep both; ours is additive next to store construction. |
 | `web/src/lib/i18n.ts` | Threads UI string keys | Union of both key sets; conflicts are line-adjacency noise. |
+| `crates/zeroclaw-gateway/src/lib.rs` AppState | — | v0.8.5 **removed** `webhook_secret_hash` in favour of `configured_gateway_webhook_secret_hash(state)` resolved from live config. Every AppState literal (including ~20 test literals in `api.rs`) must drop it and keep `claude_code_hook_secret_hash`. |
+| `crates/zeroclaw-channels/src/webhook.rs` | Bind address + direct-message treatment | Keep both; re-apply on top of upstream's rewrite. **After every merge, grep for `WebhookChannel::new` and `WebhookConfig {` across the tree.** The fork's `bind_address` is parameter 3 of 11 and a field of `WebhookConfig`, so any call site or literal upstream adds shifts every later argument by one — a new positional site fails to compile, but one that upstream later grows an 11th argument for would compile with `secret` landing in `auth_header`. v0.8.5 added two such sites: `orchestrator/mod.rs` (test helper) and `zeroclaw-runtime/src/daemon/mod.rs` (`webhook_only_config_is_supervised`). |
+| `web/src/lib/ws.ts` | `adopt` flag | v0.8.5 moved session-id storage out of `ws.ts` into `web/src/lib/chatSessions.ts` (`getActiveSessionId` / `setActiveSessionId`) and made `sessionId` a required `WebSocketClientOptions` field. Keep only `adopt` here; repoint any `setSessionId` importer at `chatSessions`. |
 | `src/main.rs` | `sessions` subcommand arm | Keep both arms; upstream adds subcommands in the same match. |
 
 ## Behavior deltas vs upstream
@@ -160,9 +170,15 @@ Re-check these after every upstream merge; they are easy to silently lose:
   `agent_alias` unconditionally on every connect. A merge that restores the
   unconditional `set_session_agent_alias` silently reassigns threads between
   agents again.
-- **`/new` in the web UI no longer deletes.** Upstream's `/new` deletes the
-  current session; ours starts a new thread and keeps the old one. A merge
-  taking upstream's `slashCommands.ts` restores destructive `/new`.
+- ~~**`/new` in the web UI no longer deletes.**~~ **Resolved upstream in
+  v0.8.5.** Upstream implemented the same non-destructive `/new` (issue #7543),
+  so this delta is retired and `slashCommands.ts` is back on upstream's
+  `agent.cmd_help_new` key. `/new` still routes through the fork's
+  `startNewThread` rather than upstream's `startNewSession`, because only the
+  threads wrapper carries the ownership escape hatch. It deliberately emits no
+  success notice: hydration for the freshly minted id lands immediately after
+  the handler and would overwrite one (upstream's `localMessageMutationVersionRef`
+  fence only discards mutations that land *after* the fetch starts).
 - **TTL sweeps have safety rules.** Scoped sweeps skip `state = 'running'`
   rows, WS resume refreshes `last_activity`, and a `running` state write
   recreates a swept metadata row so no turn is silently dropped. A merge that
@@ -191,6 +207,14 @@ Re-check these after every upstream merge; they are easy to silently lose:
   tool's own hook posting is legacy/best-effort: it cannot attach the secret
   header or `?agent=`, so runner-spawned sessions do not ingest (documented
   at the `hook_url` site in `claude_code_runner.rs`).
+- **Thread actions report refusal.** `startNewThread` and `switchThread` return
+  `boolean` (upstream's `startNewSession` / `goToSession` already did), and
+  `ThreadsPanel` surfaces `agent.sessions_unavailable` instead of closing on a
+  click that did nothing. Upstream gates every conversation transition on
+  `sessionPersistence === true`; without the return value that gate is a silent
+  no-op. The panel's error banner no longer hardcodes the "failed to load"
+  prefix, since it also carries rename, delete, and switch failures.
+
 - **A `max_tokens` stop is no longer silent.** Upstream parses `finish_reason`
   but only ever compares it to `"tool_calls"`, and the non-streaming `Choice`
   has no `finish_reason` field at all — so a reply cut off at the output-token

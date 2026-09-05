@@ -71,9 +71,21 @@ fn default_protocol_version() -> u64 {
 }
 
 rpc_type! {
+    /// Command identity and accepted tokens advertised to an RPC client.
+    pub struct CommandDescriptor {
+        pub id: String,
+        pub name: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub aliases: Vec<String>,
+    }
+}
+
+rpc_type! {
     pub struct InitializeResult {
         pub protocol_version: u64,
         pub server_version: String,
+        /// OS process ID of the daemon serving this connection.
+        pub server_pid: u32,
         /// Assigned TUI session UID.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub tui_id: Option<String>,
@@ -83,6 +95,13 @@ rpc_type! {
         /// Supported RPC method names (e.g. "session/prompt", "memory/list").
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub capabilities: Vec<String>,
+        /// Shared command catalogue entries available on the TUI surface.
+        ///
+        /// Always serialized so a new daemon's authoritative empty catalogue
+        /// remains distinguishable from an older daemon that predates this
+        /// field.
+        #[serde(default)]
+        pub commands: Vec<CommandDescriptor>,
     }
 }
 
@@ -117,6 +136,11 @@ rpc_type! {
     pub struct DoctorRunResult {
         pub results: Vec<DiagResult>,
         pub summary: DoctorSummary,
+        /// Resolved active log persistence path, if available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub log_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub timed_out_phase: Option<String>,
     }
 }
 
@@ -170,6 +194,16 @@ rpc_type! {
         pub exclude_memory: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub chat_mode: Option<ChatMode>,
+        /// Closed user-facing harness identifier. The daemon validates this
+        /// value and resolves all descriptive claims from host-owned state.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub interaction_surface: Option<crate::agent::prompt::InteractionSurface>,
+        /// When true, skip the same-mode idle-sibling eviction normally
+        /// performed on `session/new` for the calling TUI. Sent by
+        /// multi-session-aware clients that manage sibling session lifecycle
+        /// themselves. Absent or false preserves the eviction sweep.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub keep_siblings: Option<bool>,
     }
 }
 
@@ -298,12 +332,12 @@ rpc_type! {
     pub struct SessionMessagesResult {
         pub session_id: String,
         pub messages: Vec<MessageEntry>,
-        /// Total messages persisted for this session. Lets the TUI
-        /// know how many pages remain before it reaches the head.
+        /// Total projected entries for this session. Lets the TUI know how
+        /// many pages remain before it reaches the head.
         #[serde(default)]
         pub total: usize,
-        /// Index of the first message in `messages` relative to the
-        /// full persisted history. Pair with `total` to compute
+        /// Index of the first entry in `messages` relative to the
+        /// full projected history. Pair with `total` to compute
         /// "page N of M" / "load older" affordances.
         #[serde(default)]
         pub start: usize,
@@ -320,10 +354,29 @@ rpc_type! {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageEntryKind {
+    #[default]
+    Message,
+    ToolCall,
+    ToolResult,
+}
+
 rpc_type! {
     pub struct MessageEntry {
         pub role: String,
         pub content: String,
+        #[serde(default)]
+        pub kind: MessageEntryKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tool_call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tool_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tool_input: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tool_output: Option<String>,
     }
 }
 
@@ -1274,6 +1327,9 @@ rpc_type! {
 rpc_type! {
     pub struct LogsQueryResult {
         pub events: Vec<serde_json::Value>,
+        /// Resolved path of the active installed persistence writer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub log_path: Option<String>,
         /// Legacy cursor. Deprecated since 0.8.0; tracked for removal in
         /// <https://github.com/zeroclaw-labs/zeroclaw/issues/8012>.
         #[deprecated(
@@ -1544,6 +1600,46 @@ mod tests {
     }
 
     #[test]
+    fn interaction_surface_is_closed_and_snake_case() {
+        use crate::agent::prompt::InteractionSurface;
+
+        assert_eq!(
+            serde_json::to_value(InteractionSurface::ZerocodeCode).unwrap(),
+            json!("zerocode_code")
+        );
+        assert_eq!(
+            serde_json::from_value::<InteractionSurface>(json!("zerocode_code")).unwrap(),
+            InteractionSurface::ZerocodeCode
+        );
+        assert!(
+            serde_json::from_value::<InteractionSurface>(json!("client_authored_claims")).is_err()
+        );
+    }
+
+    #[test]
+    fn session_new_params_keep_siblings_round_trips_and_defaults_absent() {
+        // Older clients omit the field entirely: it must parse as None and
+        // serialize back out without a `keep_siblings` key.
+        let legacy: SessionNewParams =
+            serde_json::from_value(json!({ "agent_alias": "a" })).unwrap();
+        assert_eq!(legacy.keep_siblings, None);
+        assert_eq!(legacy.interaction_surface, None);
+        let wire = serde_json::to_value(&legacy).unwrap();
+        assert!(wire.get("keep_siblings").is_none());
+
+        for keep in [true, false] {
+            let params: SessionNewParams = serde_json::from_value(json!({
+                "agent_alias": "a",
+                "keep_siblings": keep,
+            }))
+            .unwrap();
+            assert_eq!(params.keep_siblings, Some(keep));
+            let wire = serde_json::to_value(&params).unwrap();
+            assert_eq!(wire["keep_siblings"], json!(keep));
+        }
+    }
+
+    #[test]
     fn file_source_default_is_file() {
         // `FileSource` does not derive `PartialEq`; assert via the wire
         // spelling instead. Default is `File` per the `#[default]`
@@ -1763,5 +1859,23 @@ mod tests {
         assert_eq!(params.run_id, "r1");
         assert_eq!(params.surface, Surface::Tui);
         assert!(params.last_step.is_none());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn logs_query_result_exposes_active_log_path_when_present() {
+        let result = LogsQueryResult {
+            events: Vec::new(),
+            log_path: Some("/var/lib/zeroclaw/runtime-trace.jsonl".into()),
+            next_cursor: None,
+            next_cursor_line_offset: None,
+            at_end: true,
+        };
+
+        let value = serde_json::to_value(result).expect("logs/query result");
+        assert_eq!(
+            value["log_path"],
+            json!("/var/lib/zeroclaw/runtime-trace.jsonl")
+        );
     }
 }

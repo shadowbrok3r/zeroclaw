@@ -113,6 +113,47 @@ mod tests {
         assert_eq!(dist["floating_tag"].as_str().unwrap(), "dist");
     }
 
+    // B6: the reusable relay image publish job must build from the SAME immutable
+    // ref the caller requested (`inputs.release_ref`) and derive its pinned tag
+    // from that ref, exactly like the main image job. Otherwise a workflow_call
+    // release builds/publishes the relay from the wrong ref under a mismatched
+    // SHA tag.
+    #[test]
+    fn publish_relay_pins_release_ref_for_provenance() {
+        let wf =
+            std::fs::read_to_string(root().join(".github/workflows/docker-publish.yml")).unwrap();
+        let (_, relay) = wf
+            .split_once("publish-relay:")
+            .expect("publish-relay job must exist");
+        // Stop at the next job so we only assert against this job's block.
+        let relay = relay.split("\n  scan-relay:").next().unwrap_or(relay);
+
+        assert!(
+            relay.contains("ref: ${{ inputs.release_ref || github.ref }}"),
+            "publish-relay must check out the release ref, not the triggering ref"
+        );
+        assert!(
+            relay.contains("RELEASE_REF: ${{ inputs.release_ref }}")
+                && relay.contains("-zerorelay:${RELEASE_REF}"),
+            "publish-relay must derive its pinned tag from inputs.release_ref"
+        );
+    }
+
+    // B7: the signed relay image must build with --locked so it cannot resolve
+    // newer semver-compatible deps than the reviewed Cargo.lock.
+    #[test]
+    fn relay_dockerfile_build_is_lockfile_enforced() {
+        let dockerfile = std::fs::read_to_string(root().join("apps/zerorelay/Dockerfile")).unwrap();
+        assert!(
+            dockerfile.contains("cargo build --release --locked -p zerorelay"),
+            "the relay image build must use --locked for a reproducible signed artifact"
+        );
+        assert!(
+            !dockerfile.contains("cargo build --release -p zerorelay"),
+            "the relay image build must not have an unlocked cargo build path"
+        );
+    }
+
     #[test]
     fn dockerfile_tags_are_multi_arch_containerfile_is_amd64_only() {
         let s = render(&root()).unwrap();
@@ -158,14 +199,21 @@ mod tests {
             .iter()
             .find(|t| t["stem"].as_str() == Some("all-features"))
             .unwrap();
-        assert!(
-            dist["features"]
-                .as_str()
-                .unwrap()
-                .contains("channel-matrix")
-        );
-        assert!(dist["features"].as_str().unwrap().contains("whatsapp-web"));
-        assert!(!dist["features"].as_str().unwrap().contains("channel-slack"));
+        let dist_features = dist["features"].as_str().unwrap();
+        for feature in
+            crate::generate::spec::resolve_feature_list(&root(), &Selection::Dist).unwrap()
+        {
+            assert!(
+                dist_features.contains(&feature),
+                "dist feature {feature} not rendered"
+            );
+        }
+        for feature in crate::generate::spec::features_outside_dist(&root()).unwrap() {
+            assert!(
+                !dist_features.contains(&feature),
+                "{feature} leaked into lean dist"
+            );
+        }
         assert!(all["features"].as_str().unwrap().contains("hardware"));
     }
 }

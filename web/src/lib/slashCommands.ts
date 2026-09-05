@@ -31,7 +31,7 @@ export interface CommandSpec {
 export const COMMANDS: readonly CommandSpec[] = [
   { name: 'help', usage: '/help', descriptionKey: 'agent.cmd_help_help' },
   { name: 'clear', usage: '/clear', descriptionKey: 'agent.cmd_help_clear' },
-  { name: 'new', usage: '/new', descriptionKey: 'agent.cmd_help_new_thread' },
+  { name: 'new', usage: '/new', descriptionKey: 'agent.cmd_help_new' },
   { name: 'model', usage: '/model [name]', descriptionKey: 'agent.cmd_help_model' },
 ] as const;
 
