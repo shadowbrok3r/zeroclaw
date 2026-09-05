@@ -71,15 +71,15 @@ Architecture documentation for the overhaul:
 
 | File | Why |
 |---|---|
-| `web/src/components/ThreadsPanel.tsx` (NEW) | Thread list per agent: switch, rename, delete; live-updates from SSE lifecycle events. |
-| `web/src/lib/ws.ts` | Session id / resume / `adopt` plumbing on the chat socket. |
-| `web/src/contexts/AgentContext.tsx` | Active-thread state per agent. |
-| `web/src/pages/AgentChat.tsx` | Hosts the threads panel; thread switching in the chat view. |
+| `web/src/components/ThreadsPanel.tsx` (NEW) | Read-only browser for the session families upstream's `SessionPicker` does not show: channel conversations, `cc_` Claude Code, and `rpc_`/TUI. Transcript viewer; live-updates from SSE lifecycle events. |
+| `web/src/lib/ws.ts` | `adopt` plumbing on the chat socket. |
+| `web/src/contexts/AgentContext.tsx` | `startNewThread` (ownership-refusal escape hatch over upstream's `startNewSession`). |
+| `web/src/pages/AgentChat.tsx` | Hosts the panel; `/new` and the ownership banner route through `startNewThread`. |
 | `web/src/pages/Dashboard.tsx` | Consumes `session_created` / `session_update` / `session_closed` frames (upstream already subscribed; the frames now exist). |
 | `web/src/lib/api.ts` | Client calls for the session REST verbs. |
 | `web/src/types/api.ts` | Session/thread payload types. |
 | `web/src/lib/i18n.ts` | Threads UI strings (web text contract). |
-| `web/src/lib/slashCommands.ts` | `/new` starts a fresh thread instead of deleting the current session. |
+
 
 ### Claude Code session ingestion (`cc_` family)
 
@@ -207,13 +207,21 @@ Re-check these after every upstream merge; they are easy to silently lose:
   tool's own hook posting is legacy/best-effort: it cannot attach the secret
   header or `?agent=`, so runner-spawned sessions do not ingest (documented
   at the `hook_url` site in `claude_code_runner.rs`).
-- **Thread actions report refusal.** `startNewThread` and `switchThread` return
-  `boolean` (upstream's `startNewSession` / `goToSession` already did), and
-  `ThreadsPanel` surfaces `agent.sessions_unavailable` instead of closing on a
-  click that did nothing. Upstream gates every conversation transition on
-  `sessionPersistence === true`; without the return value that gate is a silent
-  no-op. The panel's error banner no longer hardcodes the "failed to load"
-  prefix, since it also carries rename, delete, and switch failures.
+- **`SessionPicker` owns the agent's own conversations; `ThreadsPanel` owns the
+  rest.** v0.8.5 shipped upstream's own multi-conversation UI (#9353, #9355),
+  which duplicated the fork's `gw_` thread list — both were mounted in
+  `AgentChat` at once. The duplicate list was removed from `ThreadsPanel`
+  (-269 lines net), leaving it a read-only browser for the channel, `cc_` and
+  `rpc_`/TUI families. This is not cosmetic: only `SessionPicker` tracks
+  `reservedSessionIds`, so only it can refuse to put two sockets on one gateway
+  session. Do not re-add switch/rename/delete here — route them through
+  `SessionPicker`.
+
+- **`startNewThread` returns `boolean`.** Upstream gates every conversation
+  transition on `sessionPersistence === true`; without the return value that
+  gate is a silent no-op, so `/new` reports `agent.sessions_unavailable`
+  instead of appearing to work. `switchThread` was removed with the duplicate
+  list.
 
 - **A `max_tokens` stop is no longer silent.** Upstream parses `finish_reason`
   but only ever compares it to `"tool_calls"`, and the non-streaming `Choice`

@@ -269,13 +269,24 @@ Code" group (see the next section).
 
 ### Web threads UI
 
-The dashboard chat gains a threads panel
-(`web/src/components/ThreadsPanel.tsx`): list, switch, rename, and delete
-`gw_` threads per agent, live-updated from the SSE lifecycle events, with
-read-only transcript viewers for channel conversations (Discord and friends),
-Claude Code (`cc_`) sessions, and RPC/TUI sessions. The `/new` slash command
-now starts a fresh thread under a new `gw_` key and leaves the previous
-thread listed; upstream's `/new` deleted the current session.
+The dashboard chat has two session surfaces, and the split matters.
+
+Upstream's `SessionPicker` (`web/src/components/SessionPicker.tsx`, added in
+v0.8.5) owns the agent's own `gw_` conversations: new, switch, rename, delete
+from the chat header. It is the only surface that tracks which conversations a
+sibling chat pane already holds, so it is the only one that can refuse to put
+two sockets on one gateway session.
+
+The fork's panel (`web/src/components/ThreadsPanel.tsx`) covers what
+`SessionPicker` does not show, all read-only because only a `gw_` key is
+switchable: channel conversations (Discord and friends), Claude Code (`cc_`)
+sessions, and RPC/TUI sessions, each browsable through a transcript viewer.
+Both are live-updated from the SSE lifecycle events.
+
+The `/new` slash command starts a fresh thread under a new `gw_` key and
+leaves the previous thread listed. Upstream's `/new` once deleted the current
+session; it converged on the non-destructive behavior in v0.8.5, so this is no
+longer a fork difference.
 
 ### `zeroclaw sessions` CLI
 

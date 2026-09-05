@@ -125,17 +125,12 @@ export interface AgentContextValue {
   contextMaxTokens: number | null;
   contextInputTokens: number | null;
   /**
-   * Thread-flavoured `startNewSession` for the threads surface (ThreadsPanel,
-   * the `/new` slash command): begin another conversation and leave the
+   * Thread-flavoured `startNewSession` for the `/new` slash command and the
+   * ownership-refusal banner: begin another conversation and leave the
    * previous one intact — it is never deleted. Additionally escapes an
    * ownership refusal, where the persistence gate cannot apply.
    */
   startNewThread: () => boolean;
-  /**
-   * Thread-flavoured `goToSession`: open the thread the panel selected and
-   * re-hydrate its transcript.
-   */
-  switchThread: (id: string) => boolean;
   /** Info from the gateway's `session_start` frame: whether this connect
    * resumed a persisted session, and how many messages it carried. */
   sessionStart: { resumed: boolean; messageCount: number } | null;
@@ -1247,9 +1242,10 @@ export function AgentProvider({
   }, [transitionToSession]);
 
   /**
-   * Threads-surface wrapper over `startNewSession` (ThreadsPanel, `/new`):
-   * begin another conversation and leave the current one intact — starting a
-   * thread never deletes, unlike `clearAllMessages`.
+   * Threads-surface wrapper over `startNewSession` (the `/new` slash command
+   * and the ownership-refusal banner): begin another conversation and leave
+   * the current one intact — starting a thread never deletes, unlike
+   * `clearAllMessages`.
    *
    * The ownership banner's escape hatch routes here too, and it must work even
    * when persistence is unknown: the gateway refuses to resume the current
@@ -1262,12 +1258,6 @@ export function AgentProvider({
     }
     return startNewSession();
   }, [ownershipConflict, startNewSession, transitionToSession]);
-
-  /** Threads-surface wrapper over `goToSession`: open the selected thread and
-   * re-hydrate its transcript. */
-  const switchThread = useCallback((id: string): boolean => (
-    goToSession(id)
-  ), [goToSession]);
 
   /**
    * User-confirmed thread adoption (the agent-ownership banner action):
@@ -1378,7 +1368,6 @@ export function AgentProvider({
     contextMaxTokens,
     contextInputTokens,
     startNewThread,
-    switchThread,
     sessionStart,
     ownershipConflict,
     adoptThread,

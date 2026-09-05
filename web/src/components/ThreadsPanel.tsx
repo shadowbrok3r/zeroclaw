@@ -1,17 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Check, Hash, MessageSquare, Pencil, Plus, RefreshCw, Trash2, X } from 'lucide-react';
+import { Hash, MessageSquare, RefreshCw, X } from 'lucide-react';
 import type { SSEEvent, Session, SessionLifecycleEvent, SessionMessageRow } from '@/types/api';
-import { getSessions, getSessionMessages, deleteSession, renameSession } from '@/lib/api';
-import { useAgent } from '@/contexts/AgentContext';
+import { getSessions, getSessionMessages } from '@/lib/api';
 import { useSSE } from '@/hooks/useSSE';
 import { formatRelative } from '@/lib/format';
 import { t } from '@/lib/i18n';
-import { Button, ConfirmDialog } from '@/components/ui';
-
-/** Shortened display form for an unnamed thread (first uuid block). */
-function shortThreadId(id: string): string {
-  return id.length > 8 ? id.slice(0, 8) : id;
-}
 
 interface TranscriptViewer {
   session: Session;
@@ -25,35 +18,32 @@ export interface ThreadsPanelProps {
 }
 
 /**
- * Per-agent session browser, opened from the chat header. Three sections:
+ * Read-only browser for the sessions this agent owns that are NOT its own live
+ * conversations. Opened from the chat header.
  *
- * - **Chat threads** (`gw_` session keys — gateway WebSocket sessions): open
- *   (switch the live chat onto that thread), rename, and delete; plus a
- *   "new thread" action. The current thread is highlighted. Only `gw_` keys
- *   are switchable: the WS mints its key as `gw_<session_id>`, so switching
- *   onto any other key would fork an empty lookalike session.
- * - **Channel conversations** (`channel_id` set — Discord etc.): read-only;
- *   clicking a row opens a transcript viewer via the session messages API.
- * - **Claude Code** (`cc_` session keys — ingested via the gateway's
- *   Claude Code hook endpoints): read-only, same transcript viewer.
+ * The agent's own `gw_` conversations — switch, new, rename, delete — belong to
+ * `SessionPicker`, which upstream added in v0.8.5. It is the only surface that
+ * knows which conversations a sibling chat pane already holds
+ * (`reservedSessionIds`), so it is the only one that can refuse to put two
+ * sockets on one gateway session. This panel deliberately does not duplicate
+ * it; it covers the families `SessionPicker` cannot show, all read-only
+ * because only a `gw_` key is switchable (the WS mints `gw_<session_id>`, so
+ * switching onto any other key would fork an empty lookalike session):
+ *
+ * - **Channel conversations** (`channel_id` set — Discord etc.): clicking a
+ *   row opens a transcript viewer via the session messages API.
+ * - **Claude Code** (`cc_` keys — ingested via the gateway's Claude Code hook
+ *   endpoints): same transcript viewer.
  * - **Other sessions** (neither a `gw_`/`cc_` key nor a `channel_id` —
- *   rpc_/TUI sessions): read-only, same transcript viewer as channel
- *   conversations.
+ *   rpc_/TUI sessions): same transcript viewer.
  *
  * The list refetches on mount (the panel is mounted only while open) and
  * refreshes live on `session_created` / `session_update` / `session_closed`
- * SSE frames. Rendered inside an `<AgentProvider>` (uses `useAgent()`).
+ * SSE frames.
  */
 export default function ThreadsPanel({ agentAlias, onClose }: ThreadsPanelProps) {
-  const { sessionId, startNewThread, switchThread } = useAgent();
-
   const [sessions, setSessions] = useState<Session[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  // session_key currently in inline-rename mode, with its draft value.
-  const [renaming, setRenaming] = useState<{ key: string; value: string } | null>(null);
-  const [renameSaving, setRenameSaving] = useState(false);
-  const [pendingDelete, setPendingDelete] = useState<Session | null>(null);
-  const [deleting, setDeleting] = useState<string | null>(null);
   const [viewer, setViewer] = useState<TranscriptViewer | null>(null);
 
   const load = useCallback(() => {
@@ -109,16 +99,6 @@ export default function ThreadsPanel({ agentAlias, onClose }: ThreadsPanelProps)
     if (relevant) load();
   }, [events, agentAlias, load]);
 
-  // Only gateway WebSocket sessions (gw_ keys) are switchable chat threads:
-  // the WS mints its key as `gw_<session_id>`, so switching onto an rpc_/TUI
-  // session would mint `gw_rpc_<uuid>` and fork an empty lookalike session.
-  const chatThreads = useMemo(
-    () =>
-      (sessions ?? [])
-        .filter((s) => !s.channel_id && s.session_key.startsWith('gw_'))
-        .sort((a, b) => b.last_activity.localeCompare(a.last_activity)),
-    [sessions],
-  );
   const channelConversations = useMemo(
     () =>
       (sessions ?? [])
@@ -149,66 +129,6 @@ export default function ThreadsPanel({ agentAlias, onClose }: ThreadsPanelProps)
         .sort((a, b) => b.last_activity.localeCompare(a.last_activity)),
     [sessions],
   );
-
-  const handleOpenThread = (s: Session) => {
-    // The display `session_id` (gw_ stripped) is the raw uuid the WebSocket
-    // connects with; switchThread persists it and reconnects. It refuses while
-    // session storage is unconfirmed, so say so rather than closing the panel
-    // on a click that did nothing.
-    if (s.session_id !== sessionId && !switchThread(s.session_id)) {
-      setError(t('agent.sessions_unavailable'));
-      return;
-    }
-    onClose();
-  };
-
-  const commitRename = async () => {
-    if (!renaming || renameSaving) return;
-    const { key, value } = renaming;
-    const trimmed = value.trim();
-    // Empty or unchanged input is a cancel, not a rename: the server rejects
-    // PUT {name: ''} with 400 "name is required", which would surface the
-    // panel error banner and leave the editor wedged open.
-    const currentName = sessions?.find((s) => s.session_key === key)?.name ?? '';
-    if (!trimmed || trimmed === currentName) {
-      setRenaming(null);
-      return;
-    }
-    setRenameSaving(true);
-    try {
-      await renameSession(key, trimmed);
-      setSessions((prev) =>
-        prev
-          ? prev.map((s) =>
-              s.session_key === key ? { ...s, name: trimmed } : s,
-            )
-          : prev,
-      );
-      setRenaming(null);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setRenameSaving(false);
-    }
-  };
-
-  const handleDelete = async (s: Session) => {
-    if (deleting) return;
-    setDeleting(s.session_key);
-    try {
-      await deleteSession(s.session_key);
-      setSessions((prev) =>
-        prev ? prev.filter((row) => row.session_key !== s.session_key) : prev,
-      );
-      // Deleting the thread the chat is currently on: move onto a fresh one so
-      // the next turn doesn't resurrect the just-deleted session key.
-      if (s.session_id === sessionId) startNewThread();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setDeleting(null);
-    }
-  };
 
   const openViewer = (s: Session) => {
     setViewer({ session: s, messages: null, error: null });
@@ -263,20 +183,6 @@ export default function ThreadsPanel({ agentAlias, onClose }: ThreadsPanelProps)
             >
               <RefreshCw className="h-4 w-4" />
             </button>
-            <Button
-              variant="primary"
-              size="sm"
-              onClick={() => {
-                if (!startNewThread()) {
-                  setError(t('agent.sessions_unavailable'));
-                  return;
-                }
-                onClose();
-              }}
-            >
-              <Plus className="h-3.5 w-3.5" />
-              {t('threads.new_thread')}
-            </Button>
             <button
               type="button"
               onClick={onClose}
@@ -304,145 +210,6 @@ export default function ThreadsPanel({ agentAlias, onClose }: ThreadsPanelProps)
 
           {sessions !== null && (
             <>
-              {/* Chat threads */}
-              <section>
-                <h3
-                  className="text-xs font-semibold uppercase tracking-wider mb-2"
-                  style={{ color: 'var(--pc-text-muted)' }}
-                >
-                  {t('threads.chat_threads')}
-                </h3>
-                {chatThreads.length === 0 ? (
-                  <p className="text-sm py-2" style={{ color: 'var(--pc-text-faint)' }}>
-                    {t('threads.none')}
-                  </p>
-                ) : (
-                  <div className="space-y-2">
-                    {chatThreads.map((s) => {
-                      const isCurrent = s.session_id === sessionId;
-                      const isRenaming = renaming?.key === s.session_key;
-                      return (
-                        <div
-                          key={s.session_key}
-                          className="flex items-center gap-2 py-2 px-3 rounded-xl"
-                          style={{
-                            background: 'var(--pc-bg-elevated)',
-                            border: isCurrent
-                              ? '1px solid var(--pc-accent)'
-                              : '1px solid transparent',
-                          }}
-                        >
-                          {isRenaming ? (
-                            <div className="flex-1 min-w-0">
-                              <input
-                                autoFocus
-                                value={renaming.value}
-                                onChange={(e) =>
-                                  setRenaming({ key: s.session_key, value: e.target.value })
-                                }
-                                onKeyDown={(e) => {
-                                  if (e.key === 'Enter') void commitRename();
-                                  if (e.key === 'Escape') setRenaming(null);
-                                }}
-                                placeholder={t('threads.rename_placeholder')}
-                                className="input-electric px-2 py-0.5 text-xs w-40"
-                                aria-label={t('threads.rename')}
-                              />
-                            </div>
-                          ) : (
-                          <button
-                            type="button"
-                            onClick={() => handleOpenThread(s)}
-                            className="flex-1 min-w-0 text-left"
-                            title={t('threads.open_thread')}
-                          >
-                            <span className="flex items-center gap-2 flex-wrap">
-                              <span
-                                className={`text-sm font-medium truncate ${s.name ? '' : 'font-mono'}`}
-                                style={{ color: 'var(--pc-text-primary)' }}
-                              >
-                                {s.name || shortThreadId(s.session_id)}
-                              </span>
-                              {isCurrent && (
-                                <span
-                                  className="text-[10px] font-medium px-2 py-0.5 rounded-full"
-                                  style={{
-                                    background: 'rgba(var(--pc-accent-rgb), 0.10)',
-                                    color: 'var(--pc-accent)',
-                                  }}
-                                >
-                                  {t('threads.current')}
-                                </span>
-                              )}
-                            </span>
-                            <span
-                              className="flex items-center gap-2 text-xs mt-0.5"
-                              style={{ color: 'var(--pc-text-muted)' }}
-                            >
-                              <span className="flex items-center gap-1">
-                                <MessageSquare className="h-3 w-3" />
-                                {s.message_count}
-                              </span>
-                              <span>{formatRelative(s.last_activity)}</span>
-                            </span>
-                          </button>
-                          )}
-                          <div className="flex items-center gap-0.5 flex-shrink-0">
-                            {isRenaming ? (
-                              <>
-                                <button
-                                  type="button"
-                                  onClick={() => void commitRename()}
-                                  disabled={renameSaving}
-                                  className="p-1.5 rounded-lg hover:bg-[var(--pc-hover)] disabled:opacity-50"
-                                  title={t('common.save')}
-                                  style={{ color: 'var(--color-status-success)' }}
-                                >
-                                  <Check className="h-4 w-4" />
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => setRenaming(null)}
-                                  className="p-1.5 rounded-lg hover:bg-[var(--pc-hover)]"
-                                  title={t('common.cancel')}
-                                  style={{ color: 'var(--pc-text-muted)' }}
-                                >
-                                  <X className="h-4 w-4" />
-                                </button>
-                              </>
-                            ) : (
-                              <>
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    setRenaming({ key: s.session_key, value: s.name ?? '' })
-                                  }
-                                  className="p-1.5 rounded-lg hover:bg-[var(--pc-hover)]"
-                                  title={t('threads.rename')}
-                                  style={{ color: 'var(--pc-text-muted)' }}
-                                >
-                                  <Pencil className="h-4 w-4" />
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => setPendingDelete(s)}
-                                  disabled={deleting === s.session_key}
-                                  className="p-1.5 rounded-lg hover:bg-[var(--pc-hover)] disabled:opacity-50"
-                                  title={t('threads.delete')}
-                                  style={{ color: 'var(--color-status-error)' }}
-                                >
-                                  <Trash2 className="h-4 w-4" />
-                                </button>
-                              </>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </section>
-
               {/* Channel conversations (read-only) */}
               <section>
                 <h3
@@ -558,8 +325,9 @@ export default function ThreadsPanel({ agentAlias, onClose }: ThreadsPanelProps)
               )}
 
               {/* Other sessions (rpc_/TUI — neither gw_/cc_ key nor channel).
-                  Read-only transcript access only: switching onto a non-gw_
-                  key would fork an empty session (see chatThreads). */}
+                  Read-only transcript access only: the WS mints its key as
+                  `gw_<session_id>`, so switching onto a non-gw_ key would fork
+                  an empty lookalike session. */}
               {otherSessions.length > 0 && (
                 <section>
                   <h3
@@ -697,22 +465,6 @@ export default function ThreadsPanel({ agentAlias, onClose }: ThreadsPanelProps)
           </div>
         </div>
       )}
-
-      <ConfirmDialog
-        open={pendingDelete !== null}
-        danger
-        title={t('threads.delete')}
-        message={`${t('threads.confirm_delete_prefix')} ${
-          pendingDelete?.name || shortThreadId(pendingDelete?.session_id ?? '')
-        }${t('threads.confirm_delete_suffix')}`}
-        confirmLabel={t('common.delete')}
-        onConfirm={() => {
-          const target = pendingDelete;
-          setPendingDelete(null);
-          if (target) void handleDelete(target);
-        }}
-        onClose={() => setPendingDelete(null)}
-      />
     </>
   );
 }
