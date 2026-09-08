@@ -641,12 +641,39 @@ fn should_normalize_message_images(
     message.role == "user"
 }
 
+/// Image payload normalization must not erase a tool's file/URL reference:
+/// the model still needs the original target to return a delivery marker or
+/// pass the artifact to another tool. Keep it as ordinary text so repeated
+/// preparation cannot mistake the reference for another image payload.
+/// The original tool result is the source of truth; data URIs are never copied
+/// into the text reference, and user-upload paths retain their existing policy.
+fn with_tool_image_references(cleaned: &str, refs: &[String]) -> String {
+    let mut text = cleaned.to_string();
+    let mut seen = HashSet::new();
+    for reference in refs {
+        if !(Path::new(reference).is_absolute()
+            || reference.starts_with("https://")
+            || reference.starts_with("http://"))
+            || !seen.insert(reference)
+        {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str("Image reference: ");
+        text.push_str(reference);
+    }
+    text
+}
+
 fn stripped_image_marker_text(content: &str) -> String {
     let (cleaned, refs) = parse_image_markers(content);
     if refs.is_empty() {
         return content.to_string();
     }
 
+    let cleaned = with_tool_image_references(&cleaned, &refs);
     if cleaned.trim().is_empty() {
         "[image removed from history]".to_string()
     } else {
@@ -715,6 +742,7 @@ async fn normalize_native_tool_result_json(
     if refs.is_empty() {
         return None;
     }
+    let cleaned_text = with_tool_image_references(&cleaned_text, &refs);
 
     let normalized =
         normalize_image_references(&refs, config, max_bytes, remote_client, ctx, cache).await;
@@ -834,6 +862,11 @@ async fn prepare_messages_inner(
             normalized_messages.push(message.clone());
             continue;
         }
+        let cleaned_text = if is_tool_result_carrier(message) {
+            with_tool_image_references(&cleaned_text, &refs)
+        } else {
+            cleaned_text
+        };
 
         let normalized = normalize_image_references(
             &refs,
@@ -2264,8 +2297,8 @@ mod tests {
             "local image path inside tool content should be rewritten to a data URI"
         );
         assert!(
-            !inner.contains("native-tool-result.png"),
-            "raw local path must not leak after normalization"
+            inner.contains(&format!("Image reference: {}", image_path.display())),
+            "tool delivery target must remain available as text metadata"
         );
     }
 
@@ -2301,7 +2334,7 @@ mod tests {
         assert!(inner.contains("generated screenshot"));
         assert!(inner.contains("1 attached image(s) could not be loaded"));
         assert!(!inner.contains("[IMAGE:"));
-        assert!(!inner.contains("https://example.com/missing.png"));
+        assert!(inner.contains("Image reference: https://example.com/missing.png"));
     }
 
     #[tokio::test]
@@ -2347,8 +2380,8 @@ mod tests {
         assert!(inner.contains("generated"));
         assert!(inner.contains("data:image/png;base64,"));
         assert!(inner.contains("1 of 2 attached image(s) could not be loaded"));
-        assert!(!inner.contains("mixed-native-tool-result.png"));
-        assert!(!inner.contains("https://example.com/missing.png"));
+        assert!(inner.contains(&format!("Image reference: {}", image_path.display())));
+        assert!(inner.contains("Image reference: https://example.com/missing.png"));
     }
 
     #[tokio::test]
@@ -2399,7 +2432,7 @@ mod tests {
         assert!(inner.contains("generated screenshot"));
         assert!(!inner.contains("[IMAGE:"));
         assert!(!inner.contains("data:image"));
-        assert!(!inner.contains("stale-native-tool-result.png"));
+        assert!(inner.contains(&format!("Image reference: {}", image_path.display())));
     }
 
     #[tokio::test]
@@ -2434,9 +2467,9 @@ mod tests {
         assert!(!prepared.messages[0].content.contains("[IMAGE:"));
         assert!(!prepared.messages[0].content.contains("data:image"));
         assert!(
-            !prepared.messages[0]
+            prepared.messages[0]
                 .content
-                .contains("stale-prompt-tool-result.png")
+                .contains(&format!("Image reference: {}", image_path.display()))
         );
     }
 
@@ -2482,7 +2515,7 @@ mod tests {
         assert!(inner.contains("generated screenshot"));
         assert!(!inner.contains("[IMAGE:"));
         assert!(!inner.contains("data:image"));
-        assert!(!inner.contains("stale-tool-result.png"));
+        assert!(inner.contains(&format!("Image reference: {}", stale_path.display())));
 
         let (cleaned, refs) = parse_image_markers(&prepared.messages[2].content);
         assert_eq!(cleaned, "Now inspect this");
@@ -2514,6 +2547,81 @@ mod tests {
         ];
 
         assert_eq!(count_image_markers(&messages), 1);
+    }
+
+    #[tokio::test]
+    async fn tool_image_references_survive_normalization_and_later_tool_turns() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("generated picture.png");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
+        let target = path.display().to_string();
+        for native in [false, true] {
+            let raw = format!("review: OK\n[IMAGE:{target}]");
+            let message = if native {
+                ChatMessage::tool(
+                    serde_json::json!({"tool_call_id":"render1","content":raw}).to_string(),
+                )
+            } else {
+                ChatMessage::user(format!("[Tool results]\nshell: {raw}"))
+            };
+            let prepared = prepare_messages_for_provider(
+                std::slice::from_ref(&message),
+                &MultimodalConfig::default(),
+            )
+            .await
+            .unwrap();
+            assert!(prepared.contains_images);
+            assert!(
+                prepared.messages[0]
+                    .content
+                    .contains(&format!("Image reference: {target}"))
+            );
+            assert!(
+                prepared.messages[0]
+                    .content
+                    .contains("data:image/png;base64,")
+            );
+
+            // Providers may prepare an already prepared turn again.
+            let repeated =
+                prepare_messages_for_provider(&prepared.messages, &MultimodalConfig::default())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                repeated.messages[0]
+                    .content
+                    .matches("Image reference:")
+                    .count(),
+                1
+            );
+
+            let later = vec![
+                message,
+                ChatMessage::assistant("Checking settings"),
+                ChatMessage::tool("settings OK"),
+            ];
+            let replayed = prepare_messages_for_provider(&later, &MultimodalConfig::default())
+                .await
+                .unwrap();
+            assert!(!replayed.contains_images);
+            assert!(
+                replayed.messages[0]
+                    .content
+                    .contains(&format!("Image reference: {target}"))
+            );
+            assert!(!replayed.messages[0].content.contains("data:image"));
+        }
+    }
+
+    #[test]
+    fn tool_reference_metadata_never_repeats_inline_image_data() {
+        let refs = vec![
+            "data:image/png;base64,PRIVATE".into(),
+            "https://example.com/p.png".into(),
+            "https://example.com/p.png".into(),
+        ];
+        let text = with_tool_image_references("done", &refs);
+        assert_eq!(text, "done\nImage reference: https://example.com/p.png");
     }
 
     #[test]

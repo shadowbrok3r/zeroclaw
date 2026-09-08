@@ -24,6 +24,13 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `tool_result_image_policy`: handling for image markers in native `role = "tool"` results sent to compatible chat-completions providers. Defaults to `"image_url"`; set to `"omit"` to remove image URI/base64 payloads and append a fixed notice. This does not change direct user images or OpenAI Responses providers.
 - `tls_ca_cert_path`: absolute path to a PEM-encoded CA certificate for TLS connections to this provider (a per-provider trust override, distinct from the gateway TLS `ca_cert_path`). Shell expansion such as `~` is not performed; leave unset to use the system trust store.
 
+Tool-produced image paths and URLs remain available as `Image reference:` text
+when their image payloads are normalized or removed from older tool turns. Agents
+can use that exact reference for subsequent file tools or outbound image markers.
+Inline base64 data is never repeated as a text reference. This metadata preserves
+the original tool-supplied target; channel attachment permissions still determine
+whether an outbound marker may be delivered.
+
 Family-specific entries add their own typed fields on top of these shared fields.
 
 ## Field resolution order

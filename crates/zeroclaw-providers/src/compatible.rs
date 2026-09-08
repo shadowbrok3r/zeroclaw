@@ -6372,6 +6372,40 @@ mod tests {
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_img"));
     }
 
+    #[tokio::test]
+    async fn normalized_tool_image_keeps_delivery_target_in_upstream_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("render with spaces.png");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
+        let input = vec![ChatMessage::tool(serde_json::json!({
+            "tool_call_id": "render", "content": format!("review: OK\n[IMAGE:{}]", path.display()),
+        }).to_string())];
+        let provider = make_model_provider("test", "https://example.com", None);
+        let normalized = provider
+            .normalize_messages_for_upstream(&input)
+            .await
+            .unwrap();
+        let converted = provider.convert_messages_for_native(&normalized, true);
+        assert_eq!(converted[0].tool_call_id.as_deref(), Some("render"));
+        let content = serde_json::to_value(converted[0].content.as_ref().unwrap()).unwrap();
+        let parts = content.as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert!(
+            parts[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("Image reference: {}", path.display()))
+        );
+        assert!(
+            parts[1]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
+        assert!(!parts[1].to_string().contains(&path.display().to_string()));
+    }
+
     #[test]
     fn convert_messages_for_native_sanitizes_malformed_tool_result_json() {
         let input = vec![ChatMessage::tool(

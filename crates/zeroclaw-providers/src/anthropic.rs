@@ -7481,9 +7481,12 @@ data: {\"type\":\"message_stop\"}\n\n";
             "a prepared local image must not be reported as omitted: {wire}"
         );
         assert!(
-            !wire.to_string().contains("screenshot.png"),
-            "the raw local path must not leak onto the wire: {wire}"
+            texts
+                .iter()
+                .any(|text| text.contains(&format!("Image reference: {}", image_path.display()))),
+            "the tool delivery target must remain visible in text metadata: {wire}"
         );
+        assert!(!image.to_string().contains("screenshot.png"));
     }
 
     /// Regression guard: ordinary user-message images take the user arm and
