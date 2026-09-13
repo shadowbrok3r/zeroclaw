@@ -1238,6 +1238,11 @@ async fn process_chat_message(
     let mut last_input_tokens: Option<u64> = None;
     let forward_fut = async {
         let mut cancel_drained = false;
+        // The client's socket has ended. The turn keeps running: its result is persisted either
+        // way, and a phone that changed network or was backgrounded for a moment reconnects and
+        // reads it back. Cancelling instead threw the work away and stamped "[interrupted by
+        // user]" on a turn the user never touched.
+        let mut client_gone = false;
         loop {
             tokio::select! {
                 biased;
@@ -1275,10 +1280,9 @@ async fn process_chat_message(
                         let _ = sender.send(Message::Text(frame.to_string().into())).await;
                     }
                 }
-                _ = tick_websocket_ping(ping_interval) => {
+                _ = tick_websocket_ping(ping_interval), if !client_gone => {
                     if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
-                        cancel_token.cancel();
-                        break;
+                        client_gone = true;
                     }
                 }
                     event_opt = event_rx.recv() => {
@@ -1338,12 +1342,12 @@ async fn process_chat_message(
                     };
                     let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
                 }
-                client_msg = receiver.next() => {
+                client_msg = receiver.next(), if !client_gone => {
                     // On client disconnect, `receiver.next()` returns `None`
-                    // (stream end) or `Err(_)` repeatedly. A bare `continue`
-                    // hot-loops the select; cancel the turn so `turn_fut`
-                    // resolves with `ToolLoopCancelled` and `tokio::join!`
-                    // below can return. See #6514.
+                    // (stream end) or `Err(_)` repeatedly, so a bare `continue`
+                    // hot-loops the select. The `if !client_gone` guard is what
+                    // stops that — the branch is not polled again — rather than
+                    // cancelling the turn, which is what #6514 originally did.
                     let text = match client_msg {
                         Some(Ok(Message::Text(text))) => text,
                         // Keepalive: answer a client ping mid-turn so the
@@ -1356,8 +1360,10 @@ async fn process_chat_message(
                             continue;
                         }
                         Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
-                            cancel_token.cancel();
-                            break;
+                            // Let the turn finish and be stored; the next
+                            // connection backfills it over HTTP.
+                            client_gone = true;
+                            continue;
                         }
                         // Remaining control frames (pong/binary) resolve without
                         // any await; yield so a chatty client cannot spin this
