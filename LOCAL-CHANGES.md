@@ -109,6 +109,27 @@ Architecture documentation for the overhaul:
 | `crates/zeroclaw-channels/src/webhook.rs` | Two deltas. The listener binds a configurable address (`channels.webhook.bind_address`) instead of a hard-coded one, and a webhook post is treated as a direct message so it reaches the agent without a mention. `WebhookChannel::new` therefore takes one more parameter than upstream's; the two call sites live in `orchestrator/mod.rs`. |
 | `docs/book/src/channels/webhook.md` | Documents the bind address. |
 
+### Render delivery from Comfy job receipts (gateway)
+
+The phone client rendered whatever `[IMAGE:…]` path the model wrote, and the
+model wrote it wrong most of the time (fabricated `renders/output/cg_<uuid>.png`
+names, gallery epochs rebuilt from memory). The gateway now rewrites the reply at
+turn end from the durable job receipts (`comfy-gen where --deliverable`), before
+it is persisted and before the `done` frame carries it. Needs `ZEROCLAW_COMFY_GEN`
+in the service environment and a comfy-gen with `where --since --deliverable`.
+
+| File | Why |
+|---|---|
+| `crates/zeroclaw-gateway/src/render_delivery.rs` (NEW) | `rewrite()`: drop every model-written image marker when the receipts show a render this turn (otherwise only unservable ones), prepend the verified files one per line; `reconcile()` applies it to `outcome.response` and the assistant `Chat` rows in `new_messages` (only the last row gains markers, so a backfill shows each render once). |
+| `crates/zeroclaw-gateway/src/session_jobs.rs` | `run` split into `run`/`run_args`; `deliverables()` invokes `where --session S --since T --latest 64 --deliverable` and `deliverables_from()` validates the reply (absolute, no `..`, valid job id, index < 64). |
+| `crates/zeroclaw-gateway/src/ws.rs` | Captures `turn_started_unix` next to `turn_id`; calls `render_delivery::reconcile` in the `Ok(outcome)` arm before `persist_conversation_messages`. |
+| `crates/zeroclaw-gateway/src/lib.rs` | `mod render_delivery;` |
+
+Companion change in `zeroclaw-homelab/comfy-gen`: `jobs::delivered()` completes and
+caches the receipt from the render process itself (so the lookup never races the
+observer), and `where` grew `--since` / `--deliverable`. Incremental patches for both
+sides live in `zc-codex/deploy/{gateway,comfy-gen}-render-delivery.patch`.
+
 ### Provider truncation surfacing
 
 Unrelated to the session overhaul; carried here because it is a one-file

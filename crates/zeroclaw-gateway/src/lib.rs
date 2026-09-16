@@ -37,6 +37,7 @@ pub mod hardware_context;
 pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
+mod render_delivery;
 pub mod security_headers;
 pub(crate) mod session_events;
 mod session_jobs;

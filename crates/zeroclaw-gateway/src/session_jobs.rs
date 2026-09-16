@@ -55,6 +55,89 @@ fn valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// Whether the observer is wired in at all (`ZEROCLAW_COMFY_GEN` in the service environment).
+pub(crate) fn enabled() -> bool {
+    std::env::var_os("ZEROCLAW_COMFY_GEN").is_some()
+}
+
+/// One render output the receipts can vouch for: an existing absolute file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Deliverable {
+    pub job: String,
+    pub index: u64,
+    pub label: String,
+    pub kind: String,
+    pub path: String,
+    pub source: String,
+}
+
+/// Renders this session began at or after `since`, newest first, from
+/// `comfy-gen where --deliverable`. Used by `render_delivery` at turn end.
+pub(crate) async fn deliverables(session: &str, since: u64) -> Result<Vec<Deliverable>, String> {
+    let Some(exe) = std::env::var_os("ZEROCLAW_COMFY_GEN") else {
+        return Err("Comfy job tracking is not enabled on this gateway".into());
+    };
+    let exe = std::path::PathBuf::from(exe);
+    if !exe.is_absolute() {
+        return Err("Comfy job tracking executable must be an absolute path".into());
+    }
+    let args = [
+        "where",
+        "--session",
+        session,
+        "--since",
+        &since.to_string(),
+        "--latest",
+        "64",
+        "--deliverable",
+    ]
+    .map(str::to_owned);
+    let value = run_args(&exe, &args).await?;
+    deliverables_from(&value, session)
+}
+
+/// Validate a `where --deliverable` reply: the receipts are trusted for identity,
+/// but every path still has to be absolute and clean before it becomes a marker.
+pub(crate) fn deliverables_from(value: &Value, session: &str) -> Result<Vec<Deliverable>, String> {
+    if value["version"] != 1 || value["session_id"].as_str() != Some(session) {
+        return Err(
+            "Comfy job observer returned a different session or unsupported response".into(),
+        );
+    }
+    let results = value["results"]
+        .as_array()
+        .ok_or("Comfy job observer returned no results array")?;
+    let mut out = Vec::new();
+    for r in results {
+        let Some(path) = r["deliver_path"].as_str() else {
+            continue;
+        };
+        let p = FsPath::new(path);
+        if !p.is_absolute()
+            || p.components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            continue;
+        }
+        let job = r["job"].as_str().unwrap_or_default();
+        let index = r["index"].as_u64().unwrap_or(u64::MAX);
+        if !valid_id(job) || index >= 64 {
+            continue;
+        }
+        out.push(Deliverable {
+            job: job.to_owned(),
+            index,
+            label: r["label"].as_str().unwrap_or_default().to_owned(),
+            kind: r["kind"].as_str().unwrap_or("image").to_owned(),
+            path: path.to_owned(),
+            source: r["deliver_source"].as_str().unwrap_or_default().to_owned(),
+        });
+    }
+    // `where` sorts newest first; a reply reads better oldest first.
+    out.reverse();
+    Ok(out)
+}
+
 /// Fixed subcommands and argument arrays; never a shell or a caller-selected executable.
 async fn invoke(
     command: &str,
@@ -86,20 +169,29 @@ async fn run(
     job: Option<&str>,
     index: Option<usize>,
 ) -> Result<Value, String> {
+    let mut args = vec![
+        command.to_owned(),
+        "--session".to_owned(),
+        session.to_owned(),
+    ];
+    if let Some(id) = job {
+        args.push("--job".to_owned());
+        args.push(id.to_owned());
+    }
+    if let Some(i) = index {
+        args.push("--index".to_owned());
+        args.push(i.to_string());
+    }
+    run_args(exe, &args).await
+}
+
+async fn run_args(exe: &FsPath, args: &[String]) -> Result<Value, String> {
     let mut cmd = tokio::process::Command::new(exe);
-    cmd.arg(command)
-        .arg("--session")
-        .arg(session)
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    if let Some(id) = job {
-        cmd.arg("--job").arg(id);
-    }
-    if let Some(i) = index {
-        cmd.arg("--index").arg(i.to_string());
-    }
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Comfy job observer could not start: {e}"))?;
@@ -414,6 +506,72 @@ mod tests {
 
     /// Local-only Android fixture: real job REST handlers + a chat socket that cannot run tools.
     /// Start comfy_jobs_smoke.py --serve first and pass its environment here. Never uses a GPU.
+    #[test]
+    fn deliverables_keep_only_clean_absolute_files_and_read_oldest_first() {
+        let value = json!({"version":1,"session_id":"gw_s","matched":4,"results":[
+            {"job":"cg-2","index":0,"label":"cg_two","kind":"image","deliver_source":"cache","deliver_path":"/records/x/outputs/cg-2-0.png"},
+            {"job":"cg-1","index":0,"label":"cg_one","kind":"image","deliver_source":"gallery","deliver_path":"/gallery/a/cg_one_1_00001_.png"},
+            {"job":"cg-0","index":0,"label":"cg_none","kind":"image","deliver_source":null,"deliver_path":null},
+            {"job":"../x","index":0,"label":"bad","kind":"image","deliver_source":"cache","deliver_path":"/records/../etc/passwd"},
+            {"job":"cg-3","index":99,"label":"bad","kind":"image","deliver_source":"cache","deliver_path":"/records/x/outputs/cg-3-99.png"},
+            {"job":"cg-4","index":0,"label":"rel","kind":"image","deliver_source":"workspace","deliver_path":"renders/cg_rel.png"}
+        ]});
+        let got = deliverables_from(&value, "gw_s").unwrap();
+        assert_eq!(
+            got.iter().map(|d| d.path.as_str()).collect::<Vec<_>>(),
+            vec![
+                "/gallery/a/cg_one_1_00001_.png",
+                "/records/x/outputs/cg-2-0.png"
+            ]
+        );
+        assert_eq!(got[0].source, "gallery");
+        assert_eq!(got[1].label, "cg_two");
+        assert!(deliverables_from(&value, "gw_other").is_err());
+        assert!(
+            deliverables_from(
+                &json!({"version":2,"session_id":"gw_s","results":[]}),
+                "gw_s"
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn deliverables_invoke_where_with_a_window_and_delivery_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let exe = executable(
+            temp.path(),
+            "import json,sys; print(json.dumps({'version':1,'session_id':sys.argv[3],'argv':sys.argv[1:],'results':[]}))",
+        );
+        let args = [
+            "where",
+            "--session",
+            "gw_s",
+            "--since",
+            "1789535400",
+            "--latest",
+            "64",
+            "--deliverable",
+        ]
+        .map(str::to_owned);
+        let value = run_args(&exe, &args).await.unwrap();
+        assert_eq!(
+            value["argv"],
+            json!([
+                "where",
+                "--session",
+                "gw_s",
+                "--since",
+                "1789535400",
+                "--latest",
+                "64",
+                "--deliverable"
+            ])
+        );
+        assert_eq!(deliverables_from(&value, "gw_s").unwrap(), vec![]);
+    }
+
     #[tokio::test]
     #[ignore = "manual Android fixture; requires the local comfy_jobs_smoke.py --serve environment"]
     async fn serve_android_jobs_fixture() {

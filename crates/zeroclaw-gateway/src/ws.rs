@@ -1183,6 +1183,12 @@ async fn process_chat_message(
 
     // Set session state to running
     let turn_id = uuid::Uuid::new_v4().to_string();
+    // Windows the post-turn render lookup (`render_delivery`) to receipts begun
+    // during this turn; unix seconds because that is what the receipts carry.
+    let turn_started_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     if let Some(ref backend) = state.session_backend {
         let _ = backend.set_session_state(session_key, "running", Some(&turn_id));
     }
@@ -1585,7 +1591,16 @@ async fn process_chat_message(
     }
 
     match result {
-        Ok(outcome) => {
+        Ok(mut outcome) => {
+            // The receipts, not the model, decide which render files this reply
+            // attaches — before it is persisted and before `done` carries it.
+            crate::render_delivery::reconcile(
+                session_key,
+                turn_started_unix,
+                &mut outcome.response,
+                &mut outcome.new_messages,
+            )
+            .await;
             if let Some(ref backend) = state.session_backend {
                 persist_conversation_messages(backend.as_ref(), session_key, &outcome.new_messages);
             }
