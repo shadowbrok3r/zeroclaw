@@ -1109,6 +1109,22 @@ fn is_session_lifecycle_event(event: &serde_json::Value) -> bool {
     event.get("source").and_then(serde_json::Value::as_str) == Some("sessions")
 }
 
+/// A failed or stalled phone transport detaches delivery, not the running turn.
+async fn send_turn_frame<S>(sender: &mut S, client_gone: &mut bool, message: Message)
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    if *client_gone {
+        return;
+    }
+    if !matches!(
+        tokio::time::timeout(Duration::from_secs(5), sender.send(message)).await,
+        Ok(Ok(()))
+    ) {
+        *client_gone = true;
+    }
+}
+
 /// Process a single chat message through the agent and send the response.
 /// Uses [`Agent::turn_streamed`] so that intermediate text chunks, tool calls,
 /// and tool results are forwarded to the WebSocket client in real time.
@@ -1236,8 +1252,13 @@ async fn process_chat_message(
     // (replaces on each TurnEvent::Usage; not accumulated).
     // Used for accurate context-bar rendering on the client.
     let mut last_input_tokens: Option<u64> = None;
+    let mut client_gone = false;
     let forward_fut = async {
         let mut cancel_drained = false;
+        // The client's socket has ended. The turn keeps running: its result is persisted either
+        // way, and a phone that changed network or was backgrounded for a moment reconnects and
+        // reads it back. Cancelling instead threw the work away and stamped "[interrupted by
+        // user]" on a turn the user never touched.
         loop {
             tokio::select! {
                 biased;
@@ -1272,14 +1293,11 @@ async fn process_chat_message(
                             "arguments_summary": arguments_summary,
                             "timeout_secs": timeout_secs,
                         });
-                        let _ = sender.send(Message::Text(frame.to_string().into())).await;
+                        send_turn_frame(sender, &mut client_gone, Message::Text(frame.to_string().into())).await;
                     }
                 }
-                _ = tick_websocket_ping(ping_interval) => {
-                    if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
-                        cancel_token.cancel();
-                        break;
-                    }
+                _ = tick_websocket_ping(ping_interval), if !client_gone => {
+                    send_turn_frame(sender, &mut client_gone, Message::Ping(Vec::new().into())).await;
                 }
                     event_opt = event_rx.recv() => {
                     let Some(event) = event_opt else { break };
@@ -1336,28 +1354,27 @@ async fn process_chat_message(
                             "entries": entries,
                         }),
                     };
-                    let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
+                    send_turn_frame(sender, &mut client_gone, Message::Text(ws_msg.to_string().into())).await;
                 }
-                client_msg = receiver.next() => {
+                client_msg = receiver.next(), if !client_gone => {
                     // On client disconnect, `receiver.next()` returns `None`
-                    // (stream end) or `Err(_)` repeatedly. A bare `continue`
-                    // hot-loops the select; cancel the turn so `turn_fut`
-                    // resolves with `ToolLoopCancelled` and `tokio::join!`
-                    // below can return. See #6514.
+                    // (stream end) or `Err(_)` repeatedly, so a bare `continue`
+                    // hot-loops the select. The `if !client_gone` guard is what
+                    // stops that — the branch is not polled again — rather than
+                    // cancelling the turn, which is what #6514 originally did.
                     let text = match client_msg {
                         Some(Ok(Message::Text(text))) => text,
                         // Keepalive: answer a client ping mid-turn so the
                         // socket is not torn down while a long turn runs.
                         Some(Ok(Message::Ping(payload))) => {
-                            if sender.send(Message::Pong(payload)).await.is_err() {
-                                cancel_token.cancel();
-                                break;
-                            }
+                            send_turn_frame(sender, &mut client_gone, Message::Pong(payload)).await;
                             continue;
                         }
                         Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
-                            cancel_token.cancel();
-                            break;
+                            // Let the turn finish and be stored; the next
+                            // connection backfills it over HTTP.
+                            client_gone = true;
+                            continue;
                         }
                         // Remaining control frames (pong/binary) resolve without
                         // any await; yield so a chatty client cannot spin this
@@ -1522,7 +1539,12 @@ async fn process_chat_message(
 
         // Inform the client the turn was aborted
         let aborted = serde_json::json!({ "type": "aborted" });
-        let _ = sender.send(Message::Text(aborted.to_string().into())).await;
+        send_turn_frame(
+            sender,
+            &mut client_gone,
+            Message::Text(aborted.to_string().into()),
+        )
+        .await;
 
         if let Some(ref backend) = state.session_backend
             && backend.session_exists(session_key)
@@ -1634,7 +1656,12 @@ async fn process_chat_message(
                 "max_context_tokens": max_context_tokens,
                 "last_input_tokens": last_input_tokens,
             });
-            let _ = sender.send(Message::Text(done.to_string().into())).await;
+            send_turn_frame(
+                sender,
+                &mut client_gone,
+                Message::Text(done.to_string().into()),
+            )
+            .await;
 
             // Set session state to idle
             if let Some(ref backend) = state.session_backend {
@@ -2641,60 +2668,68 @@ data: {\"type\":\"message_stop\"}\n\n",
         );
     }
 
-    // The mid-turn `client_msg` arm in `forward_fut`
-    // must (a) classify stream-end / close / error frames as "client gone"
-    // and (b) cancel the turn token so `tokio::join!(turn_fut, forward_fut)`
-    // can return — a bare `continue` hot-loops the select forever.
-    #[derive(Debug, PartialEq, Eq)]
-    enum DisconnectAction {
-        Break,
-        Continue,
-        ProcessText,
+    #[tokio::test]
+    async fn stalled_delivery_detaches_within_the_write_deadline() {
+        let mut sender = Box::pin(futures_util::sink::unfold((), |(), _: Message| {
+            std::future::pending::<Result<(), ()>>()
+        }));
+        let mut client_gone = false;
+        tokio::time::timeout(
+            Duration::from_secs(6),
+            send_turn_frame(
+                &mut sender,
+                &mut client_gone,
+                Message::Ping(Default::default()),
+            ),
+        )
+        .await
+        .expect("bounded socket write");
+        assert!(client_gone);
+        // Once detached, no further write is attempted against the stalled socket.
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            send_turn_frame(
+                &mut sender,
+                &mut client_gone,
+                Message::Ping(Default::default()),
+            ),
+        )
+        .await
+        .expect("detached delivery must not block event draining");
     }
 
-    fn classify_client_msg(
-        msg: Option<Result<axum::extract::ws::Message, &'static str>>,
-    ) -> DisconnectAction {
-        use axum::extract::ws::Message;
-        match msg {
-            Some(Ok(Message::Text(_))) => DisconnectAction::ProcessText,
-            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => DisconnectAction::Break,
-            _ => DisconnectAction::Continue,
-        }
-    }
-
-    #[test]
-    fn mid_turn_client_msg_breaks_on_stream_end_close_or_err() {
-        use axum::extract::ws::Message;
-        assert_eq!(classify_client_msg(None), DisconnectAction::Break);
-        assert_eq!(
-            classify_client_msg(Some(Ok(Message::Close(None)))),
-            DisconnectAction::Break,
-        );
-        assert_eq!(
-            classify_client_msg(Some(Err("io"))),
-            DisconnectAction::Break,
-        );
-        assert_eq!(
-            classify_client_msg(Some(Ok(Message::Ping(Default::default())))),
-            DisconnectAction::Continue,
-        );
-        assert_eq!(
-            classify_client_msg(Some(Ok(Message::Text("{}".into())))),
-            DisconnectAction::ProcessText,
-        );
-    }
-
-    #[test]
-    fn mid_turn_disconnect_cancel_unblocks_joined_turn() {
-        let token = tokio_util::sync::CancellationToken::new();
-        let clone_for_turn = token.clone();
-        assert!(!clone_for_turn.is_cancelled());
-        token.cancel();
-        assert!(
-            clone_for_turn.is_cancelled(),
-            "cloned token (held by turn_fut via agent.turn_streamed) must observe cancellation"
-        );
+    #[tokio::test]
+    async fn failed_delivery_detaches_and_the_turn_still_finishes() {
+        use futures_util::sink;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut sender = Box::pin(sink::unfold((), |(), _: Message| async {
+            Err::<(), _>("disconnected")
+        }));
+        let (events, mut receiver) = tokio::sync::mpsc::channel::<Message>(1);
+        let turn = async {
+            for _ in 0..100 {
+                events
+                    .send(Message::Ping(Default::default()))
+                    .await
+                    .unwrap();
+            }
+            drop(events);
+            assert!(!cancel.is_cancelled());
+            "completed"
+        };
+        let delivery = async {
+            let mut client_gone = false;
+            while let Some(event) = receiver.recv().await {
+                send_turn_frame(&mut sender, &mut client_gone, event).await;
+            }
+            assert!(client_gone);
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(turn, delivery)
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, "completed");
     }
 
     #[test]

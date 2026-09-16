@@ -1659,7 +1659,11 @@ fn session_not_found_response() -> axum::response::Response {
 /// `PairingGuard::token_hash` path the list handler uses) does not match.
 /// Rows with no origin principal stay visible to every caller, mirroring the
 /// `/api/sessions` list filter.
-fn session_hidden_from_device(state: &AppState, headers: &HeaderMap, session_key: &str) -> bool {
+pub(crate) fn session_hidden_from_device(
+    state: &AppState,
+    headers: &HeaderMap,
+    session_key: &str,
+) -> bool {
     if !state.config.read().gateway.scope_sessions_to_device {
         return false;
     }
@@ -4168,6 +4172,10 @@ pub(crate) mod tests {
     fn sessions_app(state: AppState) -> axum::Router {
         axum::Router::new()
             .route(
+                "/api/sessions/{id}/media",
+                axum::routing::get(crate::session_media::read),
+            )
+            .route(
                 "/api/sessions",
                 axum::routing::get(handle_api_sessions_list),
             )
@@ -5024,6 +5032,163 @@ pub(crate) mod tests {
             )
             .unwrap();
         (tmp, state, backend)
+    }
+
+    #[tokio::test]
+    async fn session_media_requires_pairing_ownership_and_an_output_reference() {
+        use tower::ServiceExt as _;
+        let (tmp, state, backend) = two_device_state(true);
+        let path = tmp.path().canonicalize().unwrap().join("output.png");
+        let image = b"\x89PNG\r\n\x1a\nfixture";
+        std::fs::write(&path, image).unwrap();
+        let uri = format!("/api/sessions/owned/media?path={}", path.display());
+        let app = sessions_app(state.clone());
+        assert_eq!(
+            app.clone()
+                .oneshot(empty_request("GET", &uri))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        // A user-supplied marker is not a file grant.
+        backend
+            .append(
+                "gw_owned",
+                &zeroclaw_providers::ChatMessage::user(format!("[IMAGE:{}]", path.display())),
+            )
+            .unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(authed_empty_request("GET", &uri, "device-a-token"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        backend
+            .append(
+                "gw_owned",
+                &zeroclaw_providers::ChatMessage::assistant(format!("[IMAGE:{}]", path.display())),
+            )
+            .unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(authed_empty_request("GET", &uri, "device-b-token"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let response = app
+            .clone()
+            .oneshot(authed_empty_request("GET", &uri, "device-a-token"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            image
+        );
+        // Another image in the same directory is not implicitly exposed.
+        let unlisted = tmp.path().join("unlisted.png");
+        std::fs::write(&unlisted, image).unwrap();
+        let uri = format!("/api/sessions/owned/media?path={}", unlisted.display());
+        assert_eq!(
+            app.oneshot(authed_empty_request("GET", &uri, "device-a-token"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn session_media_stays_closed_when_dashboard_pairing_is_disabled() {
+        use tower::ServiceExt as _;
+        let (_tmp, mut state, _) = two_device_state(false);
+        state.pairing = Arc::new(PairingGuard::new(false, &["device-a-token".into()]));
+        let response = sessions_app(state)
+            .oneshot(authed_empty_request(
+                "GET",
+                "/api/sessions/owned/media?path=/tmp/image.png",
+                "unpaired-token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn session_media_rejects_disguised_files_and_oversized_payloads() {
+        use tower::ServiceExt as _;
+        let (tmp, state, backend) = two_device_state(true);
+        for (filename, expected) in [
+            ("text.png", StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            ("large.png", StatusCode::PAYLOAD_TOO_LARGE),
+        ] {
+            let path = tmp.path().canonicalize().unwrap().join(filename);
+            if filename == "large.png" {
+                std::fs::File::create(&path)
+                    .unwrap()
+                    .set_len(24 * 1024 * 1024 + 1)
+                    .unwrap();
+            } else {
+                std::fs::write(&path, "not an image").unwrap();
+            }
+            backend
+                .append(
+                    "gw_owned",
+                    &zeroclaw_providers::ChatMessage::assistant(format!(
+                        "[IMAGE:{}]",
+                        path.display()
+                    )),
+                )
+                .unwrap();
+            let uri = format!("/api/sessions/gw_owned/media?path={}", path.display());
+            assert_eq!(
+                sessions_app(state.clone())
+                    .oneshot(authed_empty_request("GET", &uri, "device-a-token"))
+                    .await
+                    .unwrap()
+                    .status(),
+                expected
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_media_does_not_follow_a_symlink_from_a_saved_reference() {
+        use tower::ServiceExt as _;
+        let (tmp, state, backend) = two_device_state(true);
+        let image = tmp.path().join("actual.png");
+        std::fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
+        let link = tmp.path().join("link.png");
+        std::os::unix::fs::symlink(&image, &link).unwrap();
+        backend
+            .append(
+                "gw_owned",
+                &zeroclaw_providers::ChatMessage::assistant(format!("[IMAGE:{}]", link.display())),
+            )
+            .unwrap();
+        let uri = format!("/api/sessions/owned/media?path={}", link.display());
+        assert_eq!(
+            sessions_app(state)
+                .oneshot(authed_empty_request("GET", &uri, "device-a-token"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]

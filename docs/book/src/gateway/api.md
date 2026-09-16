@@ -180,3 +180,17 @@ identifiers present on the event payload rather than assuming each
 `GET /api/events/history` replays the retained recent events from the same
 buffer, oldest first. It is a reconnect window for subscribers, not a separate
 canonical lifecycle store.
+
+## Session images
+
+`GET /api/sessions/{id}/media?path=<URL-encoded-absolute-path>` serves PNG, JPEG,
+WebP or GIF bytes referenced by an `[IMAGE:...]` marker in that session's persisted
+assistant or tool output. It requires a paired bearer token even when dashboard
+pairing requirements are disabled, and follows the same device visibility rule as
+session history. User-authored markers grant no file access. Symlinks, non-regular
+files, traversal paths, unsupported payloads and images above 24 MiB are refused.
+Responses use `Cache-Control: private, no-store` and `X-Content-Type-Options: nosniff`.
+
+The phone can use this endpoint through the gateway's public HTTPS origin. Files
+must exist on the gateway machine; the endpoint does not proxy arbitrary URLs or
+fetch files from other hosts.

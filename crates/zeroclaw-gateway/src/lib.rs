@@ -39,6 +39,8 @@ pub mod nodes;
 pub mod openapi;
 pub mod security_headers;
 pub(crate) mod session_events;
+mod session_jobs;
+mod session_media;
 pub mod session_queue;
 pub mod sse;
 pub mod static_files;
@@ -1950,6 +1952,10 @@ pub async fn run_gateway(
         )
         .route("/api/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename))
         .route("/api/sessions/{id}/state", get(api::handle_api_session_state))
+        .route("/api/sessions/{id}/media", get(session_media::read))
+        .route("/api/sessions/{id}/jobs", get(session_jobs::list))
+        .route("/api/sessions/{id}/jobs/{job}/cancel", post(session_jobs::cancel))
+        .route("/api/sessions/{id}/jobs/{job}/outputs/{index}", get(session_jobs::output))
         .route("/api/sessions/{id}/abort", post(api::handle_api_session_abort))
         // ── Pairing + Device management API ──
         .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))

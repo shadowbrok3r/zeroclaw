@@ -201,6 +201,177 @@ pub fn build_spec() -> serde_json::Value {
     });
 
     let paths = serde_json::json!({
+        "/api/sessions/{id}/jobs": {
+            "get": {
+                "tags": [
+                    "sessions"
+                ],
+                "summary": "List durable ComfyUI jobs",
+                "description": "Returns version 1 job snapshots scoped to this session. Requires a paired token and ZEROCLAW_COMFY_GEN. Progress and saved results are independent of the chat connection.",
+                "parameters": [
+                    {
+                        "name": "id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Session job result; private, no-store"
+                    },
+                    "400": {
+                        "description": "Invalid job or output identifier"
+                    },
+                    "401": {
+                        "description": "Paired bearer token required"
+                    },
+                    "404": {
+                        "description": "Session is unavailable"
+                    },
+                    "501": {
+                        "description": "Job tracking is not enabled"
+                    },
+                    "502": {
+                        "description": "Observer error or cancellation unconfirmed"
+                    },
+                    "503": {
+                        "description": "Observer configuration invalid"
+                    }
+                }
+            }
+        },
+        "/api/sessions/{id}/jobs/{job}/cancel": {
+            "post": {
+                "tags": [
+                    "sessions"
+                ],
+                "summary": "Cancel one ComfyUI render",
+                "description": "Targets only the saved prompt ID. Unsupported targeted cancellation is reported as an error; there is no global interrupt fallback. An accepted request remains pending until observed.",
+                "parameters": [
+                    {
+                        "name": "id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    {
+                        "name": "job",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Session job result; private, no-store"
+                    },
+                    "400": {
+                        "description": "Invalid job or output identifier"
+                    },
+                    "401": {
+                        "description": "Paired bearer token required"
+                    },
+                    "404": {
+                        "description": "Session is unavailable"
+                    },
+                    "501": {
+                        "description": "Job tracking is not enabled"
+                    },
+                    "502": {
+                        "description": "Observer error or cancellation unconfirmed"
+                    },
+                    "503": {
+                        "description": "Observer configuration invalid"
+                    }
+                }
+            }
+        },
+        "/api/sessions/{id}/jobs/{job}/outputs/{index}": {
+            "get": {
+                "tags": [
+                    "sessions"
+                ],
+                "summary": "Read a saved job image",
+                "description": "Requires a paired token, session visibility and a saved output owned by this job. Returns bounded image bytes, never a filesystem path or redirect.",
+                "parameters": [
+                    {
+                        "name": "id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    {
+                        "name": "job",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    {
+                        "name": "index",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 63
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Session job result; private, no-store"
+                    },
+                    "400": {
+                        "description": "Invalid job or output identifier"
+                    },
+                    "401": {
+                        "description": "Paired bearer token required"
+                    },
+                    "404": {
+                        "description": "Session is unavailable"
+                    },
+                    "501": {
+                        "description": "Job tracking is not enabled"
+                    },
+                    "502": {
+                        "description": "Observer error or cancellation unconfirmed"
+                    },
+                    "503": {
+                        "description": "Observer configuration invalid"
+                    }
+                }
+            }
+        },
+        "/api/sessions/{id}/media": {
+            "get": {
+                "tags": ["sessions"],
+                "summary": "Read a session image",
+                "description": "Requires an actual paired bearer token and session visibility. Only absolute image paths explicitly referenced by persisted assistant/tool output are served. User input, symlinks, non-image payloads and files over 24 MiB are refused. No redirects or arbitrary file browsing.",
+                "parameters": [
+                    {"name":"id", "in":"path", "required":true, "schema":{"type":"string"}},
+                    {"name":"path", "in":"query", "required":true, "schema":{"type":"string"}}
+                ],
+                "responses": {
+                    "200":{"description":"Image bytes with private, no-store caching", "content":{"image/png":{}, "image/jpeg":{}, "image/webp":{}, "image/gif":{}}},
+                    "400":{"description":"Invalid path"},
+                    "401":{"description":"Pairing token required"},
+                    "404":{"description":"Session, image reference or regular file unavailable"},
+                    "413":{"description":"Image exceeds 24 MiB"},
+                    "415":{"description":"Unsupported image format"}
+                }
+            }
+        },
         "/api/config/prop": {
             "get": {
                 "tags": ["config"],
