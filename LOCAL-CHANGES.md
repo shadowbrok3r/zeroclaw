@@ -257,3 +257,22 @@ Re-check these after every upstream merge; they are easy to silently lose:
   markers; a promoted warning would replace the reply with a delivery failure.
   A merge that restores upstream's `Choice` struct drops the non-streaming half
   with no compile error.
+
+- **`cargo test` no longer wipes this node's Tailscale serve config.**
+  `TailscaleTunnel::stop()` (`crates/zeroclaw-runtime/src/tunnel/tailscale.rs`)
+  shells out to `tailscale <serve|funnel> reset`, which clears the *entire*
+  serve config for the node rather than just the tunnel's own port, and
+  `tunnel::tailscale::tests::stop_without_started_process_is_ok` calls `stop()`
+  unconditionally against the real binary. On 2026-09-05 15:12:41, a
+  `cargo test --locked --workspace` during the v0.8.5 merge therefore deleted
+  the `https://ubuntu-ai-amd.taile483f.ts.net → 127.0.0.1:11437` mapping that
+  `claude-remote` depends on; it went unnoticed until 2026-09-11 and was
+  reproduced on that date by running the single test. The fix is local and
+  outside the source tree: `.cargo/config.toml` sets
+  `[target.x86_64-unknown-linux-gnu] runner` to
+  `~/.local/libexec/cargo-tailscale-guard/runner`, which prepends a passthrough
+  `tailscale` stub to `PATH` for every test/bench/run binary — all subcommands
+  reach `/usr/bin/tailscale` except `serve reset` and `funnel reset`, which
+  no-op with a message on stderr. A merge that overwrites `.cargo/config.toml`
+  drops the guard with no compile error and no test failure; the symptom is
+  `tailscale serve status` reporting `No serve config` after a test run.
