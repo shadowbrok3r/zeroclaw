@@ -35,7 +35,7 @@ pub struct ConsolidationResult {
 
 const CONSOLIDATION_SYSTEM_PROMPT: &str = r#"You are a memory consolidation engine. Given a conversation turn, extract:
 1. "history_entry": A brief summary of what happened in this turn (1-2 sentences). Include the key topic or action.
-2. "memory_update": Any NEW facts, preferences, decisions, or commitments worth remembering long-term. Return null if nothing new was learned.
+2. "memory_update": Only NEW durable facts, explicit ongoing preferences, or lasting decisions supported by this turn. Return null if nothing durable was learned. One-off edits, current render settings, temporary task state, assistant guesses and automated quality opinions belong only in history_entry. A completed action or silence is not user approval. Preserve the source and the model/project/person scope; do not generalize one example into an enduring preference.
 
 Respond ONLY with valid JSON: {"history_entry": "...", "memory_update": "..." or null}
 Do not include any text outside the JSON object."#;
@@ -44,7 +44,7 @@ Do not include any text outside the JSON object."#;
 /// asks for a semantic `kind`, atomic `facts`, and a cross-turn `trend`.
 const CONSOLIDATION_TYPED_SYSTEM_PROMPT: &str = r#"You are a memory consolidation engine. Given a conversation turn, extract:
 1. "history_entry": A brief summary of what happened in this turn (1-2 sentences). Include the key topic or action.
-2. "memory_update": Any NEW facts, preferences, decisions, or commitments worth remembering long-term. Return null if nothing new was learned.
+2. "memory_update": Only NEW durable facts, explicit ongoing preferences, or lasting decisions supported by this turn. Return null if nothing durable was learned. One-off edits, current render settings, temporary task state, assistant guesses and automated quality opinions belong only in history_entry. A completed action or silence is not user approval. Preserve the source and the model/project/person scope; do not generalize one example into an enduring preference.
 3. "kind": The memory_update subtype: "preference", "fact", "decision", or "entity". Use "fact" if unsure. Return null when memory_update is null.
 4. "facts": Atomic durable facts from this turn. Return an empty array when there are none. Do not include procedures or how-to workflows.
 5. "trend": A stable cross-turn trend or pattern, or null when none is visible.

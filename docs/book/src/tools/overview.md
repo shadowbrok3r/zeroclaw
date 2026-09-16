@@ -114,3 +114,29 @@ See [Autonomy levels](../security/autonomy.md) for the full set of per-profile f
 - [ACP](../channels/acp.md)
 - [Browser automation](./browser.md)
 - [Security → Overview](../security/overview.md)
+
+## Memory corrections
+
+`memory_recall` reports record ID, agent, recorded date and retrieval relevance.
+The date is the backend's record timestamp (creation time for SQLite), not a
+verification date. Relevance is not confidence or proof that a fact is current.
+
+`memory_store` accepts optional `supersedes: ["old-record-id"]` (up to 20 distinct
+IDs obtained from recall). For a confirmed correction of the same fact and
+scope, use a new versioned key and include the source, observation date and
+reason in content. Old rows are soft-hidden, with their content retained and a
+replacement link. A same-key store remains an ordinary in-place update and does
+not preserve the prior content.
+
+The scoped backend validates the entire retirement batch before modifying old
+rows; a peer read grant never permits retiring a peer's records. If a backend
+cannot complete/verify retirement, the tool reports incomplete correction: the
+new record may already be stored. Do not treat that result as successful
+invalidation. The tool does not decide whether statements logically conflict.
+
+Operation auditing records retirement IDs without copying raw contents into
+the audit log. Automatic consolidation's similarity-based retirement is a
+separate setting (`memory.conflict_supersede_enabled`); it is not an entailment
+or contradiction check. Deployments needing evidence-based correction can turn
+it off and use explicit corrections. Workspace memory instructions should make
+this distinction clear.

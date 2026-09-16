@@ -96,6 +96,7 @@ pub enum AuditOp {
     Forget,
     Purge,
     StoreProcedural,
+    Supersede,
 }
 
 impl std::fmt::Display for AuditOp {
@@ -108,6 +109,7 @@ impl std::fmt::Display for AuditOp {
             Self::Forget => write!(f, "forget"),
             Self::Purge => write!(f, "purge"),
             Self::StoreProcedural => write!(f, "store_procedural"),
+            Self::Supersede => write!(f, "supersede"),
         }
     }
 }
@@ -390,7 +392,18 @@ impl<M: Memory> Memory for AuditedMemory<M> {
     }
 
     async fn supersede(&self, superseded_ids: &[String], new_id: &str) -> anyhow::Result<()> {
-        self.inner.supersede(superseded_ids, new_id).await
+        self.inner.supersede(superseded_ids, new_id).await?;
+        if !superseded_ids.is_empty() {
+            let metadata = serde_json::json!({"predecessor_ids": superseded_ids}).to_string();
+            self.log_audit(
+                AuditOp::Supersede,
+                Some(new_id),
+                None,
+                None,
+                Some(&metadata),
+            );
+        }
+        Ok(())
     }
 
     async fn count_in_scope(
@@ -786,6 +799,19 @@ mod tests {
             "supersede must reach the wrapped backend, not the trait default no-op"
         );
         assert_eq!(audited.reindex().await.unwrap(), 0);
+        let count: i64 = audited
+            .audit_conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM memory_audit WHERE operation = 'supersede' AND key = ?1",
+                [&new_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "corrections have an audit trail without logging raw content"
+        );
     }
 
     #[allow(clippy::await_holding_lock)]

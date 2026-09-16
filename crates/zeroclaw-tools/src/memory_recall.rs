@@ -114,12 +114,27 @@ impl Tool for MemoryRecallTool {
                 for entry in &entries {
                     let score = entry
                         .score
-                        .map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
-                    let _ = writeln!(
-                        output,
-                        "- [{}] {}: {}{score}",
-                        entry.category, entry.key, entry.content
+                        .map_or_else(|| "-".into(), |s| format!("{s:.2}"));
+                    let line = crate::i18n::get_required_tool_string_with_args(
+                        "tool-memory-recall-entry",
+                        &[
+                            ("category", &entry.category.to_string()),
+                            ("timestamp", &entry.timestamp),
+                            (
+                                "agent",
+                                entry
+                                    .agent_alias
+                                    .as_deref()
+                                    .or(entry.agent_id.as_deref())
+                                    .unwrap_or("-"),
+                            ),
+                            ("id", &entry.id),
+                            ("key", &entry.key),
+                            ("content", &entry.content),
+                            ("score", &score),
+                        ],
                     );
+                    let _ = writeln!(output, "{line}");
                 }
                 Ok(ToolResult {
                     success: true,
@@ -385,27 +400,34 @@ mod tests {
         assert!(tool.parameters_schema()["properties"]["query"].is_object());
     }
 
-    #[test]
-    fn score_formatted_as_percent() {
-        let score: Option<f64> = Some(0.63);
-        let formatted = score.map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
-        assert_eq!(formatted, " [63%]");
-
-        let score: Option<f64> = Some(0.42);
-        let formatted = score.map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
-        assert_eq!(formatted, " [42%]");
-
-        let score: Option<f64> = Some(1.0);
-        let formatted = score.map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
-        assert_eq!(formatted, " [100%]");
-
-        let score: Option<f64> = Some(0.0);
-        let formatted = score.map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
-        assert_eq!(formatted, " [0%]");
-
-        let score: Option<f64> = None;
-        let formatted = score.map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
-        assert_eq!(formatted, "");
+    #[tokio::test]
+    async fn recall_shows_recorded_time_identity_and_relevance() {
+        let (_tmp, mem) = seeded_mem();
+        mem.store(
+            "backend",
+            "The render backend is remote",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        let entry = mem.get("backend").await.unwrap().unwrap();
+        let tool = MemoryRecallTool::new(mem);
+        let result = tool.execute(json!({"query":"backend"})).await.unwrap();
+        assert!(result.success);
+        for value in [
+            &entry.timestamp,
+            &entry.id,
+            "recorded=",
+            "agent=",
+            "relevance=",
+        ] {
+            assert!(
+                result.output.contains(value),
+                "missing evidence field: {value}"
+            );
+        }
+        assert!(!result.output.contains("%"), "relevance is not confidence");
     }
 
     #[test]

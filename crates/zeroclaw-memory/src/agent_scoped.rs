@@ -358,6 +358,43 @@ impl Memory for AgentScopedMemory {
             .count())
     }
 
+    async fn supersede(&self, superseded_ids: &[String], new_id: &str) -> Result<()> {
+        if superseded_ids.is_empty() {
+            return Ok(());
+        }
+        // A peer read grant never grants writes. Validate the complete batch
+        // before forwarding, and record the actual winner UUID (consolidation
+        // historically passes a key here). Attribution is immutable on upsert.
+        // list() is an operator preview capped at 1000 rows in SQLite. Old
+        // corrections must not disappear merely because other agents wrote
+        // newer rows. Export is the backend's complete record read contract.
+        let entries = self.inner.export(&ExportFilter::default()).await?;
+        let winner = entries
+            .iter()
+            .find(|entry| {
+                entry.agent_id.as_deref() == Some(&self.agent_id)
+                    && (entry.id == new_id || entry.key == new_id)
+                    && entry.superseded_by.is_none()
+            })
+            .ok_or_else(|| {
+                anyhow::Error::msg(
+                    "supersede requires an active replacement owned by the bound agent",
+                )
+            })?;
+        for id in superseded_ids {
+            anyhow::ensure!(id != &winner.id, "a memory cannot supersede itself");
+            anyhow::ensure!(
+                entries.iter().any(|entry| {
+                    &entry.id == id
+                        && entry.agent_id.as_deref() == Some(&self.agent_id)
+                        && entry.superseded_by.is_none()
+                }),
+                "supersede refuses missing or foreign-agent entries"
+            );
+        }
+        self.inner.supersede(superseded_ids, &winner.id).await
+    }
+
     async fn purge_namespace(&self, namespace: &str) -> Result<usize> {
         // Bulk cross-agent destruction has no agent-scoped form on the
         // trait. Refuse rather than passing through; the operator path
@@ -423,12 +460,17 @@ impl Memory for AgentScopedMemory {
     }
 
     async fn export(&self, filter: &ExportFilter) -> Result<Vec<MemoryEntry>> {
-        let entries = self
-            .list(filter.category.as_ref(), filter.session_id.as_deref())
-            .await?;
+        let entries = self.inner.export(filter).await?;
         Ok(entries
             .into_iter()
             .filter(|e| {
+                if !e
+                    .agent_id
+                    .as_deref()
+                    .is_some_and(|id| self.allowed_agent_ids.contains(id))
+                {
+                    return false;
+                }
                 if let Some(ref ns) = filter.namespace
                     && e.namespace != *ns
                 {
@@ -556,6 +598,93 @@ mod tests {
             inner.embedder_dimensions(),
             1536,
             "AgentScopedMemory must forward refresh_embedder to the wrapped backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn supersede_is_reversible_and_never_widens_peer_read_access() {
+        let (_tmp, inner) = fresh_sqlite();
+        let ids = provision_agents(&inner, &["alpha", "beta"]).await;
+        let alpha = AgentScopedMemory::new(as_dyn(inner.clone()), &ids[0], [ids[1].clone()]);
+        let beta = AgentScopedMemory::new(as_dyn(inner.clone()), &ids[1], []);
+        alpha
+            .store(
+                "backend-old",
+                "Comfy backend is old host",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        alpha
+            .store(
+                "backend-new",
+                "Comfy backend is new host",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        beta.store(
+            "peer",
+            "Peer backend stays unchanged",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        let old = alpha.get("backend-old").await.unwrap().unwrap();
+        let new = alpha.get("backend-new").await.unwrap().unwrap();
+        let peer = alpha.get("peer").await.unwrap().unwrap();
+        assert!(
+            alpha
+                .supersede(&[old.id.clone(), peer.id.clone()], &new.key)
+                .await
+                .is_err()
+        );
+        assert!(
+            alpha
+                .get("backend-old")
+                .await
+                .unwrap()
+                .unwrap()
+                .superseded_by
+                .is_none()
+        );
+        assert!(
+            alpha
+                .supersede(std::slice::from_ref(&old.id), &peer.key)
+                .await
+                .is_err()
+        );
+        assert!(
+            alpha
+                .supersede(std::slice::from_ref(&new.id), &new.key)
+                .await
+                .is_err()
+        );
+        alpha
+            .supersede(std::slice::from_ref(&old.id), &new.key)
+            .await
+            .unwrap();
+        let hidden = alpha.get("backend-old").await.unwrap().unwrap();
+        assert_eq!(hidden.content, old.content, "old evidence is retained");
+        assert_eq!(hidden.superseded_by.as_deref(), Some(new.id.as_str()));
+        assert!(
+            alpha
+                .recall("backend", 10, None, None, None)
+                .await
+                .unwrap()
+                .iter()
+                .all(|e| e.id != old.id)
+        );
+        assert!(
+            beta.get("peer")
+                .await
+                .unwrap()
+                .unwrap()
+                .superseded_by
+                .is_none()
         );
     }
 

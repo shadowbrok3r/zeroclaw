@@ -43,6 +43,12 @@ impl Tool for MemoryStoreTool {
                 "category": {
                     "type": "string",
                     "description": "Memory category: 'core' (permanent), 'daily' (session), 'conversation' (chat), or a custom category name. Defaults to 'core'."
+                },
+                "supersedes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 20,
+                    "description": crate::i18n::get_required_tool_string("tool-memory-store-supersedes")
                 }
             },
             "required": ["key", "content"]
@@ -93,7 +99,81 @@ impl Tool for MemoryStoreTool {
             });
         }
 
+        let supersedes: Vec<String> = match args.get("supersedes") {
+            Some(value) => serde_json::from_value(value.clone())?,
+            None => Vec::new(),
+        };
+        anyhow::ensure!(
+            supersedes.len() <= 20
+                && supersedes
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+                    == supersedes.len(),
+            "{}",
+            crate::i18n::get_required_tool_string("tool-memory-store-invalid-predecessors")
+        );
+        // Keep the old record under its old key. A same-key upsert would erase
+        // that evidence before a correction could soft-hide it.
+        let mut previous = Vec::new();
+        if !supersedes.is_empty() {
+            let entries = self
+                .memory
+                .export(&zeroclaw_memory::ExportFilter::default())
+                .await?;
+            for id in &supersedes {
+                let entry = entries
+                    .iter()
+                    .find(|e| &e.id == id && e.superseded_by.is_none())
+                    .ok_or_else(|| {
+                        anyhow::Error::msg(crate::i18n::get_required_tool_string(
+                            "tool-memory-store-missing-predecessor"
+                        ))
+                    })?;
+                anyhow::ensure!(
+                    entry.key != key,
+                    "{}",
+                    crate::i18n::get_required_tool_string("tool-memory-store-distinct-key")
+                );
+                previous.push(entry.clone());
+            }
+            anyhow::ensure!(
+                self.memory.get(key).await?.is_none(),
+                "{}",
+                crate::i18n::get_required_tool_string("tool-memory-store-distinct-key")
+            );
+        }
+
         match self.memory.store(key, content, category, None).await {
+            Ok(()) if !supersedes.is_empty() => {
+                let result = self.memory.supersede(&supersedes, key).await;
+                let mut retired = result.is_ok();
+                // Some backends have a no-op trait default. Never report a
+                // correction as completed unless the old rows are hidden.
+                if retired {
+                    for old in &previous {
+                        let entry = match old.agent_id.as_deref() {
+                            Some(agent) => self.memory.get_for_agent(&old.key, agent).await?,
+                            None => self.memory.get(&old.key).await?,
+                        };
+                        retired &=
+                            entry.is_some_and(|e| e.id == old.id && e.superseded_by.is_some());
+                    }
+                }
+                let output = crate::i18n::get_required_tool_string_with_args(
+                    if retired {
+                        "tool-memory-store-corrected"
+                    } else {
+                        "tool-memory-store-correction-incomplete"
+                    },
+                    &[("key", key), ("count", &supersedes.len().to_string())],
+                );
+                Ok(ToolResult {
+                    success: retired,
+                    output: output.into(),
+                    error: result.err().map(|e| e.to_string()),
+                })
+            }
             Ok(()) => Ok(ToolResult {
                 success: true,
                 output: format!("Stored memory: {key}").into(),
@@ -150,6 +230,106 @@ mod tests {
         let entry = mem.get("lang").await.unwrap();
         assert!(entry.is_some());
         assert_eq!(entry.unwrap().content, "Prefers Rust");
+    }
+
+    #[tokio::test]
+    async fn explicit_correction_keeps_history_and_compatible_facts() {
+        use zeroclaw_memory::agent_scoped::AgentScopedMemory;
+        let tmp = TempDir::new().unwrap();
+        let inner = Arc::new(SqliteMemory::new("test", tmp.path()).unwrap());
+        let id = inner.ensure_agent_uuid("artist").await.unwrap();
+        let mem: Arc<dyn Memory> = Arc::new(AgentScopedMemory::new(inner, id, []));
+        mem.store(
+            "backend@old",
+            "Rendering uses the old host",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "compatible",
+            "Rendering keeps PNG originals",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        let old = mem.get("backend@old").await.unwrap().unwrap();
+        // SQLite list() previews only the newest 1000 rows. A real correction
+        // must still find and retire older evidence through the scoped backend.
+        for i in 0..1001 {
+            mem.store(
+                &format!("scratch/{i}"),
+                "Temporary scratch note",
+                MemoryCategory::Daily,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        assert!(
+            mem.list(None, None)
+                .await
+                .unwrap()
+                .iter()
+                .all(|e| e.id != old.id)
+        );
+        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+        let same_key = tool
+            .execute(json!({"key":"backend@old", "content":"Overwrite", "supersedes":[old.id]}))
+            .await;
+        assert!(same_key.is_err());
+        assert_eq!(
+            mem.get("backend@old").await.unwrap().unwrap().content,
+            old.content
+        );
+        let result = tool.execute(json!({"key":"backend@new", "content":"Source: explicit user correction; rendering uses the new host", "supersedes":[old.id]})).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        let winner = mem.get("backend@new").await.unwrap().unwrap();
+        let archived = mem.get("backend@old").await.unwrap().unwrap();
+        assert_eq!(archived.content, old.content);
+        assert_eq!(archived.superseded_by.as_deref(), Some(winner.id.as_str()));
+        let recalled = mem.recall("Rendering", 10, None, None, None).await.unwrap();
+        assert!(recalled.iter().all(|e| e.id != old.id));
+        assert!(recalled.iter().any(|e| e.key == "compatible"));
+    }
+
+    #[tokio::test]
+    async fn correction_cannot_retire_a_readable_peer_memory() {
+        use zeroclaw_memory::agent_scoped::AgentScopedMemory;
+        let tmp = TempDir::new().unwrap();
+        let inner = Arc::new(SqliteMemory::new("test", tmp.path()).unwrap());
+        let own = inner.ensure_agent_uuid("artist").await.unwrap();
+        let peer = inner.ensure_agent_uuid("peer").await.unwrap();
+        inner
+            .store_with_agent(
+                "peer-fact",
+                "Peer likes blue",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(&peer),
+            )
+            .await
+            .unwrap();
+        let mem: Arc<dyn Memory> =
+            Arc::new(AgentScopedMemory::new(inner.clone(), own, [peer.clone()]));
+        let old = mem.get("peer-fact").await.unwrap().unwrap();
+        let tool = MemoryStoreTool::new(mem, test_security());
+        let result = tool.execute(json!({"key":"untrusted-replacement", "content":"Peer likes red", "supersedes":[old.id]})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("could not be verified"));
+        assert!(
+            inner
+                .get_for_agent("peer-fact", &peer)
+                .await
+                .unwrap()
+                .unwrap()
+                .superseded_by
+                .is_none()
+        );
     }
 
     #[tokio::test]

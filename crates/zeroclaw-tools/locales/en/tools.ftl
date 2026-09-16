@@ -136,6 +136,12 @@ tool-memory-forget = Remove a memory by key. Use to delete outdated facts or sen
 tool-memory-recall = Search long-term memory for relevant facts, preferences, or context. Returns scored results ranked by relevance. Omit the query or pass bare * to return recent memories.
 
 tool-memory-store = Store a fact, preference, or note in long-term memory. Use category 'core' for permanent facts, 'daily' for session notes, 'conversation' for chat context, or a custom category name.
+tool-memory-recall-entry = - [{ $category }; recorded={ $timestamp }; agent={ $agent }; id={ $id }] { $key }: { $content } [relevance={ $score }]
+tool-memory-store-supersedes = Optional IDs from memory_recall to retire after an explicit correction or verified contradictory evidence about the same fact and scope. Use a new versioned key; include source, date and correction reason in content. Similar or compatible facts are not contradictions. Old rows are retained.
+tool-memory-store-missing-predecessor = A predecessor ID is missing or inaccessible; recall it before correcting it.
+tool-memory-store-distinct-key = Corrections require a new versioned key so the previous content is preserved.
+tool-memory-store-corrected = Stored memory: { $key }; retired { $count } previous record(s), retaining their content.
+tool-memory-store-correction-incomplete = Stored memory: { $key }, but retiring the previous records could not be verified. Do not claim the correction is complete.
 
 tool-microsoft365 = Microsoft 365 integration: manage Outlook mail, Teams messages, Calendar events, OneDrive files, and SharePoint search via Microsoft Graph API
 
@@ -194,3 +200,5 @@ tool-web-search-tool-note-truncated-results = (further results omitted)
 tool-workspace = Manage multi-client workspaces. Subcommands: list, switch, create, info, export. Each workspace provides isolated memory, audit, secrets, and tool restrictions.
 
 tool-weather = Get current weather conditions and forecast for any location worldwide. Supports city names (in any language or script), IATA airport codes (e.g. 'LAX'), GPS coordinates (e.g. '51.5,-0.1'), postal/zip codes, and domain-based geolocation. Returns temperature, feels-like, humidity, wind speed/direction, precipitation, visibility, pressure, UV index, and cloud cover. Optional 0-3 day forecast with hourly breakdown. Units default to metric (°C, km/h, mm) but can be set to imperial (°F, mph, inches) per request. No API key required.
+
+tool-memory-store-invalid-predecessors = Corrections accept at most 20 distinct predecessor IDs.
