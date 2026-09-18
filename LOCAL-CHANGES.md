@@ -29,6 +29,22 @@ Architecture documentation for the overhaul:
 
 ## Change inventory
 
+### `crates/zeroclaw-gateway/src/ws.rs` — a turn outlives its client's socket
+
+The turn-forwarding `select!` used to call `cancel_token.cancel()` when the client's socket ended,
+which upstream added to stop a disconnected socket hot-looping the branch (#6514). The side effect
+was that any client disconnect killed the turn and stored the partial reply with
+`[interrupted by user]` appended — so a phone that changed network, or was backgrounded long
+enough for the OS to abort its socket, lost the answer it was waiting for and was told it had
+interrupted itself.
+
+A `client_gone` flag with `if !client_gone` guards on that arm and on the ping arm stops the branch
+being polled, which is what #6514 actually needed, while the turn runs on. It finishes, is
+persisted, and the next connection backfills it over `/api/sessions/{id}/messages`.
+
+Conflict note: upstream edits to this `select!` will land on the guarded arms. Keep the guards;
+do not restore `cancel_token.cancel()` on the disconnect path.
+
 ### Session lifecycle SSE events
 
 | File | Why |
