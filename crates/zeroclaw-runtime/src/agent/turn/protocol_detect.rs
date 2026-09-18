@@ -8,6 +8,40 @@ use zeroclaw_tool_call_parser::{
     looks_like_tool_protocol_example, tool_protocol_envelope_mentions_known_tool,
 };
 
+/// Bracketed text-protocol openers a `[` candidate may still be growing into
+/// (`[tool_call]` streams in as `[`, `[to`, `[tool_c`, ...).
+const BRACKET_TAG_OPENERS: [&str; 1] = ["[tool_call]"];
+
+/// `true` when a candidate held because it starts with `{` or `[` has turned out
+/// to be prose: its first JSON value hit a syntax error (`[ACT emotion="playful"]`,
+/// `[DELAY 1]`, `{name}`, `[[reply_to_current]]`), or it parsed as a value that is
+/// not a tool envelope naming a known tool (`[1] see below`). A value that is only
+/// incomplete so far (serde reports EOF) is NOT prose -- `{"tool_calls": [` must
+/// keep buffering -- and neither is a prefix of a bracketed protocol tag.
+pub(crate) fn bracket_candidate_is_prose(text: &str, known_tool_names: &HashSet<String>) -> bool {
+    let trimmed = text.trim_start();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if BRACKET_TAG_OPENERS
+        .iter()
+        .any(|tag| tag.starts_with(lower.as_str()) || lower.starts_with(tag))
+    {
+        return false;
+    }
+    let mut values = serde_json::Deserializer::from_str(trimmed).into_iter::<serde_json::Value>();
+    match values.next() {
+        Some(Ok(_)) => {
+            let first = &trimmed[..values.byte_offset()];
+            !(looks_like_tool_protocol_envelope(first)
+                && tool_protocol_envelope_mentions_known_tool(first, known_tool_names))
+        }
+        Some(Err(err)) => !err.is_eof(),
+        None => false,
+    }
+}
+
 pub(crate) fn longest_suffix_matching_prefix(text: &str, pattern: &str) -> usize {
     (1..pattern.len())
         .rev()

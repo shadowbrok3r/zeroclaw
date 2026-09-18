@@ -1,7 +1,7 @@
 //! Streaming-text guards: protocol-fragment buffering and `<think>` tag stripping.
 
 use super::protocol_detect::{
-    complete_json_fence_protocol_state, complete_non_protocol_json,
+    bracket_candidate_is_prose, complete_json_fence_protocol_state, complete_non_protocol_json,
     find_embedded_protocol_candidate_start, find_incomplete_protocol_candidate_start,
     longest_suffix_matching_prefix, starts_suspicious_protocol_prefix,
     starts_suspicious_tag_or_fence_prefix,
@@ -116,6 +116,18 @@ impl StreamTextGuard {
         }
 
         if complete_non_protocol_json(candidate, &self.known_tool_names) {
+            self.pending_candidate_start = None;
+            return Some(std::mem::take(&mut self.pending));
+        }
+
+        // Prose that merely contains a bracket can never become a tool envelope:
+        // release it now. Without this, `complete_non_protocol_json` above is the
+        // only way out, and prose never parses as JSON -- so everything from the
+        // first `[`/`{` on was held until finish(). Measured 2026-09-18: the
+        // `default` agent opens every reply with an avatar tag
+        // (`[ACT emotion="playful"]`) and streamed each reply to /ws/chat as ONE
+        // chunk just before `done`, while `research` (no brackets) streamed 60-70.
+        if bracket_candidate_is_prose(candidate, &self.known_tool_names) {
             self.pending_candidate_start = None;
             return Some(std::mem::take(&mut self.pending));
         }
@@ -591,5 +603,120 @@ impl StreamTerminalMarkerStripper {
         // whitespace (e.g. `<eom␠` with no closing `>`) is preserved verbatim —
         // it is user-visible prose, not a terminal marker suffix.
         strip_trailing_terminal_markers(&self.pending)
+    }
+}
+
+#[cfg(test)]
+mod prose_bracket_tests {
+    use super::StreamTextGuard;
+    use crate::tools::ToolSpec;
+
+    fn tools(names: &[&str]) -> Vec<ToolSpec> {
+        names
+            .iter()
+            .map(|name| ToolSpec::new(*name, "", serde_json::json!({"type": "object"})))
+            .collect()
+    }
+
+    /// Feed `text` in `step`-char deltas. Returns (released live, released by finish()).
+    fn stream(text: &str, step: usize, tools: &[ToolSpec]) -> (String, String, StreamTextGuard) {
+        let mut guard = StreamTextGuard::new(Some(tools));
+        let chars: Vec<char> = text.chars().collect();
+        let mut live = String::new();
+        for piece in chars.chunks(step) {
+            if let Some(out) = guard.push(&piece.iter().collect::<String>()) {
+                live.push_str(&out);
+            }
+        }
+        let tail = guard.finish().unwrap_or_default();
+        (live, tail, guard)
+    }
+
+    // The reply shape that streamed as one chunk: an avatar tag first, more tags
+    // mid-reply. Token-sized deltas, like a real provider stream.
+    const AVATAR_REPLY: &str = "[ACT emotion=\"playful\"]\n\nA lighthouse guides ships safely \
+        to shore. [ACT emotion=\"seductive\"][DELAY 1] Like my gaze on you~";
+
+    #[test]
+    fn avatar_tags_stream_live_instead_of_one_chunk_at_finish() {
+        for step in [1, 3, 4, 7] {
+            let (live, tail, guard) = stream(AVATAR_REPLY, step, &tools(&["shell", "file_read"]));
+            assert_eq!(
+                format!("{live}{tail}"),
+                AVATAR_REPLY,
+                "step {step}: text must be intact"
+            );
+            assert!(
+                !guard.suppressed_protocol,
+                "step {step}: prose is not protocol"
+            );
+            assert!(
+                live.contains("A lighthouse guides ships") && live.contains("[DELAY 1]"),
+                "step {step}: the body must be released live, not held for finish(); live={live:?}"
+            );
+            assert!(
+                tail.len() <= 8,
+                "step {step}: at most a trailing fragment may wait; tail={tail:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prose_brackets_and_braces_are_released() {
+        for text in [
+            "See [1] and {name} here.",
+            "[[reply_to_current]] Sure thing.",
+            "Done - [interrupted by user]",
+        ] {
+            let (live, tail, guard) = stream(text, 2, &tools(&["shell"]));
+            assert_eq!(format!("{live}{tail}"), text);
+            assert!(!guard.suppressed_protocol, "{text:?} is prose");
+            assert!(tail.len() <= 4, "{text:?} must stream; tail={tail:?}");
+        }
+    }
+
+    #[test]
+    fn json_tool_envelope_for_a_known_tool_is_still_suppressed() {
+        let text = r#"{"name": "shell", "arguments": {"command": "ls -la"}}"#;
+        let (live, tail, guard) = stream(text, 3, &tools(&["shell"]));
+        assert!(
+            guard.suppressed_protocol,
+            "a text-form call to a known tool must be suppressed"
+        );
+        assert!(
+            live.is_empty() && tail.is_empty(),
+            "nothing may leak; live={live:?} tail={tail:?}"
+        );
+    }
+
+    #[test]
+    fn tool_calls_envelope_keeps_buffering_while_incomplete() {
+        let mut guard = StreamTextGuard::new(Some(&tools(&["shell"])));
+        for delta in ["{\"tool", "_calls\": [", "{\"name\": \"sh"] {
+            assert_eq!(
+                guard.push(delta),
+                None,
+                "incomplete JSON must stay buffered at {delta:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bracketed_tool_call_tag_is_not_released_while_it_grows() {
+        let mut guard = StreamTextGuard::new(Some(&tools(&["shell"])));
+        for delta in ["[", "to", "ol_c", "all]"] {
+            assert_eq!(
+                guard.push(delta),
+                None,
+                "a growing [tool_call] opener must stay held at {delta:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn complete_non_envelope_json_array_is_released() {
+        let (live, tail, guard) = stream("[1, 2, 3] are the counts.", 2, &tools(&["shell"]));
+        assert_eq!(format!("{live}{tail}"), "[1, 2, 3] are the counts.");
+        assert!(!guard.suppressed_protocol);
     }
 }

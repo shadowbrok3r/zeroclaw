@@ -139,6 +139,22 @@ provider fix this deployment depends on.
 |---|---|
 | `crates/zeroclaw-providers/src/compatible.rs` | Adds `finish_reason` to the non-streaming `Choice` (upstream omits the field entirely) and surfaces a `length` stop on both the streaming and non-streaming paths as a `WARN` plus a visible notice appended to the reply. |
 
+### Stream guard releases bracketed prose (runtime)
+
+Unrelated to the session overhaul. The streaming text guard holds everything from
+a `[` or `{` onward until it parses as JSON, so a text-form tool call never
+leaks into the stream. Prose never parses, so a reply that opened with an avatar
+tag (`[ACT emotion="playful"]`) reached `/ws/chat` as one chunk just before
+`done`. Measured 2026-09-18: the `default` agent streamed one chunk per reply,
+`research` 60-70.
+
+| File | Why |
+|---|---|
+| `crates/zeroclaw-runtime/src/agent/turn/protocol_detect.rs` | `bracket_candidate_is_prose()`: a held `[`/`{` candidate is prose when its first JSON value is a syntax error, or a complete value that is not a known-tool envelope. An incomplete value (serde EOF) and a growing `[tool_call]` opener are not. |
+| `crates/zeroclaw-runtime/src/agent/turn/stream_guard.rs` | `StreamTextGuard::push` releases such a candidate at once. `prose_bracket_tests` cover avatar tags, prose brackets, a suppressed known-tool envelope and an incomplete one. |
+
+The same change is kept as `zc-codex/deploy/zeroclaw-stream-guard-prose-brackets.patch`.
+
 ### Documentation
 
 | File | Why |
@@ -276,3 +292,10 @@ Re-check these after every upstream merge; they are easy to silently lose:
   no-op with a message on stderr. A merge that overwrites `.cargo/config.toml`
   drops the guard with no compile error and no test failure; the symptom is
   `tailscale serve status` reporting `No serve config` after a test run.
+
+- **Bracketed prose streams.** Upstream's `StreamTextGuard` holds any reply
+  from its first `[` or `{` to the end of the turn unless the held text parses
+  as JSON, so avatar tags (`[ACT ...]`, `[DELAY 1]`) turned a streamed reply into
+  one chunk. A merge that takes upstream's `stream_guard.rs` drops the release
+  and its tests together, with no compile error; the symptom is a `default`
+  agent reply arriving on `/ws/chat` as a single `chunk`.
