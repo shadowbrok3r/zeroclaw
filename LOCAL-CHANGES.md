@@ -144,8 +144,7 @@ in the service environment and a comfy-gen with `where --since --deliverable`.
 
 Companion change in `zeroclaw-homelab/comfy-gen`: `jobs::delivered()` completes and
 caches the receipt from the render process itself (so the lookup never races the
-observer), and `where` grew `--since` / `--deliverable`. Incremental patches for both
-sides live in `zc-codex/deploy/{gateway,comfy-gen}-render-delivery.patch`.
+observer), and `where` grew `--since` / `--deliverable`.
 
 ### Provider truncation surfacing
 
@@ -169,8 +168,6 @@ tag (`[ACT emotion="playful"]`) reached `/ws/chat` as one chunk just before
 |---|---|
 | `crates/zeroclaw-runtime/src/agent/turn/protocol_detect.rs` | `bracket_candidate_is_prose()`: a held `[`/`{` candidate is prose when its first JSON value is a syntax error, or a complete value that is not a known-tool envelope. An incomplete value (serde EOF) and a growing `[tool_call]` opener are not. |
 | `crates/zeroclaw-runtime/src/agent/turn/stream_guard.rs` | `StreamTextGuard::push` releases such a candidate at once. `prose_bracket_tests` cover avatar tags, prose brackets, a suppressed known-tool envelope and an incomplete one. |
-
-The same change is kept as `zc-codex/deploy/zeroclaw-stream-guard-prose-brackets.patch`.
 
 ### Documentation
 
