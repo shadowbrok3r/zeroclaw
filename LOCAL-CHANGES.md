@@ -1,8 +1,9 @@
 # LOCAL-CHANGES.md
 
 Fork-delta manifest for this repository. Upstream is
-`zeroclaw-labs/zeroclaw`; upstream tags are merged in periodically via the
-`local/upstream-merge` branch. This file exists to keep those merges cheap:
+`zeroclaw-labs/zeroclaw`; upstream tags are merged periodically into `main`,
+the fork's single line (the deployed binary is built from it). This file exists
+to keep those merges cheap:
 it names every file this fork touches, why, and how to resolve the conflicts
 that recur.
 
@@ -185,9 +186,10 @@ The same change is kept as `zc-codex/deploy/zeroclaw-stream-guard-prose-brackets
 
 ```bash
 git fetch origin
-git checkout local/upstream-merge
-git merge <tag>          # e.g. v0.8.5
-# resolve, validate, then merge local/upstream-merge into local/sessions-threads
+git switch -c upstream-merge/<tag> main   # short-lived; delete after merging
+git merge <tag>          # e.g. v0.8.6
+# resolve, validate (cargo test, then a release build), then:
+git switch main && git merge --ff-only upstream-merge/<tag>
 ```
 
 New-file additions never conflict: `crates/zeroclaw-gateway/src/session_events.rs`,
