@@ -93,6 +93,16 @@ pub enum TurnEvent {
         /// Synthesised by `crate::approval::summarize_args`; never the raw
         /// `args` value.
         arguments_summary: String,
+        /// The tool arguments with secret-keyed values redacted but NOT
+        /// truncated, for a surface that must show the operator exactly what
+        /// they are approving — a shell command cut at
+        /// `summarize_args`' 80 characters can hide the part that matters.
+        ///
+        /// Still not the raw `args`: the same `looks_like_secret_key`
+        /// redaction as the summary applies, because this reaches phone
+        /// modals and their notification text, which can render on a lock
+        /// screen. `None` when the producing channel has no argument object.
+        arguments: Option<serde_json::Value>,
         /// How long the channel will wait before auto-denying.
         timeout_secs: u64,
     },

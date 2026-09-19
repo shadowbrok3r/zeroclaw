@@ -117,6 +117,14 @@ impl Channel for WsApprovalChannel {
             request_id: request_id.clone(),
             tool_name: request.tool_name.clone(),
             arguments_summary: request.arguments_summary.clone(),
+            // The summary truncates every value at 80 characters, which can cut
+            // a shell command short of the part the operator needs to judge it.
+            // Carry the untruncated arguments too, with the same secret-key
+            // redaction — this reaches a phone modal and its notification text.
+            arguments: request
+                .raw_arguments
+                .as_ref()
+                .map(zeroclaw_runtime::approval::redact_args),
             timeout_secs: self.timeout.as_secs(),
         };
         if self.event_tx.send(event).await.is_err() {

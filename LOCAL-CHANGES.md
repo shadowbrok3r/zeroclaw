@@ -232,6 +232,27 @@ An approval is only meaningful if the operator can see what they are approving.
 | `crates/zeroclaw-runtime/src/agent/agent.rs` | Attaches the policy to the manager it builds. |
 | `crates/zeroclaw-runtime/src/agent/turn/approval_gate.rs` | Escalates `Approved` → `Prompt` for such a command, and downgrades an `AlwaysApprove` on an escalated call to a one-shot `Yes`, so one tap on a `mkdir` cannot session-allowlist `shell` and pre-approve a later `rm -rf`. |
 
+An approval frame also carries the arguments untruncated, because the same
+reasoning applies one layer out: `summarize_args` redacts by key AND cuts every
+value at 80 characters, so the phone was being asked to approve a shell command
+it could only partly see. `TurnEvent::ApprovalRequest` gained an `arguments`
+field and the three `/ws/chat` frame builders emit it. It is not the raw object
+— `approval::redact_args` applies the same `looks_like_secret_key` redaction as
+the summary and drops only the truncation, because this reaches a phone modal
+and its notification text, which can render on a lock screen. The ACP/RPC
+mapping in `rpc/dispatch.rs` deliberately ignores the field (`..`): widening that
+surface is a separate decision.
+
+| File | Why |
+|---|---|
+| `crates/zeroclaw-api/src/agent.rs` | `TurnEvent::ApprovalRequest.arguments: Option<Value>`, documented as redacted-but-untruncated. |
+| `crates/zeroclaw-runtime/src/approval/mod.rs` | `redact_args()` beside `summarize_args` so one redaction list serves both and they cannot drift. |
+| `crates/zeroclaw-gateway/src/ws_approval.rs` | Populates it from `ChannelApprovalRequest.raw_arguments`, which the WS path previously dropped on the floor. |
+| `crates/zeroclaw-gateway/src/ws.rs` | All three `approval_request` frame builders emit `arguments`. |
+
+Consumed by the zc-codex app from 0.8.35, which renders `arguments.command` in
+full for `shell` approvals and falls back to `arguments_summary` when absent.
+
 Conflict note: the escalation in `approval_gate.rs` and the two `operator_can_override`
 calls in `policy.rs` are one mechanism — keep them together. Dropping only the
 escalation while keeping the policy relaxation is the dangerous half: `shell` is

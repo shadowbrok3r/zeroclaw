@@ -412,6 +412,37 @@ pub fn summarize_args(args: &serde_json::Value) -> String {
     }
 }
 
+/// The tool arguments with secret-keyed values redacted, and nothing
+/// truncated.
+///
+/// [`summarize_args`] does two things at once — it redacts by key AND cuts
+/// every value at 80 characters — which makes it unusable for a surface that
+/// must show an operator the exact command they are approving. This keeps the
+/// redaction and drops the cut, so it can be sent somewhere the full value
+/// matters without widening what a secret-keyed value discloses.
+///
+/// Uses the same [`looks_like_secret_key`] predicate as the summary on
+/// purpose: two redaction lists would drift, and the quieter failure is the
+/// one where this surface leaks a key the summary would have hidden.
+#[must_use]
+pub fn redact_args(args: &serde_json::Value) -> serde_json::Value {
+    match args {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(k, v)| {
+                    let value = if looks_like_secret_key(k) {
+                        serde_json::Value::String("[redacted]".to_string())
+                    } else {
+                        v.clone()
+                    };
+                    (k.clone(), value)
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 /// Heuristic for argument keys that should have their value redacted in
 /// human-readable summaries. Matches anywhere in the (lowercased) key:
 /// covers `api_key`, `api-key`, `apiKey`, `oauth_token`, `secret`,
@@ -772,6 +803,40 @@ mod tests {
         let summary = summarize_args(&args);
         assert!(summary.contains('…'));
         assert!(summary.len() < 200);
+    }
+
+    #[test]
+    fn redact_args_keeps_the_whole_value_but_still_hides_secrets() {
+        // The point of this over summarize_args: an operator approving a shell
+        // command must see all of it, and 80 characters can cut off the part
+        // that decides the answer.
+        let command = format!("rm -rf {}", "a/".repeat(80));
+        let args = serde_json::json!({
+            "command": command,
+            "api_key": "sk-live-do-not-leak",
+            "approved": false,
+        });
+        let redacted = redact_args(&args);
+        assert_eq!(
+            redacted["command"].as_str().unwrap(),
+            command,
+            "the command must survive untruncated"
+        );
+        assert_eq!(
+            redacted["api_key"], "[redacted]",
+            "a secret-keyed value must not reach a lock-screen notification"
+        );
+        assert_eq!(redacted["approved"], serde_json::json!(false));
+        // summarize_args would have cut the same command short.
+        assert!(summarize_args(&args).contains('…'));
+    }
+
+    #[test]
+    fn redact_args_passes_non_objects_through() {
+        assert_eq!(
+            redact_args(&serde_json::json!("plain")),
+            serde_json::json!("plain")
+        );
     }
 
     #[test]

@@ -5432,11 +5432,14 @@ fn notification_for_turn_event(
             name: name.clone(),
             raw_output: output.clone(),
         },
+        // `arguments` is deliberately not forwarded: it exists for the WS
+        // approval modal, and widening the ACP surface is a separate decision.
         TurnEvent::ApprovalRequest {
             request_id,
             tool_name,
             arguments_summary,
             timeout_secs,
+            ..
         } => SessionUpdateEvent::ApprovalRequest {
             session_id: session_id.to_string(),
             request_id: request_id.clone(),
@@ -8020,6 +8023,7 @@ mod tests {
             request_id: "ar_1".into(),
             tool_name: "bash".into(),
             arguments_summary: "rm -rf /".into(),
+            arguments: None,
             timeout_secs: 30,
         };
         let json = notification_for_turn_event("s1", &event, None).unwrap();

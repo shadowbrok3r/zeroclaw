@@ -936,12 +936,14 @@ async fn handle_socket(
                         request_id,
                         tool_name,
                         arguments_summary,
+                        arguments,
                         timeout_secs,
                     } => serde_json::json!({
                         "type": "approval_request",
                         "request_id": request_id,
                         "tool": tool_name,
                         "arguments_summary": arguments_summary,
+                        "arguments": arguments,
                         "timeout_secs": timeout_secs,
                     }),
                     other => {
@@ -1447,6 +1449,7 @@ async fn process_chat_message(
                         request_id,
                         tool_name,
                         arguments_summary,
+                        arguments,
                         timeout_secs,
                     } = event {
                         let frame = serde_json::json!({
@@ -1454,6 +1457,7 @@ async fn process_chat_message(
                             "request_id": request_id,
                             "tool": tool_name,
                             "arguments_summary": arguments_summary,
+                            "arguments": arguments,
                             "timeout_secs": timeout_secs,
                         });
                         send_turn_frame(sender, &mut client_gone, Message::Text(frame.to_string().into())).await;
@@ -1502,12 +1506,14 @@ async fn process_chat_message(
                             request_id,
                             tool_name,
                             arguments_summary,
+                            arguments,
                             timeout_secs,
                         } => serde_json::json!({
                             "type": "approval_request",
                             "request_id": request_id,
                             "tool": tool_name,
                             "arguments_summary": arguments_summary,
+                            "arguments": arguments,
                             "timeout_secs": timeout_secs,
                         }),
                         TurnEvent::HistoryTrimmed {
