@@ -46,6 +46,38 @@ persisted, and the next connection backfills it over `/api/sessions/{id}/message
 Conflict note: upstream edits to this `select!` will land on the guarded arms. Keep the guards;
 do not restore `cancel_token.cancel()` on the disconnect path.
 
+### Reconnect rejoins the running turn (`turn_resume`, gateway)
+
+The turn outliving its socket (above) still left the phone blind: a socket that
+reconnected mid-turn got nothing of the running turn, since it streamed only into
+the old socket, and `send_turn_frame` drops every frame after one write over 5 s.
+Measured 2026-09-18 (comfy session `e5a406ad`, 22:51-22:56 UTC): the phone
+reconnected 32 s in, its thinking froze mid-word for 4.5 minutes, the reply only
+came back from history after `done`, and the later thinking/tool rows were lost.
+
+A per-session hub now mirrors every frame of the running turn. A socket that
+connects with `session_id` while that session's turn is running gets, right after
+`session_start`, `{"type":"turn_resume","frames":[…]}`: the whole turn from its
+first frame (adjacent `chunk` deltas merged, adjacent `thinking` merged, never
+across a `tool_call`/`tool_result`; an `approval_request` only while still
+pending), then the rest of the turn live. Pending approvals and steering are
+per session, so the resumed socket can answer a parked approval or steer. The
+consumer is zc-codex app 0.8.31+ (`android/src/zeroclaw.rs` `turn_resume` arm,
+test `a_turn_cut_by_a_reconnect_is_replaced_by_the_gateways_replay`); older
+apps ignore the frame.
+
+| File | Why |
+|---|---|
+| `crates/zeroclaw-gateway/src/ws_hub.rs` (NEW) | `TurnHub` keyed by `session_key`: ordered replay buffer, live `broadcast`, `pending_approvals`, steering. `begin`/`push`/`finish` from the turn; `attach` snapshots and subscribes under one lock so an observer gets each frame exactly once. Registry reclaims idle, unreferenced sessions on insert. |
+| `crates/zeroclaw-gateway/src/ws.rs` | `handle_socket` takes `pending_approvals` from the hub and, if a turn is running, runs `observe_running_turn` before the first-message path. `process_chat_message` takes `&hub`: `begin` at turn start, `push` beside every streamed frame (also after the client is gone), `finish` with `done`/`aborted`/`error`. |
+| `crates/zeroclaw-gateway/src/lib.rs` | `pub mod ws_hub;` |
+
+Conflict note: every `send_turn_frame` of a turn frame in `process_chat_message` has a
+`hub.push`/`hub.finish` next to it. Upstream edits that add a frame type or a terminal path
+must add the matching hub call, or a reconnect will replay an incomplete turn (no compile
+error). A new turn-failure code must also be told to zc-codex, which ends the turn on
+`PROVIDER_ERROR`/`AUTH_ERROR`/`AGENT_ERROR`.
+
 ### Session lifecycle SSE events
 
 | File | Why |
@@ -190,6 +222,7 @@ git switch main && git merge --ff-only upstream-merge/<tag>
 ```
 
 New-file additions never conflict: `crates/zeroclaw-gateway/src/session_events.rs`,
+`crates/zeroclaw-gateway/src/ws_hub.rs`,
 `src/sessions_cli/`, `docs/book/src/architecture/session-lifecycle.md`,
 `web/src/components/ThreadsPanel.tsx`, and this file are fork-only paths.
 Conflicts concentrate in the shared files below.

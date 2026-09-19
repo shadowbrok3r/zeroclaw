@@ -5,7 +5,7 @@
 //! transport forwards the summary without rebuilding it from raw arguments.
 
 use super::AppState;
-use crate::ws_approval::{PendingApprovals, WsApprovalChannel, new_pending_approvals};
+use crate::ws_approval::{PendingApprovals, WsApprovalChannel};
 use axum::{
     extract::{
         Query, State, WebSocketUpgrade,
@@ -631,7 +631,11 @@ async fn handle_socket(
 
     let (approval_event_tx, mut approval_event_rx) =
         tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(8);
-    let pending_approvals: PendingApprovals = new_pending_approvals();
+    // Per-session turn hub. Pending approvals live here (not per socket) so a
+    // socket that resumes a running turn can answer a prompt the turn is parked
+    // on, and the turn's frames are mirrored here for reconnect replay.
+    let hub = crate::ws_hub::hub_for(&session_key);
+    let pending_approvals: PendingApprovals = hub.pending_approvals.clone();
     let approval_channel = Arc::new(WsApprovalChannel::new(
         approval_event_tx.clone(),
         pending_approvals.clone(),
@@ -673,6 +677,32 @@ async fn handle_socket(
         let _ = sender.send(Message::Text(frame.to_string().into())).await;
     }
 
+    // If a turn is already streaming for this session, this socket is a
+    // reconnect: replay the turn so far and stream the rest live, then fall
+    // through to normal operation once it ends. A first message that arrived on
+    // the reconnect is steering for the running turn, not a new turn.
+    if hub.running() {
+        if let Some(text) = first_msg_fallback.take()
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+            && v["type"].as_str() == Some("message")
+            && let Some(content) = v["content"].as_str()
+            && !content.is_empty()
+        {
+            hub.steer(content.to_string());
+        }
+        observe_running_turn(
+            &hub,
+            &mut sender,
+            &mut receiver,
+            &pending_approvals,
+            &mut ping_interval,
+            &state,
+            &session_id,
+            auth_subject.as_deref(),
+        )
+        .await;
+    }
+
     // Process the first message if it was not a connect frame
     if let Some(ref text) = first_msg_fallback {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
@@ -703,6 +733,7 @@ async fn handle_socket(
                         &session_key,
                         &session_id,
                         auth_subject.as_deref(),
+                        &hub,
                     )
                     .await;
                 }
@@ -875,6 +906,7 @@ async fn handle_socket(
                     &session_key,
                     &session_id,
                         auth_subject.as_deref(),
+                        &hub,
                 )
                 .await;
             }
@@ -1125,6 +1157,124 @@ where
     }
 }
 
+/// Rejoin a turn that is already streaming for this session, for a socket that
+/// connected mid-turn (a reconnect). Sends the running turn so far as one
+/// `turn_resume` frame, then streams the rest live off the hub's broadcast,
+/// until a terminal frame (`done`/`aborted`/`error`) or the socket closes.
+///
+/// The turn itself is driven by whichever socket started it and is unaffected
+/// by this observer: a failed write here detaches only this socket. Inbound
+/// `approval_response` and `message` frames are routed to the shared hub, so a
+/// resumed socket can answer a parked approval or steer the running turn.
+#[allow(clippy::too_many_arguments)]
+async fn observe_running_turn(
+    hub: &Arc<crate::ws_hub::TurnHub>,
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
+    pending_approvals: &PendingApprovals,
+    ping_interval: &mut Option<tokio::time::Interval>,
+    state: &AppState,
+    session_id: &str,
+    auth_subject: Option<&str>,
+) {
+    use futures_util::StreamExt as _;
+
+    // Snapshot the turn so far and subscribe to the rest, atomically. `None`
+    // means the turn ended between the caller's check and here — nothing to do.
+    let Some((mut live_rx, frames)) = hub.attach() else {
+        return;
+    };
+    let resume = serde_json::json!({ "type": "turn_resume", "frames": frames });
+    if sender
+        .send(Message::Text(resume.to_string().into()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            biased;
+            frame = live_rx.recv() => {
+                match frame {
+                    Ok(text) => {
+                        let is_terminal = serde_json::from_str::<serde_json::Value>(&text)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("type").and_then(|t| t.as_str()).map(str::to_string)
+                            })
+                            .is_some_and(|t| matches!(t.as_str(), "done" | "aborted" | "error"));
+                        if sender.send(Message::Text(text.into())).await.is_err() {
+                            return;
+                        }
+                        if is_terminal {
+                            return;
+                        }
+                    }
+                    // Fell too far behind the live turn: detach and let the app
+                    // re-sync from history rather than stalling the turn.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => return,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+            _ = tick_websocket_ping(ping_interval) => {
+                if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    return;
+                }
+            }
+            client_msg = receiver.next() => {
+                let Some(msg) = client_msg else { return };
+                let text = match msg {
+                    Ok(Message::Text(text)) => text,
+                    Ok(Message::Ping(payload)) => {
+                        if sender.send(Message::Pong(payload)).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    Ok(Message::Pong(_)) => continue,
+                    Ok(Message::Close(_)) | Err(_) => return,
+                    _ => continue,
+                };
+                let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                match parsed["type"].as_str() {
+                    Some("approval_response") => {
+                        if handle_ws_sop_frame(&parsed, state, session_id, auth_subject, &mut *sender)
+                            .await
+                        {
+                            continue;
+                        }
+                        let request_id = parsed["request_id"].as_str().unwrap_or("");
+                        let decision = match parsed["decision"].as_str().unwrap_or("") {
+                            "approve" => Some(ChannelApprovalResponse::Approve),
+                            "always" => Some(ChannelApprovalResponse::AlwaysApprove),
+                            "deny" => Some(ChannelApprovalResponse::Deny),
+                            _ => None,
+                        };
+                        if !request_id.is_empty()
+                            && let Some(decision) = decision
+                            && let Some(tx) = pending_approvals.lock().remove(request_id)
+                        {
+                            let _ = tx.send(decision);
+                        }
+                    }
+                    Some("message") => {
+                        if let Some(content) = parsed["content"].as_str()
+                            && !content.is_empty()
+                        {
+                            hub.steer(content.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 /// Process a single chat message through the agent and send the response.
 /// Uses [`Agent::turn_streamed`] so that intermediate text chunks, tool calls,
 /// and tool results are forwarded to the WebSocket client in real time.
@@ -1144,6 +1294,9 @@ async fn process_chat_message(
     // Transport-authenticated approval subject (paired-token hash), threaded so a
     // mid-turn SOP approval frame carries the same identity as the top-level path.
     auth_subject: Option<&str>,
+    // Per-session turn hub: every frame is mirrored here so a socket that
+    // reconnects mid-turn can replay it and stream the rest live.
+    hub: &Arc<crate::ws_hub::TurnHub>,
 ) {
     use futures_util::StreamExt as _;
     use zeroclaw_runtime::agent::TurnEvent;
@@ -1209,6 +1362,10 @@ async fn process_chat_message(
     // Channel for streaming turn events from the agent.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
     let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(32);
+
+    // Open this turn on the session hub: reset the replay buffer, mark running,
+    // and expose the steering channel so a resumed socket can steer too.
+    hub.begin(steering_tx.clone());
 
     let content_owned = content.to_string();
     let session_key_owned = session_key.to_string();
@@ -1300,6 +1457,9 @@ async fn process_chat_message(
                             "timeout_secs": timeout_secs,
                         });
                         send_turn_frame(sender, &mut client_gone, Message::Text(frame.to_string().into())).await;
+                        // Mirror to the session hub even if this socket is gone,
+                        // so a reconnecting socket can replay the pending prompt.
+                        hub.push(&frame);
                     }
                 }
                 _ = tick_websocket_ping(ping_interval), if !client_gone => {
@@ -1361,6 +1521,10 @@ async fn process_chat_message(
                         }),
                     };
                     send_turn_frame(sender, &mut client_gone, Message::Text(ws_msg.to_string().into())).await;
+                    // Mirror to the session hub regardless of this socket's
+                    // liveness, so the full turn is available for reconnect
+                    // replay. push() ignores non-replayable frame types.
+                    hub.push(&ws_msg);
                 }
                 client_msg = receiver.next(), if !client_gone => {
                     // On client disconnect, `receiver.next()` returns `None`
@@ -1551,6 +1715,9 @@ async fn process_chat_message(
             Message::Text(aborted.to_string().into()),
         )
         .await;
+        // End the turn on the hub: fan the terminal frame out to any resumed
+        // socket and clear the replay buffer.
+        hub.finish(&aborted);
 
         if let Some(ref backend) = state.session_backend
             && backend.session_exists(session_key)
@@ -1677,6 +1844,9 @@ async fn process_chat_message(
                 Message::Text(done.to_string().into()),
             )
             .await;
+            // End the turn on the hub: any resumed socket sees `done` and the
+            // replay buffer is cleared.
+            hub.finish(&done);
 
             // Set session state to idle
             if let Some(ref backend) = state.session_backend {
@@ -1740,6 +1910,8 @@ async fn process_chat_message(
             let user_message =
                 zeroclaw_runtime::agent::terminal_completion_error_message(&e.error, None);
             let err = send_ws_turn_failure(sender, &e.error, user_message.as_deref()).await;
+            // End the turn on the hub with the same error frame the socket got.
+            hub.finish(&err);
 
             // Broadcast error event
             let _ = state.event_tx.send(serde_json::json!({
@@ -2250,7 +2422,7 @@ data: {\"type\":\"message_stop\"}\n\n",
         // and WS_CHANNEL_KEY ever diverge, that lookup misses and the tools
         // silently fall back to an arbitrary seeded channel — the original bug.
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let pending = new_pending_approvals();
+        let pending = crate::ws_approval::new_pending_approvals();
         let approval_channel = Arc::new(WsApprovalChannel::new(
             tx,
             pending,

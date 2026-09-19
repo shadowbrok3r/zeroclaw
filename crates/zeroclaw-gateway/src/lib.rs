@@ -57,6 +57,7 @@ pub mod voice_duplex;
 mod webhook_ingress;
 pub mod ws;
 pub mod ws_approval;
+pub mod ws_hub;
 pub mod ws_sop_runs;
 
 use anyhow::{Context, Result};
