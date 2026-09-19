@@ -2447,6 +2447,21 @@ impl SecurityPolicy {
             // The floor: no approval can conjure a shell. Never ask.
             return false;
         }
+        // The shell tool runs its own path scan — workspace confinement plus
+        // `forbidden_paths` — which never consults `approved`, so a command
+        // reaching outside the agent's workspace is refused however the operator
+        // answers. Measured 2026-09-19: an APPROVED `rm -rf /tmp/zc-test-dir`
+        // still came back "Path blocked by security policy", because
+        // `workspace_only` makes the floor an allowlist, not a denylist of
+        // sensitive directories. Prompting there spends a person's attention on
+        // a question whose answer cannot be honoured, and teaches them that a
+        // tap is sometimes meaningless.
+        if self
+            .forbidden_workspace_path_argument_for_shell(command, dialect)
+            .is_some()
+        {
+            return false;
+        }
         if !self.is_command_allowed_for_shell(command, dialect) {
             return true;
         }
@@ -4885,6 +4900,42 @@ mod tests {
     }
 
     #[test]
+    fn a_command_the_path_floor_will_refuse_is_never_put_to_an_operator() {
+        // Measured 2026-09-19 on the live gateway: an approved
+        // `rm -rf /tmp/zc-test-dir` still came back "Path blocked by security
+        // policy", because `workspace_only` makes the path floor an allowlist —
+        // /tmp is not in `forbidden_paths` and is blocked all the same. The
+        // operator's tap could not be honoured, so the question is not worth
+        // asking.
+        let workspace = tp_ws();
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            allowed_commands: vec!["rm".into()],
+            block_high_risk_commands: true,
+            operator_approval_route: true,
+            workspace_only: true,
+            allowed_roots: vec![],
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+
+        let outside = format!("rm -rf {}", tp_outside1());
+        assert!(
+            !p.shell_command_needs_operator_approval(&outside),
+            "a path the floor refuses must not raise a modal: {outside}"
+        );
+
+        // The same high-risk command inside the workspace is exactly what the
+        // prompt is for — approval lifts the risk tier, and the floor is not in
+        // the way.
+        let inside = format!("rm -rf {}", workspace.join("scratch").display());
+        assert!(
+            p.shell_command_needs_operator_approval(&inside),
+            "a high-risk command the operator could actually release must still ask: {inside}"
+        );
+    }
+
+    #[test]
     fn needs_operator_approval_matches_what_validate_would_refuse() {
         // These two must agree: a divergence either asks about commands that
         // would have run anyway, or runs commands nobody was asked about.
@@ -4900,7 +4951,11 @@ mod tests {
         // Outside the allowlist → ask.
         assert!(p.shell_command_needs_operator_approval("sort file.txt"));
         // High risk, even though explicitly allowed (supervised still gates it).
-        assert!(p.shell_command_needs_operator_approval("rm -rf /tmp/test"));
+        // The path stays workspace-relative on purpose: an absolute one outside
+        // the workspace is refused by the path floor whatever the operator says,
+        // and is therefore never asked about — see
+        // `a_command_the_path_floor_will_refuse_is_never_put_to_an_operator`.
+        assert!(p.shell_command_needs_operator_approval("rm -rf scratch"));
         // Allowed and harmless → never ask.
         assert!(!p.shell_command_needs_operator_approval("ls -la"));
 

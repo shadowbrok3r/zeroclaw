@@ -225,6 +225,17 @@ behind it), and PowerShell — whose `--%` stop-parsing token and provider-prefi
 quoting (`E'nv:'PATH`) can hide what a command does from the person approving it.
 An approval is only meaningful if the operator can see what they are approving.
 
+Because those refusals stand regardless, nothing that hits them is escalated —
+asking spends a person's attention on a question whose answer cannot be honoured.
+That includes the path floor, which is easy to under-estimate: `workspace_only`
+makes it an ALLOWLIST, so with `allowed_roots = []` every path outside the agent's
+workspace is refused even though it is nowhere in `forbidden_paths`. Measured
+2026-09-19 against the live gateway: an APPROVED `rm -rf /tmp/zc-test-dir` still
+came back "Path blocked by security policy". `shell_command_needs_operator_approval`
+therefore consults `forbidden_workspace_path_argument_for_shell` — the same scan
+`shell.rs` runs — and declines to ask. The same `rm -rf` inside the workspace does
+prompt, and runs when approved: the risk tier is liftable, the confinement is not.
+
 | File | Why |
 |---|---|
 | `crates/zeroclaw-config/src/policy.rs` | `operator_approval_route` on `SecurityPolicy` (set only by `from_profiles`, from `risk_profile.approval_route.is_some()`); `operator_can_override()` gates the allowlist and high-risk-block refusals on it + supervised + non-PowerShell; `shell_command_needs_operator_approval[_for_shell]()` mirrors exactly the refusals an approval can satisfy. |

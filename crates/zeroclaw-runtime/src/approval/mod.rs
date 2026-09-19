@@ -543,7 +543,14 @@ mod tests {
             mgr.shell_command_needs_operator("sort f.txt"),
             "a command outside the allowlist is a question for the operator"
         );
-        assert!(mgr.shell_command_needs_operator("rm -rf /tmp/x"));
+        // Workspace-relative on purpose: an absolute path outside the workspace
+        // is refused by the shell tool's path floor whatever the operator
+        // answers, so it is never asked about.
+        assert!(mgr.shell_command_needs_operator("rm -rf scratch"));
+        assert!(
+            !mgr.shell_command_needs_operator("rm -rf /tmp/x"),
+            "the path floor refuses this regardless, so it must not raise a modal"
+        );
         assert!(
             !mgr.shell_command_needs_operator("ls -la"),
             "an allowed, low-risk command must never prompt"
