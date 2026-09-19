@@ -2,7 +2,7 @@
 //! Provides a pre-execution hook that prompts the user before tool calls,
 //! with session-scoped "Always" allowlists and audit logging.
 
-use crate::security::AutonomyLevel;
+use crate::security::{AutonomyLevel, SecurityPolicy};
 use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,7 @@ use std::collections::HashSet;
 #[cfg(unix)]
 use std::io::BufReader;
 use std::io::{self, BufRead, Write};
+use std::sync::Arc;
 use zeroclaw_config::schema::RiskProfileConfig;
 
 // ── Types ────────────────────────────────────────────────────────
@@ -98,6 +99,13 @@ pub struct ApprovalManager {
     session_allowlist: Mutex<HashSet<String>>,
     /// Audit trail of approval decisions.
     audit_log: Mutex<Vec<ApprovalLogEntry>>,
+    /// The command policy this agent's shell runs under, when known. Lets the
+    /// gate escalate a command the policy would refuse into an operator prompt
+    /// instead of a dead-end refusal — see
+    /// [`Self::shell_command_needs_operator`]. `None` keeps the old behaviour
+    /// (no escalation, so the policy refuses as it always did), which is why
+    /// every path that cannot name the right policy leaves it unset.
+    shell_policy: Option<Arc<SecurityPolicy>>,
 }
 
 impl ApprovalManager {
@@ -111,6 +119,7 @@ impl ApprovalManager {
             non_interactive_shell_requires_approval: false,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
+            shell_policy: None,
         }
     }
 
@@ -123,6 +132,7 @@ impl ApprovalManager {
             non_interactive_shell_requires_approval: false,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
+            shell_policy: None,
         }
     }
 
@@ -135,7 +145,27 @@ impl ApprovalManager {
             non_interactive_shell_requires_approval: true,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
+            shell_policy: None,
         }
+    }
+
+    /// Attach the command policy the agent's shell tool enforces, so a command
+    /// it would refuse becomes a question for the operator instead.
+    #[must_use]
+    pub fn with_shell_policy(mut self, policy: Arc<SecurityPolicy>) -> Self {
+        self.shell_policy = Some(policy);
+        self
+    }
+
+    /// Whether this shell command must be put to an operator rather than
+    /// refused outright. False under full autonomy (which never prompts, so the
+    /// configured boundary stands as written) and false with no policy attached.
+    pub fn shell_command_needs_operator(&self, command: &str) -> bool {
+        self.autonomy_level == AutonomyLevel::Supervised
+            && self
+                .shell_policy
+                .as_ref()
+                .is_some_and(|p| p.shell_command_needs_operator_approval(command))
     }
 
     /// Derive a manager for a different agent's risk profile while preserving
@@ -157,6 +187,11 @@ impl ApprovalManager {
             non_interactive_shell_requires_approval: self.non_interactive_shell_requires_approval,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
+            // Deliberately NOT inherited: this manager runs a different agent's
+            // risk profile, and its allowed_commands are not ours. Escalating
+            // against the wrong policy would ask about the wrong commands, so
+            // the delegate falls back to its policy's own plain refusal.
+            shell_policy: None,
         }
     }
 
@@ -451,6 +486,52 @@ mod tests {
             level: AutonomyLevel::Full,
             ..RiskProfileConfig::default()
         }
+    }
+
+    fn shell_policy(autonomy: AutonomyLevel) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy,
+            allowed_commands: vec!["ls".into()],
+            block_high_risk_commands: true,
+            // Escalation is opt-in: it follows the profile having somewhere to ask.
+            operator_approval_route: true,
+            ..SecurityPolicy::default()
+        })
+    }
+
+    #[test]
+    fn shell_command_needs_operator_only_with_a_policy_and_supervised_autonomy() {
+        // No policy attached: nothing escalates, so the command policy refuses
+        // on its own exactly as it did before this existed.
+        let bare = ApprovalManager::for_non_interactive(&supervised_config());
+        assert!(!bare.shell_command_needs_operator("sort f.txt"));
+
+        let mgr = ApprovalManager::for_non_interactive(&supervised_config())
+            .with_shell_policy(shell_policy(AutonomyLevel::Supervised));
+        assert!(
+            mgr.shell_command_needs_operator("sort f.txt"),
+            "a command outside the allowlist is a question for the operator"
+        );
+        assert!(mgr.shell_command_needs_operator("rm -rf /tmp/x"));
+        assert!(
+            !mgr.shell_command_needs_operator("ls -la"),
+            "an allowed, low-risk command must never prompt"
+        );
+
+        // Full autonomy never prompts, so it never escalates either.
+        let full = ApprovalManager::for_non_interactive(&full_config())
+            .with_shell_policy(shell_policy(AutonomyLevel::Full));
+        assert!(!full.shell_command_needs_operator("sort f.txt"));
+    }
+
+    #[test]
+    fn a_derived_manager_does_not_inherit_another_agents_shell_policy() {
+        // The delegate runs a different profile whose allowed_commands are not
+        // ours; escalating against this policy would ask about the wrong set.
+        let mgr = ApprovalManager::for_non_interactive(&supervised_config())
+            .with_shell_policy(shell_policy(AutonomyLevel::Supervised));
+        let derived = mgr.derive_for_risk_profile(&supervised_config());
+        assert!(!derived.shell_command_needs_operator("sort f.txt"));
     }
 
     // ── CLI prompt input ────────────────────────────────────

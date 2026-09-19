@@ -350,6 +350,17 @@ pub struct SecurityPolicy {
     pub max_cost_per_day_cents: u32,
     pub require_approval_for_medium_risk: bool,
     pub block_high_risk_commands: bool,
+    /// Whether this agent has somewhere to put a command decision to a person
+    /// (`risk_profile.approval_route`). Set only by [`Self::from_risk_profile`];
+    /// everything else — presets, hand-built policies, `Default` — leaves it
+    /// false and keeps the historical behaviour exactly.
+    ///
+    /// It widens what a route means: having told the runtime where to ask, a
+    /// command this policy would refuse is put to the operator instead of
+    /// dead-ending. Without a route there is nobody to ask, so the refusal
+    /// stands as it always did — which is also what keeps the shipped presets'
+    /// contract ("a hard block, not an approval prompt") intact.
+    pub operator_approval_route: bool,
     pub shell_env_passthrough: Vec<String>,
     pub shell_timeout_secs: u64,
     /// Tool name allowlist. `None` is unrestricted (default for agents
@@ -765,6 +776,7 @@ impl Default for SecurityPolicy {
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
+            operator_approval_route: false,
             shell_env_passthrough: vec![],
             shell_timeout_secs: 60,
             allowed_tools: None,
@@ -2318,15 +2330,26 @@ impl SecurityPolicy {
             return Err("Command blocked: configured runtime has no shell access".into());
         }
 
-        if !self.is_command_allowed_for_shell(command, dialect) {
+        // Turn a dead end into a question: a command outside the agent's set is
+        // refused unless an OPERATOR approved it, rather than handing the model a
+        // refusal it cannot act on. See [`Self::operator_can_override`] for why
+        // this cannot be satisfied by the runtime auto-approving the tool.
+        if !self.is_command_allowed_for_shell(command, dialect)
+            && !self.operator_can_override(approved, dialect)
+        {
             return Err(format!("Command not allowed by security policy: {command}"));
         }
 
         let risk = self.command_risk_level_for_shell(command, dialect);
 
         if risk == CommandRiskLevel::High {
+            // Same reasoning as the allowlist above: an operator who was shown the
+            // command and approved it outranks the blanket block. This is NOT the
+            // floor — `dialect == None` above, and the shell tool's own
+            // forbidden-path scan, never consult `approved` and still refuse.
             if self.block_high_risk_commands
                 && !self.is_command_explicitly_allowed_for_shell(command, dialect)
+                && !self.operator_can_override(approved, dialect)
             {
                 return Err("Command blocked: high-risk command is disallowed by policy".into());
             }
@@ -2360,6 +2383,80 @@ impl SecurityPolicy {
         }
 
         Ok(risk)
+    }
+
+    /// Whether an `approved` argument may lift the allowlist and the high-risk
+    /// block — i.e. whether it can be trusted to mean "a human said yes to THIS
+    /// command".
+    ///
+    /// Only under [`AutonomyLevel::Supervised`], and the reason is subtle enough to
+    /// be worth stating. The runtime overwrites `approved` with the approval gate's
+    /// decision, and that decision is `Approved` either because an operator answered
+    /// a prompt OR because the tool sits in `auto_approve` — which `shell` does for
+    /// every profile here. What separates the two is the gate escalating any command
+    /// [`Self::shell_command_needs_operator_approval`] flags to a real prompt, so in
+    /// supervised mode a flagged command reaching here with `approved == true` was
+    /// answered by a person. Full autonomy never prompts, so there `approved` carries
+    /// no human behind it and must not open a boundary the operator configured.
+    fn operator_can_override(&self, approved: bool, dialect: ShellDialect) -> bool {
+        // PowerShell is excluded on purpose. Its stop-parsing token (`--%`) and
+        // provider-prefix quoting (`E'nv:'PATH`) can hide what a command really
+        // does from the person being asked, and an approval is only meaningful
+        // if the operator can see what they are approving. Those forms stay
+        // refused outright rather than becoming a prompt that launders them.
+        approved
+            && self.operator_approval_route
+            && self.autonomy == AutonomyLevel::Supervised
+            && dialect != ShellDialect::PowerShell
+    }
+
+    /// Whether this shell command should be put to an operator before it runs.
+    ///
+    /// Mirrors exactly the refusals in [`Self::validate_command_execution_for_shell`]
+    /// that an approval can satisfy, so the approval gate can ask instead of the
+    /// runtime handing the model a refusal it cannot act on. Deliberately does NOT
+    /// include the floor — a runtime with no shell access, and the shell tool's own
+    /// forbidden-path scan, refuse whatever the operator says, so asking about them
+    /// would promise a permission that cannot be granted.
+    ///
+    /// Kept beside those checks on purpose: a divergence here would either ask about
+    /// commands that will run anyway, or run commands that were never asked about.
+    pub fn shell_command_needs_operator_approval(&self, command: &str) -> bool {
+        #[cfg(target_os = "windows")]
+        let dialect = ShellDialect::WindowsCmd;
+        #[cfg(not(target_os = "windows"))]
+        let dialect = ShellDialect::Posix;
+
+        self.shell_command_needs_operator_approval_for_shell(command, dialect)
+    }
+
+    /// Dialect-aware form of [`Self::shell_command_needs_operator_approval`].
+    pub fn shell_command_needs_operator_approval_for_shell(
+        &self,
+        command: &str,
+        dialect: ShellDialect,
+    ) -> bool {
+        // Never ask a question whose answer this policy would not honour: with
+        // no route, under full autonomy, or in a dialect whose grammar can hide
+        // the command, `operator_can_override` refuses anyway, so escalating
+        // would only swap a clear refusal for an unanswerable prompt.
+        if !self.operator_can_override(true, dialect) {
+            return false;
+        }
+        if dialect == ShellDialect::None {
+            // The floor: no approval can conjure a shell. Never ask.
+            return false;
+        }
+        if !self.is_command_allowed_for_shell(command, dialect) {
+            return true;
+        }
+        match self.command_risk_level_for_shell(command, dialect) {
+            // High always asks: either the blanket block would refuse it, or the
+            // supervised `!approved` arm would.
+            CommandRiskLevel::High => true,
+            CommandRiskLevel::Medium => self.require_approval_for_medium_risk,
+            CommandRiskLevel::Low => false,
+        }
     }
 
     fn is_command_explicitly_allowed_for_shell(
@@ -3611,6 +3708,7 @@ impl SecurityPolicy {
             max_cost_per_day_cents: runtime.max_cost_per_day_cents,
             require_approval_for_medium_risk: risk_profile.require_approval_for_medium_risk,
             block_high_risk_commands: risk_profile.block_high_risk_commands,
+            operator_approval_route: risk_profile.approval_route.is_some(),
             shell_env_passthrough: risk_profile.shell_env_passthrough.clone(),
             shell_timeout_secs: runtime.shell_timeout_secs,
             allowed_tools: if risk_profile.allowed_tools.is_empty() {
@@ -4293,8 +4391,10 @@ mod tests {
         assert!(p.is_command_allowed("python3 --version"));
         assert!(p.is_command_allowed("/usr/bin/antigravity"));
 
-        // Wildcard still respects risk gates in validate_command_execution.
-        let blocked = p.validate_command_execution("rm -rf /tmp/test", true);
+        // Wildcard still respects risk gates in validate_command_execution: a
+        // blank-cheque allowlist does not make a high-risk command free. Only an
+        // operator approval lifts it (see the escalation tests below).
+        let blocked = p.validate_command_execution("rm -rf /tmp/test", false);
         assert!(blocked.is_err());
         assert!(blocked.unwrap_err().contains("high-risk"));
     }
@@ -4705,9 +4805,119 @@ mod tests {
             ..SecurityPolicy::default()
         };
 
-        let result = p.validate_command_execution("rm -rf /tmp/test", true);
+        let result = p.validate_command_execution("rm -rf /tmp/test", false);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("high-risk"));
+    }
+
+    #[test]
+    fn supervised_operator_approval_lifts_the_high_risk_block() {
+        // The point of routing approvals to the operator: a blocked command
+        // becomes a question, and a person's "yes" runs it. Without that yes it
+        // is still blocked (asserted above).
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            operator_approval_route: true,
+            ..SecurityPolicy::default()
+        };
+
+        assert_eq!(
+            p.validate_command_execution("rm -rf /tmp/test", true)
+                .unwrap(),
+            CommandRiskLevel::High,
+            "an operator who was shown the command and approved it outranks the blanket block"
+        );
+    }
+
+    #[test]
+    fn supervised_operator_approval_lifts_the_allowlist() {
+        // The jq/sort class: a command outside the agent's set is a question for
+        // the operator, not a dead end the model can only report.
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            allowed_commands: vec!["ls".into()],
+            operator_approval_route: true,
+            ..SecurityPolicy::default()
+        };
+
+        let refused = p.validate_command_execution("sort file.txt", false);
+        assert!(refused.is_err());
+        assert!(refused.unwrap_err().contains("not allowed"));
+
+        assert!(
+            p.validate_command_execution("sort file.txt", true).is_ok(),
+            "an operator approval admits a command outside the allowlist"
+        );
+    }
+
+    #[test]
+    fn full_autonomy_approval_does_not_lift_the_allowlist_or_the_block() {
+        // Full autonomy never prompts, so `approved` there carries no human
+        // behind it and must not widen a boundary the operator configured.
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["ls".into()],
+            block_high_risk_commands: true,
+            operator_approval_route: true,
+            ..SecurityPolicy::default()
+        };
+
+        assert!(
+            p.validate_command_execution("sort file.txt", true).is_err(),
+            "auto-approval must not stand in for an operator under full autonomy"
+        );
+
+        let p_wild = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            operator_approval_route: true,
+            ..SecurityPolicy::default()
+        };
+        assert!(
+            p_wild
+                .validate_command_execution("rm -rf /tmp/test", true)
+                .is_err(),
+            "the high-risk block stands under full autonomy"
+        );
+    }
+
+    #[test]
+    fn needs_operator_approval_matches_what_validate_would_refuse() {
+        // These two must agree: a divergence either asks about commands that
+        // would have run anyway, or runs commands nobody was asked about.
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            allowed_commands: vec!["ls".into(), "rm".into()],
+            block_high_risk_commands: true,
+            require_approval_for_medium_risk: true,
+            operator_approval_route: true,
+            ..SecurityPolicy::default()
+        };
+
+        // Outside the allowlist → ask.
+        assert!(p.shell_command_needs_operator_approval("sort file.txt"));
+        // High risk, even though explicitly allowed (supervised still gates it).
+        assert!(p.shell_command_needs_operator_approval("rm -rf /tmp/test"));
+        // Allowed and harmless → never ask.
+        assert!(!p.shell_command_needs_operator_approval("ls -la"));
+
+        // Medium risk follows the profile's own switch.
+        let medium = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            allowed_commands: vec!["touch".into()],
+            require_approval_for_medium_risk: true,
+            operator_approval_route: true,
+            ..SecurityPolicy::default()
+        };
+        assert!(medium.shell_command_needs_operator_approval("touch a.txt"));
+        let medium_off = SecurityPolicy {
+            require_approval_for_medium_risk: false,
+            ..medium
+        };
+        assert!(!medium_off.shell_command_needs_operator_approval("touch a.txt"));
     }
 
     #[test]
@@ -7883,14 +8093,15 @@ mod tests {
     #[test]
     fn wildcard_with_block_high_risk_true_still_blocks() {
         // Ensure the existing safety net is preserved: wildcard + block_high_risk_commands=true
-        // should still block high-risk commands.
+        // should still block high-risk commands. Unapproved is the case that
+        // matters — nothing runs a high-risk command off a wildcard alone.
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             allowed_commands: vec!["*".into()],
             block_high_risk_commands: true,
             ..SecurityPolicy::default()
         };
-        let result = p.validate_command_execution("rm -rf /tmp/test", true);
+        let result = p.validate_command_execution("rm -rf /tmp/test", false);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("high-risk"));
     }

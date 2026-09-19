@@ -201,6 +201,45 @@ tag (`[ACT emotion="playful"]`) reached `/ws/chat` as one chunk just before
 | `crates/zeroclaw-runtime/src/agent/turn/protocol_detect.rs` | `bracket_candidate_is_prose()`: a held `[`/`{` candidate is prose when its first JSON value is a syntax error, or a complete value that is not a known-tool envelope. An incomplete value (serde EOF) and a growing `[tool_call]` opener are not. |
 | `crates/zeroclaw-runtime/src/agent/turn/stream_guard.rs` | `StreamTextGuard::push` releases such a candidate at once. `prose_bracket_tests` cover avatar tags, prose brackets, a suppressed known-tool envelope and an incomplete one. |
 
+### A blocked shell command asks the operator instead of dead-ending
+
+Upstream gives a shell command three ways to be refused, and two of them ignore
+`approved` entirely: a command outside `allowed_commands`, and a high-risk command
+under `block_high_risk_commands`. The model gets a refusal it cannot act on, and
+the operator is never asked — even on a phone that is attached and waiting. The
+third, the medium/high `!approved` arms, never fired here at all, because `shell`
+is in every profile's `auto_approve` and the runtime therefore stamps
+`approved = true` on every shell call (`set_runtime_approved_arg`).
+
+Now a command the policy would refuse is escalated into a real approval prompt and
+put to the operator over the same route `turn_resume` uses. Opt-in and derived, not
+a new knob: it follows `risk_profile.approval_route` being set, so a profile with
+somewhere to ask asks, and every profile without one — plus every shipped preset —
+refuses exactly as before. That is deliberate: `presets::balanced` contracts "a
+hard block, not an approval prompt", and this must not quietly redefine it.
+
+The floor is unchanged and is NOT promptable: a runtime with no shell access, the
+shell tool's own dialect-aware forbidden-path scan (`shell.rs`, which never sees
+`approved`), full autonomy (which never prompts, so `approved` there has no human
+behind it), and PowerShell — whose `--%` stop-parsing token and provider-prefix
+quoting (`E'nv:'PATH`) can hide what a command does from the person approving it.
+An approval is only meaningful if the operator can see what they are approving.
+
+| File | Why |
+|---|---|
+| `crates/zeroclaw-config/src/policy.rs` | `operator_approval_route` on `SecurityPolicy` (set only by `from_profiles`, from `risk_profile.approval_route.is_some()`); `operator_can_override()` gates the allowlist and high-risk-block refusals on it + supervised + non-PowerShell; `shell_command_needs_operator_approval[_for_shell]()` mirrors exactly the refusals an approval can satisfy. |
+| `crates/zeroclaw-runtime/src/approval/mod.rs` | `ApprovalManager` carries the agent's `SecurityPolicy` (`with_shell_policy`) and answers `shell_command_needs_operator()`. `derive_for_risk_profile` deliberately does NOT inherit it — a delegate runs another profile whose `allowed_commands` are not ours. |
+| `crates/zeroclaw-runtime/src/agent/agent.rs` | Attaches the policy to the manager it builds. |
+| `crates/zeroclaw-runtime/src/agent/turn/approval_gate.rs` | Escalates `Approved` → `Prompt` for such a command, and downgrades an `AlwaysApprove` on an escalated call to a one-shot `Yes`, so one tap on a `mkdir` cannot session-allowlist `shell` and pre-approve a later `rm -rf`. |
+
+Conflict note: the escalation in `approval_gate.rs` and the two `operator_can_override`
+calls in `policy.rs` are one mechanism — keep them together. Dropping only the
+escalation while keeping the policy relaxation is the dangerous half: `shell` is
+auto-approved, so every risky command would arrive with `approved = true` and run
+without anyone being asked. Tests pinning this: `supervised_operator_approval_lifts_the_*`,
+`full_autonomy_approval_does_not_lift_the_allowlist_or_the_block`, and
+`needs_operator_approval_matches_what_validate_would_refuse`.
+
 ### Documentation
 
 | File | Why |

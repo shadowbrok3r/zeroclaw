@@ -1805,11 +1805,15 @@ impl Agent {
             None
         };
 
+        // The command policy rides along so the approval gate can turn a command
+        // this agent's shell would refuse into a question for the operator,
+        // instead of a refusal the model can only report back.
         let approval_manager = if approval_backchannel {
             ApprovalManager::for_non_interactive_backchannel(risk_profile)
         } else {
             ApprovalManager::for_non_interactive(risk_profile)
-        };
+        }
+        .with_shell_policy(Arc::clone(&security));
 
         let structured_history_cap_resolver: Arc<dyn Fn() -> usize + Send + Sync> =
             if let Some(cap_config) = live_config {

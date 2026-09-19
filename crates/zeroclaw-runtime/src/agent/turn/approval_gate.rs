@@ -28,6 +28,30 @@ pub(crate) async fn gate_tool_approval(
         .approval
         .map(|mgr| mgr.approval_requirement(tool_name))
         .unwrap_or(ApprovalRequirement::NotRequired);
+
+    // A shell command the agent's own policy would refuse — outside its
+    // allowlist, or high/medium risk — is put to the operator instead of being
+    // refused outright, so a request that is merely unusual can be allowed by a
+    // person rather than dead-ending in the model's transcript.
+    //
+    // Deliberately NOT conditional on a channel existing: with no approval route
+    // the flow below finds the request unanswerable and denies, which is exactly
+    // the refusal this replaced. That also closes the hole the alternative would
+    // open — `shell` sits in `auto_approve` for every profile, so without this
+    // escalation the runtime would stamp `approved = true` on a risky command and
+    // the policy, which now lets an operator override, would let it run unasked.
+    let escalated_command = approval_requirement == ApprovalRequirement::Approved
+        && tool_name == "shell"
+        && ctx.approval.is_some_and(|mgr| {
+            tool_args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .is_some_and(|command| mgr.shell_command_needs_operator(command))
+        });
+    if escalated_command {
+        approval_requirement = ApprovalRequirement::Prompt;
+    }
+
     if let Some(mgr) = ctx.approval
         && approval_requirement == ApprovalRequirement::Prompt
     {
@@ -90,8 +114,17 @@ pub(crate) async fn gate_tool_approval(
                 Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve) => {
                     ApprovalResponse::Yes
                 }
+                // "Always" allowlists the TOOL for the session, so on an escalated
+                // command it would silently pre-approve every later risky command
+                // too — one tap on a `mkdir` covering an `rm -rf` an hour later.
+                // The operator answered about this command, so it approves this
+                // command.
                 Some(zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove) => {
-                    ApprovalResponse::Always
+                    if escalated_command {
+                        ApprovalResponse::Yes
+                    } else {
+                        ApprovalResponse::Always
+                    }
                 }
                 Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny) => ApprovalResponse::No,
                 Some(zeroclaw_api::channel::ChannelApprovalResponse::DenyWithEdit {
