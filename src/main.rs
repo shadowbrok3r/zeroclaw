@@ -3812,6 +3812,11 @@ enum MemoryCommands {
         /// Delete a single entry by key (supports prefix match)
         #[arg(long)]
         key: Option<String>,
+        /// Restrict `--key` to one agent's row. Rows are per agent and a
+        /// shared key (e.g. `user_msg`) exists once per agent, so without
+        /// this the key must be held by exactly one agent.
+        #[arg(long)]
+        agent: Option<String>,
         #[arg(long)]
         category: Option<String>,
         /// Skip confirmation prompt

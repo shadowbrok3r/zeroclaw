@@ -48,9 +48,12 @@ pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> 
         } => handle_list(config, category, session, limit, offset).await,
         crate::MemoryCommands::Get { key } => handle_get(config, &key).await,
         crate::MemoryCommands::Stats => handle_stats(config).await,
-        crate::MemoryCommands::Clear { key, category, yes } => {
-            handle_clear(config, key, category, yes).await
-        }
+        crate::MemoryCommands::Clear {
+            key,
+            agent,
+            category,
+            yes,
+        } => handle_clear(config, key, agent, category, yes).await,
         crate::MemoryCommands::Reindex => handle_reindex(config).await,
     }
 }
@@ -315,6 +318,7 @@ fn unsupported_clear_backend_message(backend: &str) -> String {
 async fn handle_clear(
     config: &Config,
     key: Option<String>,
+    agent: Option<String>,
     category: Option<String>,
     yes: bool,
 ) -> Result<()> {
@@ -329,7 +333,7 @@ async fn handle_clear(
 
     // Single-key deletion (exact or prefix match).
     if let Some(key) = key {
-        return handle_clear_key(&*mem, &key, yes).await;
+        return handle_clear_key(&*mem, &key, agent.as_deref(), yes).await;
     }
 
     // Batch deletion by category (or all).
@@ -379,7 +383,12 @@ async fn handle_clear(
 }
 
 /// Delete a single entry by exact key or prefix match.
-async fn handle_clear_key(mem: &dyn Memory, key: &str, yes: bool) -> Result<()> {
+async fn handle_clear_key(
+    mem: &dyn Memory,
+    key: &str,
+    agent: Option<&str>,
+    yes: bool,
+) -> Result<()> {
     // Resolve the target key (exact match or unique prefix).
     let target = if mem.get(key).await?.is_some() {
         key.to_string()
@@ -427,15 +436,83 @@ async fn handle_clear_key(mem: &dyn Memory, key: &str, yes: bool) -> Result<()> 
         }
     };
 
-    if !yes {
-        let confirmed = dialoguer::Confirm::new()
-            .with_prompt(format!("  Delete '{target}'?"))
-            .default(false)
-            .interact()?;
-        if !confirmed {
-            println!("{}", mt("cli-memory-aborted", "Aborted."));
+    // A key does not identify a row. Memories are per agent and a shared key
+    // (`user_msg` — each agent's last message) exists once per agent, while
+    // `Memory::forget` deletes EVERY row matching the key by contract. Deleting
+    // without naming an agent would therefore take siblings the caller never
+    // saw, and `memory get` shows only the first match, so nothing on screen
+    // hints that more exist. Resolve who actually holds the key first.
+    let holders: Vec<(Option<String>, Option<String>)> = mem
+        .list(None, None)
+        .await?
+        .into_iter()
+        .filter(|entry| entry.key == target)
+        .map(|entry| (entry.agent_alias, entry.agent_id))
+        .collect();
+
+    if let Some(alias) = agent {
+        let Some((_, agent_id)) = holders
+            .iter()
+            .find(|(held_by, _)| held_by.as_deref() == Some(alias))
+        else {
+            println!(
+                "{}",
+                mt_args(
+                    "cli-memory-key-not-held-by-agent",
+                    &[("key", &target), ("agent", alias)],
+                    "No entry for that key under that agent"
+                )
+            );
+            print_key_holders(&holders);
+            return Ok(());
+        };
+        // An unattributed row cannot be addressed by agent: scoping it would
+        // silently fall back to deleting every sibling.
+        let Some(agent_id) = agent_id.as_deref() else {
+            bail!(
+                "Backend does not attribute '{target}' to an agent, so --agent cannot target it safely."
+            );
+        };
+
+        if !confirm_delete(&format!("  Delete '{target}' for agent '{alias}'?"), yes)? {
             return Ok(());
         }
+        if mem.forget_for_agent(&target, agent_id).await? {
+            println!(
+                "{} {}",
+                style("✓").green().bold(),
+                mt_args(
+                    "cli-memory-deleted-key-for-agent",
+                    &[("key", &target), ("agent", alias)],
+                    "Deleted key for agent"
+                )
+            );
+        }
+        return Ok(());
+    }
+
+    if holders.len() > 1 {
+        println!(
+            "{}\n",
+            mt_args(
+                "cli-memory-key-held-by-many",
+                &[("key", &target), ("n", &holders.len().to_string())],
+                "That key is held by more than one agent; refusing to delete all of them"
+            )
+        );
+        print_key_holders(&holders);
+        println!(
+            "\n{}",
+            mt(
+                "cli-memory-name-an-agent",
+                "Pass --agent <alias> to delete one agent's row."
+            )
+        );
+        return Ok(());
+    }
+
+    if !confirm_delete(&format!("  Delete '{target}'?"), yes)? {
+        return Ok(());
     }
 
     if mem.forget(&target).await? {
@@ -447,6 +524,31 @@ async fn handle_clear_key(mem: &dyn Memory, key: &str, yes: bool) -> Result<()> 
     }
 
     Ok(())
+}
+
+/// List which agents hold a key, so a refusal says who would have been hit.
+fn print_key_holders(holders: &[(Option<String>, Option<String>)]) {
+    for (alias, agent_id) in holders {
+        let shown = alias
+            .clone()
+            .or_else(|| agent_id.clone())
+            .unwrap_or_else(|| "(unattributed)".to_string());
+        println!("- {}", style(shown).white().bold());
+    }
+}
+
+fn confirm_delete(prompt: &str, yes: bool) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    let confirmed = dialoguer::Confirm::new()
+        .with_prompt(prompt)
+        .default(false)
+        .interact()?;
+    if !confirmed {
+        println!("{}", mt("cli-memory-aborted", "Aborted."));
+    }
+    Ok(confirmed)
 }
 
 fn parse_category(s: &str) -> MemoryCategory {
@@ -511,6 +613,88 @@ mod tests {
         assert_eq!(truncate_content("", 10), "");
     }
 
+    /// Two agents, one shared key — the shape that makes an unscoped delete
+    /// destructive. `user_msg` is a real example: every agent has one.
+    async fn two_agents_sharing_user_msg(config: &Config) -> Box<dyn Memory> {
+        let mem = create_cli_memory(config).unwrap();
+        for (alias, content) in [("comfy", "a real request"), ("coder", "a probe prompt")] {
+            let agent = mem.ensure_agent_uuid(alias).await.unwrap();
+            mem.store_with_agent(
+                "user_msg",
+                content,
+                MemoryCategory::Conversation,
+                None,
+                None,
+                None,
+                Some(&agent),
+            )
+            .await
+            .unwrap();
+        }
+        mem
+    }
+
+    async fn user_msg_rows(mem: &dyn Memory) -> Vec<super::super::traits::MemoryEntry> {
+        mem.list(None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.key == "user_msg")
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn clear_by_key_refuses_when_more_than_one_agent_holds_it() {
+        // `Memory::forget` deletes every row matching the key by contract, so
+        // without an agent this would take both rows while the operator, who
+        // saw one entry in `memory get`, believes they are deleting one thing.
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.data_dir = tmp.path().to_path_buf();
+        let mem = two_agents_sharing_user_msg(&config).await;
+
+        handle_clear_key(&*mem, "user_msg", None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            user_msg_rows(&*mem).await.len(),
+            2,
+            "an ambiguous key must delete nothing at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_by_key_with_agent_deletes_only_that_agents_row() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.data_dir = tmp.path().to_path_buf();
+        let mem = two_agents_sharing_user_msg(&config).await;
+
+        handle_clear_key(&*mem, "user_msg", Some("coder"), true)
+            .await
+            .unwrap();
+
+        let rows = user_msg_rows(&*mem).await;
+        assert_eq!(rows.len(), 1, "the sibling row must survive");
+        assert_eq!(rows[0].agent_alias.as_deref(), Some("comfy"));
+        assert!(rows[0].content.contains("a real request"));
+    }
+
+    #[tokio::test]
+    async fn clear_by_key_for_an_agent_that_does_not_hold_it_deletes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.data_dir = tmp.path().to_path_buf();
+        let mem = two_agents_sharing_user_msg(&config).await;
+
+        handle_clear_key(&*mem, "user_msg", Some("voice"), true)
+            .await
+            .unwrap();
+
+        assert_eq!(user_msg_rows(&*mem).await.len(), 2);
+    }
+
     #[tokio::test]
     async fn clear_rejects_append_only_markdown_backend() {
         let tmp = TempDir::new().unwrap();
@@ -521,6 +705,7 @@ mod tests {
         let err = handle_command(
             crate::MemoryCommands::Clear {
                 key: None,
+                agent: None,
                 category: None,
                 yes: true,
             },
@@ -545,6 +730,7 @@ mod tests {
         let err = handle_command(
             crate::MemoryCommands::Clear {
                 key: None,
+                agent: None,
                 category: None,
                 yes: true,
             },
@@ -567,6 +753,7 @@ mod tests {
         let err = handle_command(
             crate::MemoryCommands::Clear {
                 key: None,
+                agent: None,
                 category: None,
                 yes: true,
             },

@@ -553,6 +553,10 @@ cli-memory-none-to-clear = No entries to clear.
 cli-memory-found-in-scope = Found {$count} entries in '{$scope}'.
 cli-memory-aborted = Aborted.
 cli-memory-deleted-key = Deleted key: {$key}
+cli-memory-deleted-key-for-agent = Deleted key: {$key} (agent {$agent})
+cli-memory-key-held-by-many = '{$key}' is held by {$n} agents. Refusing to delete all of them:
+cli-memory-key-not-held-by-agent = No entry for key '{$key}' under agent '{$agent}'. Held by:
+cli-memory-name-an-agent = Pass --agent <alias> to delete one agent's row.
 
 # ── cron (zeroclaw cron) ──
 cli-cron-none = No scheduled tasks yet.
