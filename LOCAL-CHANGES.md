@@ -225,6 +225,44 @@ behind it), and PowerShell — whose `--%` stop-parsing token and provider-prefi
 quoting (`E'nv:'PATH`) can hide what a command does from the person approving it.
 An approval is only meaningful if the operator can see what they are approving.
 
+The escalation also refuses, rather than asks, when a command hides its target
+behind `$`, a backtick (or `%` under cmd). Found the hard way on 2026-09-19: the
+path scan matches path-SHAPED arguments, so `F="/tmp/x" && printf ok > "$F"` looks
+like an assignment token and an indirection, not a path. It reported nothing at
+escalation time and again at execution time, and an approved run wrote outside
+the workspace.
+
+That rule lives in `operator_can_override`, and it must live there and nowhere
+else. Putting it in `shell_command_needs_operator_approval_for_shell` instead is
+the obvious-looking move and it is wrong: that function only decides whether to
+ASK. Returning `false` from it means "no approval needed", not "refuse" — the
+refusals are lifted by `operator_can_override`, which would still know nothing
+about the command. A rule added to the asking side alone therefore removes the
+prompt and leaves the command running, with nobody asked. That was measured on
+the live daemon, not theorised: the probe above ran to completion with no
+approval_request on the socket, and an in-workspace `D="…" && rm -rf "$D"`
+deleted the directory the same silent way — strictly worse than the laundering
+the rule was written to stop.
+
+Two consequences worth keeping. Not asking is only safe when it means refusing,
+so both halves must consult one predicate; and the regression test asserts the
+refusal, not merely the absence of a modal, because a test that checks only for
+"no prompt" passes happily while the command executes.
+
+**The underlying scan is still blind to indirection** — hardening it to resolve
+assignments and expansions would change execution for every agent, not just the
+routed ones, and is deliberately left as separate work.
+
+Variable indirection is its one proven blind spot, and probing the live daemon on
+2026-09-19 mapped the edge: a relative escape (`> ../../../../../../tmp/x`), split
+quoting (`> "/tm""p/x"`) and a glob (`> /tm?/x`) are all caught by the scan and
+refused without a modal, so it resolves traversal and treats a quote-split or
+globbed token as path-shaped. Every hidden-target shape tried — `"$F"`, `` ` ` ``
+and `$(…)` — now fails closed with a refusal rather than silence, and the ordinary
+escalations still ask: a literal `rm -rf <workspace>/…` prompts and runs when
+approved, and a long literal command prompts, survives a socket drop and
+reconnect, and records a decline as the operator's.
+
 Because those refusals stand regardless, nothing that hits them is escalated —
 asking spends a person's attention on a question whose answer cannot be honoured.
 That includes the path floor, which is easy to under-estimate: `workspace_only`

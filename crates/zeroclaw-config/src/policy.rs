@@ -2335,7 +2335,7 @@ impl SecurityPolicy {
         // refusal it cannot act on. See [`Self::operator_can_override`] for why
         // this cannot be satisfied by the runtime auto-approving the tool.
         if !self.is_command_allowed_for_shell(command, dialect)
-            && !self.operator_can_override(approved, dialect)
+            && !self.operator_can_override(command, approved, dialect)
         {
             return Err(format!("Command not allowed by security policy: {command}"));
         }
@@ -2349,7 +2349,7 @@ impl SecurityPolicy {
             // forbidden-path scan, never consult `approved` and still refuse.
             if self.block_high_risk_commands
                 && !self.is_command_explicitly_allowed_for_shell(command, dialect)
-                && !self.operator_can_override(approved, dialect)
+                && !self.operator_can_override(command, approved, dialect)
             {
                 return Err("Command blocked: high-risk command is disallowed by policy".into());
             }
@@ -2398,16 +2398,46 @@ impl SecurityPolicy {
     /// supervised mode a flagged command reaching here with `approved == true` was
     /// answered by a person. Full autonomy never prompts, so there `approved` carries
     /// no human behind it and must not open a boundary the operator configured.
-    fn operator_can_override(&self, approved: bool, dialect: ShellDialect) -> bool {
-        // PowerShell is excluded on purpose. Its stop-parsing token (`--%`) and
-        // provider-prefix quoting (`E'nv:'PATH`) can hide what a command really
-        // does from the person being asked, and an approval is only meaningful
-        // if the operator can see what they are approving. Those forms stay
-        // refused outright rather than becoming a prompt that launders them.
+    ///
+    /// Takes the command because one predicate has to govern both halves: every
+    /// refusal an approval can lift is a refusal
+    /// [`Self::shell_command_needs_operator_approval_for_shell`] asks about, and
+    /// every command it cannot lift stays refused. Keeping the two rules in one
+    /// place is not tidiness. When a rule was added to the asking side alone
+    /// (2026-09-19), a command matching it stopped being escalated while its
+    /// refusal was still being lifted here — so it ran with nobody asked, which
+    /// is strictly worse than the laundering the rule was written to stop.
+    /// Measured on the live daemon the same day. Add a rule here, not there.
+    fn operator_can_override(&self, command: &str, approved: bool, dialect: ShellDialect) -> bool {
         approved
             && self.operator_approval_route
             && self.autonomy == AutonomyLevel::Supervised
-            && dialect != ShellDialect::PowerShell
+            && !Self::command_hides_its_target(command, dialect)
+    }
+
+    /// Whether the command's own grammar can hide what it acts on from the
+    /// person being asked to approve it.
+    ///
+    /// PowerShell qualifies whole: its stop-parsing token (`--%`) and
+    /// provider-prefix quoting (`E'nv:'PATH`) can rewrite what a command does
+    /// after the operator has read it. Elsewhere it is expansion —
+    /// `F="/tmp/x" && printf ok > "$F"` keeps its path in a variable, so
+    /// [`Self::forbidden_workspace_path_argument_for_shell`] sees an assignment
+    /// token and an indirection, not a path, and reports nothing at escalation
+    /// time AND again at execution time. Measured 2026-09-19 on the live
+    /// gateway: approving exactly that wrote outside the workspace.
+    ///
+    /// An approval is only meaningful if the operator can see what they are
+    /// approving, and a floor that cannot resolve the target cannot enforce it,
+    /// so these stay refused instead of becoming a prompt that launders them.
+    /// Hardening the scan to resolve assignments and expansions is a separate,
+    /// larger job: it would change execution for every agent, not just the ones
+    /// with an approval route.
+    fn command_hides_its_target(command: &str, dialect: ShellDialect) -> bool {
+        dialect == ShellDialect::PowerShell
+            || command.contains('$')
+            || command.contains('`')
+            || (dialect == ShellDialect::WindowsCmd && command.contains('%'))
     }
 
     /// Whether this shell command should be put to an operator before it runs.
@@ -2437,10 +2467,11 @@ impl SecurityPolicy {
         dialect: ShellDialect,
     ) -> bool {
         // Never ask a question whose answer this policy would not honour: with
-        // no route, under full autonomy, or in a dialect whose grammar can hide
-        // the command, `operator_can_override` refuses anyway, so escalating
-        // would only swap a clear refusal for an unanswerable prompt.
-        if !self.operator_can_override(true, dialect) {
+        // no route, under full autonomy, or when the command's grammar can hide
+        // its target, `operator_can_override` refuses anyway, so escalating
+        // would only swap a clear refusal for an unanswerable prompt. Asking the
+        // SAME predicate is what keeps "not asked" and "refused" the same set.
+        if !self.operator_can_override(command, true, dialect) {
             return false;
         }
         if dialect == ShellDialect::None {
@@ -2462,6 +2493,9 @@ impl SecurityPolicy {
         {
             return false;
         }
+        // A command whose grammar hides its target is handled by
+        // `operator_can_override` above — deliberately NOT repeated here, because
+        // repeating it is exactly how the two halves drifted apart once.
         if !self.is_command_allowed_for_shell(command, dialect) {
             return true;
         }
@@ -4932,6 +4966,99 @@ mod tests {
         assert!(
             p.shell_command_needs_operator_approval(&inside),
             "a high-risk command the operator could actually release must still ask: {inside}"
+        );
+    }
+
+    #[test]
+    fn a_command_that_hides_its_target_is_refused_and_not_asked_about() {
+        // Regression for a real escape, found 2026-09-19 on the live gateway:
+        // `F="/tmp/zc-floor-probe.txt" && printf ok > "$F"` was escalated, an
+        // operator approved it, and it wrote outside the workspace. The path
+        // scan reports nothing for it — an assignment token and an indirection
+        // are not path-shaped — so the floor the approval leans on was not
+        // actually there.
+        //
+        // BOTH halves are asserted here, and the second one is the point. The
+        // first version of this fix only stopped the ASKING, and a gate
+        // returning false means "no approval needed", not "refuse": the
+        // allowlist refusal was still being lifted, so the command ran with
+        // nobody asked — strictly worse than the laundering it was closing.
+        // A test that only checks for the absence of a modal passes happily
+        // while the command executes. Always assert the refusal too.
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            allowed_commands: vec!["printf".into(), "cat".into()],
+            operator_approval_route: true,
+            workspace_only: true,
+            allowed_roots: vec![],
+            workspace_dir: tp_ws(),
+            ..SecurityPolicy::default()
+        };
+
+        let hidden = format!("F=\"{}\" && printf ok > \"$F\"", tp_outside1());
+        assert!(
+            !p.shell_command_needs_operator_approval(&hidden),
+            "a variable-hidden path must not raise a modal: {hidden}"
+        );
+        assert!(
+            p.validate_command_execution(&hidden, true).is_err(),
+            "not asking must mean REFUSED, not permitted — even with approved=true: {hidden}"
+        );
+        assert!(
+            !p.shell_command_needs_operator_approval("cat `cat /etc/hostname`"),
+            "command substitution hides its target too"
+        );
+        assert!(
+            !p.shell_command_needs_operator_approval("printf ok > $(echo /tmp/x)"),
+            "$() hides its target too"
+        );
+
+        // A plain command with a resolvable target is unaffected — this is the
+        // case the whole feature exists for.
+        assert!(
+            p.shell_command_needs_operator_approval("sort -u notes.txt"),
+            "an ordinary command outside the allowlist must still ask"
+        );
+
+        // The high-risk block is the other refusal an approval can lift, and it
+        // went the same way: measured on the live daemon, an in-workspace
+        // `D="…" && rm -rf "$D"` deleted the directory with no prompt at all.
+        // The command is allowlisted, so only `block_high_risk_commands` stands
+        // between it and execution.
+        let workspace = tp_ws();
+        let risky = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            allowed_commands: vec!["rm".into()],
+            block_high_risk_commands: true,
+            operator_approval_route: true,
+            workspace_only: true,
+            allowed_roots: vec![],
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+        let hidden_rm = format!(
+            "D=\"{}\" && rm -rf \"$D\"",
+            workspace.join("zc-test-dir").display()
+        );
+        assert!(
+            !risky.shell_command_needs_operator_approval(&hidden_rm),
+            "a variable-hidden rm must not raise a modal: {hidden_rm}"
+        );
+        assert!(
+            risky.validate_command_execution(&hidden_rm, true).is_err(),
+            "the high-risk block must still refuse it with approved=true: {hidden_rm}"
+        );
+
+        // Spelled out literally, the same command is exactly what the prompt is
+        // for: asked, and lifted by an approval.
+        let plain_rm = format!("rm -rf {}", workspace.join("zc-test-dir").display());
+        assert!(
+            risky.shell_command_needs_operator_approval(&plain_rm),
+            "a resolvable high-risk target must still ask: {plain_rm}"
+        );
+        assert!(
+            risky.validate_command_execution(&plain_rm, true).is_ok(),
+            "and must run once approved: {plain_rm}"
         );
     }
 
