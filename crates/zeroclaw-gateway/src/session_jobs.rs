@@ -13,7 +13,11 @@ use tokio::io::AsyncReadExt;
 
 const MAX_REPLY: usize = 2 * 1024 * 1024;
 
-fn authorize(state: &AppState, headers: &HeaderMap, id: &str) -> Result<String, StatusCode> {
+pub(crate) fn authorize(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+) -> Result<String, StatusCode> {
     let paired = api::extract_bearer_token(headers).is_some_and(|token| {
         !token.is_empty()
             && state
@@ -185,7 +189,9 @@ async fn run(
     run_args(exe, &args).await
 }
 
-async fn run_args(exe: &FsPath, args: &[String]) -> Result<Value, String> {
+/// Shared with `session_experiments`: the same no-shell, capped-output,
+/// JSON-on-stdout contract serves both helpers.
+pub(crate) async fn run_args(exe: &FsPath, args: &[String]) -> Result<Value, String> {
     let mut cmd = tokio::process::Command::new(exe);
     cmd.args(args)
         .stdin(Stdio::null())

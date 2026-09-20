@@ -40,6 +40,7 @@ pub mod openapi;
 mod render_delivery;
 pub mod security_headers;
 pub(crate) mod session_events;
+mod session_experiments;
 mod session_jobs;
 mod session_media;
 pub mod session_queue;
@@ -1958,6 +1959,8 @@ pub async fn run_gateway(
         .route("/api/sessions/{id}/jobs", get(session_jobs::list))
         .route("/api/sessions/{id}/jobs/{job}/cancel", post(session_jobs::cancel))
         .route("/api/sessions/{id}/jobs/{job}/outputs/{index}", get(session_jobs::output))
+        .route("/api/sessions/{id}/experiments", get(session_experiments::list))
+        .route("/api/sessions/{id}/experiments/{name}/pick", post(session_experiments::pick))
         .route("/api/sessions/{id}/abort", post(api::handle_api_session_abort))
         // ── Pairing + Device management API ──
         .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))
