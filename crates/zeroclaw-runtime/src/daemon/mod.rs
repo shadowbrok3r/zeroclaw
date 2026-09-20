@@ -696,6 +696,27 @@ pub async fn run(
         )
         .ok();
 
+        // Free sessions whose turn died with the previous process. Nothing
+        // will ever write their terminal state, so without this the stored
+        // state says `running` forever: the app shows the session busy, locks
+        // the composer, and `abort` answers `no_active_response` because there
+        // is no turn to stop. A restart landing mid-turn is enough to cause
+        // it, and restarts are routine. Logged per session, because the next
+        // person debugging odd session behaviour needs to know this happened.
+        if let Some(backend) = session_backend.as_ref() {
+            for (session_key, turn_id) in backend.reclaim_orphaned_running(chrono::Utc::now()) {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "session_key": session_key,
+                            "orphaned_turn_id": turn_id,
+                        })),
+                    "Session reclaimed at boot: its turn did not survive the last process"
+                );
+            }
+        }
+
         // Wire the memory subsystem so `memory/list` and `memory/search`
         // work over RPC transports (same pattern as the gateway).
         let rpc_memory: Option<std::sync::Arc<dyn zeroclaw_api::memory_traits::Memory>> = if config

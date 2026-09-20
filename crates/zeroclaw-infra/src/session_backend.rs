@@ -313,6 +313,27 @@ pub trait SessionBackend: Send + Sync {
     fn list_stuck_sessions(&self, _threshold_secs: u64) -> Vec<SessionMetadata> {
         Vec::new()
     }
+
+    /// Reset rows left in `running` by a turn that cannot still be live, and
+    /// return the `(session_key, orphaned_turn_id)` pairs reconciled.
+    ///
+    /// A turn is unrecoverable once the process running it is gone: nothing
+    /// will ever write its terminal state, so the row claims `running`
+    /// forever and every state poll faithfully repeats it. Callers pass their
+    /// own start instant, and only rows whose `turn_started_at` precedes it
+    /// are touched — a turn from before this process cannot be running in it.
+    /// That scoping matters when more than one process shares the store: a
+    /// blanket reset would strand a live turn belonging to someone else.
+    ///
+    /// Only a long-running server should call this. A short-lived CLI shares
+    /// the same store, and its "before my start" window would cover turns the
+    /// daemon is actively running.
+    fn reclaim_orphaned_running(
+        &self,
+        _process_start: DateTime<Utc>,
+    ) -> Vec<(String, Option<String>)> {
+        Vec::new()
+    }
 }
 
 /// Resolve a caller-supplied session id to the full stored session key.

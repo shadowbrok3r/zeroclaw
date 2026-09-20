@@ -1371,6 +1371,46 @@ impl SessionBackend for SqliteSessionBackend {
         rows.filter_map(|r| r.ok()).collect()
     }
 
+    fn reclaim_orphaned_running(
+        &self,
+        process_start: DateTime<Utc>,
+    ) -> Vec<(String, Option<String>)> {
+        let conn = self.conn.lock();
+        let cutoff = process_start.to_rfc3339();
+        // A `running` row with no `turn_started_at` is already inconsistent —
+        // `set_session_state` always stamps one — so it cannot be shown to
+        // belong to a live turn either, and is reclaimed on the same terms.
+        const ORPHANED: &str =
+            "state = 'running' AND (turn_started_at IS NULL OR turn_started_at < ?1)";
+
+        let orphaned: Vec<(String, Option<String>)> = {
+            let sql = format!("SELECT session_key, turn_id FROM session_metadata WHERE {ORPHANED}");
+            let Ok(mut stmt) = conn.prepare(&sql) else {
+                return Vec::new();
+            };
+            let Ok(rows) = stmt.query_map(params![cutoff], |row| Ok((row.get(0)?, row.get(1)?)))
+            else {
+                return Vec::new();
+            };
+            rows.filter_map(Result::ok).collect()
+        };
+
+        if orphaned.is_empty() {
+            return orphaned;
+        }
+
+        let sql = format!(
+            "UPDATE session_metadata
+             SET state = 'idle', turn_id = NULL, turn_started_at = NULL
+             WHERE {ORPHANED}"
+        );
+        if conn.execute(&sql, params![cutoff]).is_err() {
+            // Report nothing rather than claim a reconcile that did not land.
+            return Vec::new();
+        }
+        orphaned
+    }
+
     fn list_stuck_sessions(&self, threshold_secs: u64) -> Vec<SessionMetadata> {
         let conn = self.conn.lock();
         #[allow(clippy::cast_possible_wrap)]
@@ -2951,6 +2991,76 @@ mod tests {
         let state = backend.get_session_state("s1").unwrap().unwrap();
         assert_eq!(state.state, "error");
         assert_eq!(state.turn_id.as_deref(), Some("turn-1"));
+    }
+
+    #[test]
+    fn reclaim_frees_a_turn_that_died_with_the_previous_process() {
+        // The live failure, 2026-09-20: a restart landed mid-turn, the row
+        // kept saying `running`, the app locked the composer, and `abort`
+        // answered `no_active_response` because no turn existed to stop.
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend
+            .append("gw_orphan", &ChatMessage::user("a"))
+            .unwrap();
+        backend
+            .set_session_state("gw_orphan", "running", Some("turn-that-died"))
+            .unwrap();
+
+        // "This process started after that turn began" — i.e. a restart.
+        let reclaimed = backend.reclaim_orphaned_running(Utc::now());
+
+        assert_eq!(
+            reclaimed,
+            vec![("gw_orphan".to_string(), Some("turn-that-died".to_string()))],
+            "the reconcile must name the session and the turn it freed"
+        );
+        let state = backend.get_session_state("gw_orphan").unwrap().unwrap();
+        assert_eq!(state.state, "idle");
+        assert!(state.turn_id.is_none(), "a freed turn keeps no id");
+    }
+
+    #[test]
+    fn reclaim_leaves_a_turn_that_started_after_this_process_began() {
+        // The multi-process guard: a turn begun after our start belongs to a
+        // live process, and a blanket reset would strand it mid-flight.
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let process_start = Utc::now() - chrono::Duration::seconds(60);
+
+        backend.append("gw_live", &ChatMessage::user("a")).unwrap();
+        backend
+            .set_session_state("gw_live", "running", Some("turn-in-flight"))
+            .unwrap();
+
+        assert!(
+            backend.reclaim_orphaned_running(process_start).is_empty(),
+            "a turn newer than this process must be left alone"
+        );
+        assert_eq!(
+            backend.get_session_state("gw_live").unwrap().unwrap().state,
+            "running"
+        );
+    }
+
+    #[test]
+    fn reclaim_leaves_idle_and_errored_sessions_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("gw_idle", &ChatMessage::user("a")).unwrap();
+        backend.append("gw_err", &ChatMessage::user("b")).unwrap();
+        backend
+            .set_session_state("gw_err", "error", Some("turn-err"))
+            .unwrap();
+
+        assert!(backend.reclaim_orphaned_running(Utc::now()).is_empty());
+        assert_eq!(
+            backend.get_session_state("gw_err").unwrap().unwrap().state,
+            "error",
+            "an error state is a recorded outcome, not an orphan"
+        );
     }
 
     #[test]
