@@ -886,13 +886,13 @@ pub(crate) fn persist_manual_run_result(
     status: &str,
     output: Option<&str>,
     duration_ms: i64,
-) -> Result<()> {
+) -> Result<i64> {
     let bounded_output = output.map(truncate_cron_output);
 
     with_initialized_connection(config, |conn| {
         let tx = conn.unchecked_transaction()?;
 
-        insert_run_and_prune(
+        let run_id = insert_run_and_prune(
             &tx,
             config,
             &job.id,
@@ -913,7 +913,7 @@ pub(crate) fn persist_manual_run_result(
 
         tx.commit()
             .context("Failed to commit manual cron run result transaction")?;
-        Ok(())
+        Ok(run_id)
     })
 }
 
@@ -928,13 +928,13 @@ pub(crate) fn persist_run_result(
     output: Option<&str>,
     duration_ms: i64,
     action: RunCompletionAction,
-) -> Result<()> {
+) -> Result<i64> {
     let bounded_output = output.map(truncate_cron_output);
 
     with_initialized_connection(config, |conn| {
         let tx = conn.unchecked_transaction()?;
 
-        insert_run_and_prune(
+        let run_id = insert_run_and_prune(
             &tx,
             config,
             &job.id,
@@ -956,7 +956,7 @@ pub(crate) fn persist_run_result(
 
         tx.commit()
             .context("Failed to commit cron run result transaction")?;
-        Ok(())
+        Ok(run_id)
     })
 }
 
@@ -983,7 +983,7 @@ fn insert_run_and_prune(
     status: &str,
     output: Option<&str>,
     duration_ms: i64,
-) -> Result<()> {
+) -> Result<i64> {
     conn.execute(
         "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -997,6 +997,11 @@ fn insert_run_and_prune(
         ],
     )
     .context("Failed to insert cron run")?;
+
+    // The row the run landed on. A `cron_result` frame carries this id so a
+    // live event can be matched against `/api/cron/{id}/runs` rather than
+    // guessed at by timestamp.
+    let run_id = conn.last_insert_rowid();
 
     let keep = i64::from(config.scheduler.max_run_history.max(1));
     conn.execute(
@@ -1012,7 +1017,7 @@ fn insert_run_and_prune(
     )
     .context("Failed to prune cron run history")?;
 
-    Ok(())
+    Ok(run_id)
 }
 
 fn apply_last_run_state(

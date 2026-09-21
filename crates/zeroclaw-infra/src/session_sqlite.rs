@@ -68,7 +68,15 @@ impl SqliteSessionBackend {
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA temp_store = MEMORY;
-             PRAGMA mmap_size = 4194304;",
+             PRAGMA mmap_size = 4194304;
+             -- WAL keeps readers out of a writer's way, but two writers still
+             -- collide, and the default busy timeout is zero: the loser gets
+             -- `database is locked` on the spot rather than waiting. More than
+             -- one connection writes this store -- the gateway's own turns, a
+             -- `zeroclaw sessions` CLI in another process, and a cron delivery
+             -- writing a run into a session -- so a few seconds of patience is
+             -- the difference between a queued write and a lost one.
+             PRAGMA busy_timeout = 5000;",
         )?;
 
         conn.execute_batch(

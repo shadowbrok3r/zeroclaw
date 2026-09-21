@@ -627,6 +627,10 @@ pub async fn handle_api_cron_run(
     Json(serde_json::json!({
         "status": result.status,
         "job_id": result.job_id,
+        // The row this run landed on, so a client can open it in
+        // `/api/cron/{id}/runs` without matching on timestamps. `null` when
+        // persisting the history row failed — the run itself still happened.
+        "run_id": result.run_id,
         "success": result.success,
         "output": result.output,
         "duration_ms": result.duration_ms,

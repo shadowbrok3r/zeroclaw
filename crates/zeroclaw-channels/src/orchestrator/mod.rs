@@ -13185,6 +13185,102 @@ pub async fn start_channels(
     Ok(())
 }
 
+/// Is this delivery bound for a gateway session rather than a chat platform?
+fn is_app_delivery_channel(channel: &str) -> bool {
+    channel
+        .split_once('.')
+        .map_or(channel, |(channel_type, _)| channel_type)
+        .eq_ignore_ascii_case("app")
+}
+
+/// Write a cron announcement into a gateway session, where the phone app
+/// already lists it.
+///
+/// `app.<agent alias>` names the agent that owns the session, and the alias is
+/// not decoration: `/api/sessions` drops a row that has neither an agent nor a
+/// channel, and the app filters what is left by the alias its machine entry is
+/// set to. A session stamped with the wrong alias is invisible rather than
+/// misfiled, so an unknown alias is an error here instead of a silent write.
+/// `target` is the session id — an id that already exists is appended to,
+/// whatever prefix it is stored under.
+async fn deliver_to_app_session(
+    config: &zeroclaw_config::schema::Config,
+    channel: &str,
+    target: &str,
+    output: &str,
+) -> anyhow::Result<()> {
+    let alias = channel
+        .split_once('.')
+        .map(|(_, alias)| alias.trim())
+        .filter(|alias| !alias.is_empty())
+        .ok_or_else(|| {
+            anyhow::Error::msg(
+                "delivery channel \"app\" must name the owning agent: app.<agent alias> \
+                 (e.g. app.curator)",
+            )
+        })?;
+    if !config.agents.contains_key(alias) {
+        anyhow::bail!(
+            "[agents.{alias}] is not configured; app delivery needs an existing agent alias"
+        );
+    }
+    let session_id = target.trim();
+    if session_id.is_empty() {
+        anyhow::bail!("app delivery needs a session id in `to` (e.g. cron_nightly-curation)");
+    }
+
+    let backend =
+        zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels.session_backend)
+            .map_err(|e| {
+                anyhow::Error::msg(format!("app delivery could not open the session store: {e}"))
+            })?;
+    // An id the store already knows keeps its own key: appending under a second
+    // spelling would split one conversation across two rows the app then shows
+    // as two sessions.
+    let key = zeroclaw_infra::session_backend::resolve_session_key(backend.as_ref(), session_id)
+        .unwrap_or_else(|| session_id.to_string());
+
+    backend.append(
+        &key,
+        &zeroclaw_api::model_provider::ChatMessage::assistant(output),
+    )?;
+    backend.set_session_agent_alias(&key, alias)?;
+    // Only when the session has no name yet: a name set by hand outlives every
+    // later run.
+    if backend.get_session_name(&key)?.is_none() {
+        backend.set_session_name(&key, &app_session_title(session_id))?;
+    }
+
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_attrs(::serde_json::json!({
+                "session_key": key,
+                "agent_alias": alias,
+                "bytes": output.len(),
+            })),
+        "Cron announcement written to a gateway session"
+    );
+    Ok(())
+}
+
+/// A label for a session the app will list, derived from its id:
+/// `cron_nightly-curation` becomes `Nightly curation`. Used only when the
+/// session has no name, so it names the row the first time a job delivers and
+/// never fights a rename.
+fn app_session_title(session_id: &str) -> String {
+    let stripped = session_id
+        .strip_prefix("cron_")
+        .or_else(|| session_id.strip_prefix("cron-"))
+        .unwrap_or(session_id);
+    let spaced = stripped.replace(['-', '_'], " ");
+    let mut chars = spaced.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => session_id.to_string(),
+    }
+}
+
 pub async fn deliver_announcement(
     config: &zeroclaw_config::schema::Config,
     channel: &str,
@@ -13215,6 +13311,13 @@ pub async fn deliver_announcement(
         && let Some(ch) = registry.get(channel.to_ascii_lowercase().as_str())
     {
         return ch.send(&make_msg(&safe_output)).await;
+    }
+
+    // `app.<agent alias>` is not a chat platform: it writes the announcement
+    // into a gateway session, which is what the phone app lists. Handled before
+    // the registry/config lookup below because there is no channel to configure.
+    if is_app_delivery_channel(channel) {
+        return deliver_to_app_session(config, channel, target, &safe_output).await;
     }
 
     let (raw_type, alias) = channel.split_once('.').ok_or_else(|| {
@@ -36643,5 +36746,130 @@ mod debounce_resolution_tests {
             &telegram_configs,
         );
         assert_eq!(duration, Duration::from_millis(1000));
+    }
+}
+
+#[cfg(test)]
+mod app_session_delivery_tests {
+    use super::{app_session_title, deliver_to_app_session, is_app_delivery_channel};
+
+    fn config_with_agent(
+        dir: &std::path::Path,
+        alias: &str,
+    ) -> zeroclaw_config::schema::Config {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.data_dir = dir.to_path_buf();
+        config.agents.insert(alias.to_string(), Default::default());
+        config
+    }
+
+    #[tokio::test]
+    async fn an_app_delivery_writes_a_session_the_api_will_list() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_with_agent(tmp.path(), "curator");
+
+        deliver_to_app_session(&config, "app.curator", "cron_nightly-curation", "the brief")
+            .await
+            .unwrap();
+
+        let backend = zeroclaw_infra::make_session_backend(
+            &config.data_dir,
+            &config.channels.session_backend,
+        )
+        .unwrap();
+        let messages = backend.load("cron_nightly-curation");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "assistant");
+        assert_eq!(messages[0].content, "the brief");
+        // Without the alias stamp `/api/sessions` drops the row as an orphan
+        // and the app never sees the session at all.
+        assert_eq!(
+            backend
+                .get_session_agent_alias("cron_nightly-curation")
+                .unwrap()
+                .as_deref(),
+            Some("curator")
+        );
+        assert_eq!(
+            backend
+                .get_session_name("cron_nightly-curation")
+                .unwrap()
+                .as_deref(),
+            Some("Nightly curation")
+        );
+    }
+
+    #[tokio::test]
+    async fn later_runs_append_and_leave_a_name_set_by_hand_alone() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_with_agent(tmp.path(), "curator");
+
+        deliver_to_app_session(&config, "app.curator", "cron_nightly-curation", "first")
+            .await
+            .unwrap();
+        let backend = zeroclaw_infra::make_session_backend(
+            &config.data_dir,
+            &config.channels.session_backend,
+        )
+        .unwrap();
+        backend
+            .set_session_name("cron_nightly-curation", "Curation")
+            .unwrap();
+
+        deliver_to_app_session(&config, "app.curator", "cron_nightly-curation", "second")
+            .await
+            .unwrap();
+
+        let messages = backend.load("cron_nightly-curation");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content, "second");
+        assert_eq!(
+            backend
+                .get_session_name("cron_nightly-curation")
+                .unwrap()
+                .as_deref(),
+            Some("Curation")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_agent_is_an_error_not_a_session_nobody_can_see() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_with_agent(tmp.path(), "curator");
+
+        let err = deliver_to_app_session(&config, "app.ghost", "cron_x", "body")
+            .await
+            .expect_err("an unconfigured alias should be refused");
+
+        assert!(err.to_string().contains("ghost"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_alias_less_app_channel_is_an_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_with_agent(tmp.path(), "curator");
+
+        let err = deliver_to_app_session(&config, "app", "cron_x", "body")
+            .await
+            .expect_err("app with no alias should be refused");
+
+        assert!(err.to_string().contains("app.<agent alias>"), "{err}");
+    }
+
+    #[test]
+    fn app_channels_are_recognised_with_or_without_an_alias() {
+        assert!(is_app_delivery_channel("app"));
+        assert!(is_app_delivery_channel("app.curator"));
+        assert!(is_app_delivery_channel("APP.Curator"));
+        assert!(!is_app_delivery_channel("apple.work"));
+        assert!(!is_app_delivery_channel("discord.clamps"));
+    }
+
+    #[test]
+    fn a_session_id_reads_as_a_label() {
+        assert_eq!(app_session_title("cron_nightly-curation"), "Nightly curation");
+        assert_eq!(app_session_title("cron-dialect-packs"), "Dialect packs");
+        assert_eq!(app_session_title("automations"), "Automations");
+        assert_eq!(app_session_title(""), "");
     }
 }

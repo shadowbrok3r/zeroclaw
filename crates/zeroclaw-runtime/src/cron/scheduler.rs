@@ -113,12 +113,104 @@ impl CronDeliveryContext {
 
 pub struct ManualCronRunResult {
     pub job_id: String,
+    /// Row id of the persisted run, or `None` when writing history failed.
+    /// The caller hands it to a client that wants to open this exact run in
+    /// `/api/cron/{id}/runs` instead of re-fetching and matching by time.
+    pub run_id: Option<i64>,
     pub success: bool,
     pub status: String,
     pub output: String,
     pub duration_ms: i64,
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
+}
+
+/// One finished scheduled run, as `process_due_jobs` needs it: everything a
+/// `cron_result` frame carries, since the job itself is consumed by the task
+/// that ran it.
+pub(crate) struct ScheduledRunReport {
+    pub job_id: String,
+    pub name: Option<String>,
+    pub agent_alias: String,
+    pub run_id: Option<i64>,
+    pub success: bool,
+    pub status: String,
+    pub output: String,
+    pub duration_ms: i64,
+    pub finished_at: DateTime<Utc>,
+}
+
+/// What a persisted run leaves behind for the caller that has to report it.
+pub(crate) struct PersistedRun {
+    pub success: bool,
+    pub status: String,
+    pub output: String,
+    pub run_id: Option<i64>,
+}
+
+/// How much run output a `cron_result` frame carries.
+///
+/// The frame fans out to every `/ws/chat` client and every `/api/events`
+/// listener the moment a job finishes — a phone among them — so a shell job
+/// that prints a log file would be pushed verbatim to a device that only
+/// wanted to know the job ran. The body a reader actually wants is in
+/// `/api/cron/{id}/runs`, which the store bounds separately at
+/// `MAX_CRON_OUTPUT_BYTES`; the frame reports `truncated` and the full byte
+/// count so a client can tell "this is all of it" from "fetch the rest".
+const MAX_CRON_EVENT_OUTPUT_BYTES: usize = 8 * 1024;
+
+/// A finished run, broadcast on the event bus as `cron_result`.
+///
+/// One builder for both paths: a manual trigger and the scheduler's own loop
+/// produced frames with different fields before, so a client had to special-
+/// case where the run came from.
+pub(crate) struct CronResultEvent<'a> {
+    pub job_id: &'a str,
+    pub name: Option<&'a str>,
+    pub agent_alias: &'a str,
+    pub run_id: Option<i64>,
+    pub success: bool,
+    pub status: &'a str,
+    pub output: &'a str,
+    pub duration_ms: i64,
+    pub manual: bool,
+    pub finished_at: DateTime<Utc>,
+}
+
+impl CronResultEvent<'_> {
+    pub(crate) fn into_value(self) -> serde_json::Value {
+        let (output, truncated) = truncate_event_output(self.output);
+        serde_json::json!({
+            "type": "cron_result",
+            "job_id": self.job_id,
+            "name": self.name,
+            "agent": self.agent_alias,
+            "run_id": self.run_id,
+            "success": self.success,
+            "status": self.status,
+            "output": output,
+            "output_bytes": self.output.len(),
+            "truncated": truncated,
+            "duration_ms": self.duration_ms,
+            "manual": self.manual,
+            "timestamp": self.finished_at.to_rfc3339(),
+        })
+    }
+}
+
+/// Cut `output` to [`MAX_CRON_EVENT_OUTPUT_BYTES`], on a char boundary, and
+/// say whether anything was dropped. No marker is appended: the frame carries
+/// `truncated` and `output_bytes`, and a client that wants the rest asks the
+/// runs API for it.
+fn truncate_event_output(output: &str) -> (String, bool) {
+    if output.len() <= MAX_CRON_EVENT_OUTPUT_BYTES {
+        return (output.to_string(), false);
+    }
+    let mut cutoff = MAX_CRON_EVENT_OUTPUT_BYTES;
+    while cutoff > 0 && !output.is_char_boundary(cutoff) {
+        cutoff -= 1;
+    }
+    (output[..cutoff].to_string(), true)
 }
 
 pub struct CronDeliveryOutcome {
@@ -136,7 +228,7 @@ pub async fn deliver_and_classify_run_result(
 ) -> CronDeliveryOutcome {
     let mut status = if success { "ok" } else { "error" }.to_string();
 
-    if let Err(e) = deliver_if_configured(config, job, &output).await {
+    if let Err(e) = deliver_if_configured(config, job, success, &output).await {
         // Cron add-time accepts dangling delivery refs (the job's channel
         // may not be provisioned yet); the loudly-logged warn here is
         // the scheduler-side half of that contract. Manual trigger paths
@@ -229,7 +321,7 @@ async fn run_manual_job_inner(
     let duration_ms = (finished_at - started_at).num_milliseconds();
     let outcome = deliver_and_classify_run_result(config, job, success, output, context).await;
 
-    if let Err(e) = persist_manual_run_result(
+    let run_id = match persist_manual_run_result(
         config,
         job,
         started_at,
@@ -238,28 +330,40 @@ async fn run_manual_job_inner(
         Some(&outcome.output),
         duration_ms,
     ) {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
-            "manual cron trigger: failed to persist run history"
-        );
-    }
+        Ok(run_id) => Some(run_id),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
+                "manual cron trigger: failed to persist run history"
+            );
+            None
+        }
+    };
 
     if let Some(tx) = event_tx {
-        let _ = tx.send(serde_json::json!({
-            "type": "cron_result",
-            "job_id": job.id,
-            "success": outcome.success,
-            "output": &outcome.output,
-            "manual": true,
-            "timestamp": finished_at.to_rfc3339(),
-        }));
+        let _ = tx.send(
+            CronResultEvent {
+                job_id: &job.id,
+                name: job.name.as_deref(),
+                agent_alias: &job.agent_alias,
+                run_id,
+                success: outcome.success,
+                status: &outcome.status,
+                output: &outcome.output,
+                duration_ms,
+                manual: true,
+                finished_at,
+            }
+            .into_value(),
+        );
     }
 
     ManualCronRunResult {
         job_id: job.id.clone(),
+        run_id,
         success: outcome.success,
         status: outcome.status,
         output: outcome.output,
@@ -719,25 +823,35 @@ async fn process_due_jobs(
     }))
     .buffer_unordered(max_concurrent);
 
-    while let Some((job_id, success, output)) = in_flight.next().await {
-        if !success {
+    while let Some(report) = in_flight.next().await {
+        if !report.success {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"job_id": job_id, "output": output})),
+                    .with_attrs(
+                        ::serde_json::json!({"job_id": report.job_id, "output": report.output})
+                    ),
                 "Scheduler job '' failed: "
             );
         }
         // Broadcast cron result to dashboard/SSE clients.
         if let Some(tx) = event_tx {
-            let _ = tx.send(serde_json::json!({
-                "type": "cron_result",
-                "job_id": job_id,
-                "success": success,
-                "output": output,
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-            }));
+            let _ = tx.send(
+                CronResultEvent {
+                    job_id: &report.job_id,
+                    name: report.name.as_deref(),
+                    agent_alias: &report.agent_alias,
+                    run_id: report.run_id,
+                    success: report.success,
+                    status: &report.status,
+                    output: &report.output,
+                    duration_ms: report.duration_ms,
+                    manual: false,
+                    finished_at: report.finished_at,
+                }
+                .into_value(),
+            );
         }
     }
 }
@@ -748,7 +862,7 @@ async fn execute_and_persist_job(
     agent_alias: &str,
     job: &CronJob,
     component: &str,
-) -> (String, bool, String) {
+) -> ScheduledRunReport {
     crate::health::mark_component_ok(component);
     warn_if_high_frequency_agent_job(job);
 
@@ -765,7 +879,7 @@ async fn execute_and_persist_job(
     .instrument(span)
     .await;
     let finished_at = Utc::now();
-    let success = Box::pin(persist_job_result(
+    let persisted = Box::pin(persist_job_result(
         config,
         job,
         success,
@@ -789,7 +903,20 @@ async fn execute_and_persist_job(
         );
     }
 
-    (job.id.clone(), success, output)
+    ScheduledRunReport {
+        job_id: job.id.clone(),
+        name: job.name.clone(),
+        agent_alias: agent_alias.to_string(),
+        run_id: persisted.run_id,
+        success: persisted.success,
+        status: persisted.status,
+        // The classified output, not the raw one: it is what the run row and
+        // the manual frame carry, and it names a delivery failure the raw
+        // output knows nothing about.
+        output: persisted.output,
+        duration_ms: (finished_at - started_at).num_milliseconds(),
+        finished_at,
+    }
 }
 
 async fn run_agent_job(
@@ -926,7 +1053,7 @@ async fn persist_job_result(
     output: &str,
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
-) -> bool {
+) -> PersistedRun {
     let duration_ms = (finished_at - started_at).num_milliseconds();
     let outcome = deliver_and_classify_run_result(
         config,
@@ -946,6 +1073,7 @@ async fn persist_job_result(
     };
 
     let job_state_at = Utc::now();
+    let mut run_id = None;
     if let Err(e) = persist_run_result(
         config,
         job,
@@ -956,7 +1084,9 @@ async fn persist_job_result(
         Some(&outcome.output),
         duration_ms,
         action,
-    ) {
+    )
+    .map(|id| run_id = Some(id))
+    {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1008,7 +1138,12 @@ async fn persist_job_result(
         }
     }
 
-    outcome.success
+    PersistedRun {
+        success: outcome.success,
+        status: outcome.status,
+        output: outcome.output,
+        run_id,
+    }
 }
 
 fn is_one_shot_auto_delete(job: &CronJob) -> bool {
@@ -1046,7 +1181,47 @@ fn warn_if_high_frequency_agent_job(job: &CronJob) {
     }
 }
 
-async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
+/// Is this an `app.<agent alias>` delivery — a write into a gateway session
+/// the phone app lists, rather than an outbound message to a chat platform?
+fn is_app_channel(channel: &str) -> bool {
+    channel
+        .split_once('.')
+        .map_or(channel, |(channel_type, _)| channel_type)
+        .eq_ignore_ascii_case("app")
+}
+
+/// What an `app.<alias>` delivery writes into the session.
+///
+/// The app renders that session as a conversation, where a body on its own
+/// reads as an orphaned message a week later — the header is what says which
+/// job ran, when, and whether it worked. Every other channel gets the output
+/// unchanged: a Discord channel already carries that context.
+fn app_delivery_body(job: &CronJob, channel: &str, success: bool, output: &str) -> String {
+    if !is_app_channel(channel) {
+        return output.to_string();
+    }
+
+    let name = job.name.as_deref().unwrap_or(&job.id);
+    // The job's own timezone, so the header reads as the hour it was scheduled
+    // for rather than the UTC one the daemon happens to run in.
+    let when = match &job.schedule {
+        Schedule::Cron { tz: Some(tz), .. } => <chrono_tz::Tz as std::str::FromStr>::from_str(tz)
+            .ok()
+            .map(|tz| Utc::now().with_timezone(&tz).format("%Y-%m-%d %H:%M %Z").to_string()),
+        _ => None,
+    }
+    .unwrap_or_else(|| Utc::now().format("%Y-%m-%d %H:%M UTC").to_string());
+    let outcome = if success { "" } else { " · failed" };
+
+    format!("**{name}** · {when}{outcome}\n\n{output}")
+}
+
+async fn deliver_if_configured(
+    config: &Config,
+    job: &CronJob,
+    success: bool,
+    output: &str,
+) -> Result<()> {
     let delivery: &DeliveryConfig = &job.delivery;
     if !delivery.mode.eq_ignore_ascii_case("announce") {
         return Ok(());
@@ -1089,7 +1264,7 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         channel,
         target,
         delivery.thread_id.as_deref(),
-        output,
+        &app_delivery_body(job, channel, success, output),
     )
     .await
 }
@@ -1834,6 +2009,13 @@ mod tests {
         assert_eq!(event["job_id"], job.id);
         assert_eq!(event["success"], true);
         assert_eq!(event["manual"], true);
+        assert_eq!(event["status"], "ok");
+        assert_eq!(event["agent"], TEST_AGENT);
+        assert_eq!(event["truncated"], false);
+        assert!(event["duration_ms"].as_i64().is_some());
+        // The id of the row just written, so a client can open this exact run
+        // instead of matching the newest one by time.
+        assert_eq!(event["run_id"].as_i64(), Some(runs[0].id));
         assert!(
             event["output"]
                 .as_str()
@@ -2424,7 +2606,7 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await.success;
         assert!(success);
 
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
@@ -2442,7 +2624,7 @@ mod tests {
         let finished = started + ChronoDuration::milliseconds(10);
 
         crate::cron::store::reset_write_connection_count_for_tests(&config);
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await.success;
 
         assert!(success);
         assert_eq!(
@@ -2464,7 +2646,7 @@ mod tests {
             let finished = started + ChronoDuration::milliseconds(10);
             let output = format!("run-{idx}");
 
-            let success = persist_job_result(&config, &job, true, &output, started, finished).await;
+            let success = persist_job_result(&config, &job, true, &output, started, finished).await.success;
             assert!(success);
         }
 
@@ -2500,7 +2682,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await.success;
 
         assert!(success);
         assert!(cron::list_runs(&config, &job.id, 10).unwrap().is_empty());
@@ -2534,7 +2716,7 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await.success;
         assert!(success);
         let lookup = cron::get_job(&config, &job.id);
         assert!(lookup.is_err());
@@ -2562,7 +2744,7 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
+        let success = persist_job_result(&config, &job, false, "boom", started, finished).await.success;
         assert!(!success);
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(!updated.enabled);
@@ -2592,7 +2774,7 @@ mod tests {
         let finished = started + ChronoDuration::milliseconds(10);
 
         crate::cron::store::reset_write_connection_count_for_tests(&config);
-        let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
+        let success = persist_job_result(&config, &job, false, "boom", started, finished).await.success;
 
         assert!(!success);
         assert_eq!(
@@ -2638,7 +2820,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await.success;
         assert!(success);
 
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
@@ -2675,7 +2857,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await.success;
         assert!(success);
 
         let updated = cron::get_job(&config, &job.id).unwrap();
@@ -2696,7 +2878,7 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await.success;
         assert!(success);
         let lookup = cron::get_job(&config, &job.id);
         assert!(lookup.is_err());
@@ -2713,7 +2895,7 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
+        let success = persist_job_result(&config, &job, false, "boom", started, finished).await.success;
         assert!(!success);
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(!updated.enabled);
@@ -2752,7 +2934,7 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await.success;
         assert!(success);
 
         let updated = cron::get_job(&config, &job.id).unwrap();
@@ -2780,7 +2962,7 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await.success;
         assert!(success);
 
         let updated = cron::get_job(&config, &job.id).unwrap();
@@ -2850,7 +3032,7 @@ mod tests {
 
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await.success;
         assert!(success);
 
         // After reschedule_after_run, At schedule jobs should be disabled
@@ -2870,7 +3052,7 @@ mod tests {
         let job = test_job("echo ok");
 
         // Default delivery mode is not "announce", so should be a no-op.
-        assert!(deliver_if_configured(&config, &job, "x").await.is_ok());
+        assert!(deliver_if_configured(&config, &job, true, "x").await.is_ok());
     }
 
     static DELIVERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -2923,7 +3105,7 @@ mod tests {
             "NO_REPLY[INFO]: healthy",
         ] {
             let before = DELIVERED.load(SeqCst);
-            deliver_if_configured(&config, &job, quiet).await.unwrap();
+            deliver_if_configured(&config, &job, true, quiet).await.unwrap();
             assert_eq!(
                 DELIVERED.load(SeqCst),
                 before,
@@ -2933,7 +3115,7 @@ mod tests {
 
         // Real content must be delivered.
         let before = DELIVERED.load(SeqCst);
-        deliver_if_configured(&config, &job, "All systems nominal")
+        deliver_if_configured(&config, &job, true, "All systems nominal")
             .await
             .unwrap();
         assert_eq!(
@@ -2948,7 +3130,7 @@ mod tests {
             "NO_REPLY[REFUSE]: policy prevented the check",
         ] {
             let before = DELIVERED.load(SeqCst);
-            deliver_if_configured(&config, &job, visible).await.unwrap();
+            deliver_if_configured(&config, &job, true, visible).await.unwrap();
             assert_eq!(
                 DELIVERED.load(SeqCst),
                 before + 1,
@@ -3149,7 +3331,10 @@ mod tests {
     async fn broadcast_sends_cron_result_on_success() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
-        let job = test_job("echo broadcast-ok");
+        let mut job = test_job("echo broadcast-ok");
+        // A frame that names the job is what a phone puts in a notification
+        // title; `job_id` alone reads as a uuid there.
+        job.name = Some("Broadcast OK".into());
         // Bind the synthetic test job to test-agent so process_due_jobs's
         // owning-agent lookup succeeds (jobs without an owner are skipped).
         config
@@ -3171,6 +3356,164 @@ mod tests {
         assert_eq!(event["success"], true);
         assert!(event["output"].as_str().unwrap().contains("broadcast-ok"));
         assert!(event["timestamp"].as_str().is_some());
+        assert_eq!(event["name"], "Broadcast OK");
+        assert_eq!(event["agent"], TEST_AGENT);
+        assert_eq!(event["status"], "ok");
+        // A scheduled run says so rather than leaving the field out, which is
+        // what a client had to infer from before.
+        assert_eq!(event["manual"], false);
+        assert_eq!(event["truncated"], false);
+        assert!(event["duration_ms"].as_i64().is_some());
+        assert_eq!(
+            event["output_bytes"].as_u64().map(|n| n as usize),
+            event["output"].as_str().map(str::len)
+        );
+        // This job was never written to the store, so the history insert has no
+        // row to hang off and the frame reports null rather than inventing an
+        // id. `manual_cron_trigger_broadcasts_and_records_run` covers the
+        // populated case, where the id matches the run row.
+        assert_eq!(event["run_id"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn app_delivery_body_heads_the_run_with_the_job_and_its_hour() {
+        let mut job = test_job("echo hi");
+        job.name = Some("Nightly curation".into());
+        job.schedule = crate::cron::Schedule::Cron {
+            expr: "40 3 * * *".into(),
+            tz: Some("America/Denver".into()),
+        };
+
+        let body = app_delivery_body(&job, "app.curator", true, "the brief");
+
+        assert!(body.starts_with("**Nightly curation** \u{b7} "), "{body}");
+        assert!(body.ends_with("\n\nthe brief"), "{body}");
+        assert!(!body.contains("failed"));
+        // The job's timezone, not the daemon's: this job is scheduled at 03:40
+        // Denver time and the header has to read as that hour.
+        assert!(body.contains("MDT") || body.contains("MST"), "{body}");
+    }
+
+    #[test]
+    fn app_delivery_body_says_when_the_run_failed() {
+        let mut job = test_job("echo hi");
+        job.name = Some("Nightly screenplay".into());
+
+        let body = app_delivery_body(&job, "app.director", false, "agent job failed: boom");
+
+        assert!(body.contains("\u{b7} failed"), "{body}");
+        assert!(body.ends_with("agent job failed: boom"), "{body}");
+    }
+
+    #[test]
+    fn app_delivery_body_falls_back_to_the_job_id_when_unnamed() {
+        let job = test_job("echo hi");
+
+        let body = app_delivery_body(&job, "app.curator", true, "out");
+
+        assert!(body.starts_with("**test-job** \u{b7} "), "{body}");
+    }
+
+    #[test]
+    fn other_channels_get_the_output_unchanged() {
+        let job = test_job("echo hi");
+
+        assert_eq!(
+            app_delivery_body(&job, "discord.clamps", true, "body"),
+            "body"
+        );
+        assert_eq!(app_delivery_body(&job, "telegram", false, "body"), "body");
+    }
+
+    #[test]
+    fn a_bare_app_channel_is_refused_when_the_job_is_written() {
+        // The session an app delivery writes to is listed per agent, so `app`
+        // with no alias has nowhere to land. Refused at add time rather than at
+        // 03:40.
+        let delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("app".into()),
+            to: Some("cron_nightly-curation".into()),
+            thread_id: None,
+            best_effort: true,
+        };
+
+        let err = crate::cron::validate_delivery_config(Some(&delivery))
+            .expect_err("bare app should be refused");
+
+        assert!(err.to_string().contains("app.<agent alias>"), "{err}");
+        assert!(
+            crate::cron::validate_delivery_config(Some(&DeliveryConfig {
+                channel: Some("app.curator".into()),
+                ..delivery
+            }))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn cron_result_frame_carries_a_short_output_whole() {
+        let finished_at = Utc::now();
+        let event = CronResultEvent {
+            job_id: "job",
+            name: Some("Nightly curation"),
+            agent_alias: "curator",
+            run_id: Some(7),
+            success: true,
+            status: "ok",
+            output: "two lines\nof output",
+            duration_ms: 1234,
+            manual: false,
+            finished_at,
+        }
+        .into_value();
+
+        assert_eq!(event["output"], "two lines\nof output");
+        assert_eq!(event["truncated"], false);
+        assert_eq!(event["output_bytes"], 19);
+        assert_eq!(event["name"], "Nightly curation");
+        assert_eq!(event["agent"], "curator");
+        assert_eq!(event["run_id"], 7);
+        assert_eq!(event["timestamp"], finished_at.to_rfc3339());
+    }
+
+    #[test]
+    fn cron_result_frame_bounds_a_long_output_and_says_so() {
+        // A shell job that prints a log file: the frame is pushed to every
+        // socket, so it carries a bounded prefix and the full size.
+        let output = "x".repeat(MAX_CRON_EVENT_OUTPUT_BYTES + 4096);
+        let event = CronResultEvent {
+            job_id: "job",
+            name: None,
+            agent_alias: "default",
+            run_id: None,
+            success: true,
+            status: "ok",
+            output: &output,
+            duration_ms: 1,
+            manual: false,
+            finished_at: Utc::now(),
+        }
+        .into_value();
+
+        assert_eq!(event["truncated"], true);
+        assert_eq!(event["output_bytes"].as_u64().unwrap() as usize, output.len());
+        assert!(event["output"].as_str().unwrap().len() <= MAX_CRON_EVENT_OUTPUT_BYTES);
+        assert_eq!(event["name"], serde_json::Value::Null);
+        assert_eq!(event["run_id"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn cron_result_frame_cuts_on_a_char_boundary() {
+        // `é` is two bytes, so a cut at the byte limit lands mid-character
+        // unless the boundary is walked back — and a String built from the
+        // wrong index does not compile away, it panics at runtime.
+        let output = "é".repeat(MAX_CRON_EVENT_OUTPUT_BYTES);
+        let (cut, truncated) = truncate_event_output(&output);
+
+        assert!(truncated);
+        assert!(cut.len() <= MAX_CRON_EVENT_OUTPUT_BYTES);
+        assert!(cut.chars().all(|c| c == 'é'));
     }
 
     #[tokio::test]

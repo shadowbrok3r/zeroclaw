@@ -30,6 +30,10 @@ pub use types::{
 /// Channel names exposed by the cron tool schemas. Actual runtime delivery is
 /// provided by the registered channel delivery handler, not this static enum.
 pub(crate) const CRON_DELIVERY_SCHEMA_CHANNELS: &[&str] = &[
+    // `app.<agent alias>` writes the run into a gateway session instead of
+    // sending it anywhere: the phone app lists that session, so an automation
+    // reaches it with no channel account in between.
+    "app",
     "telegram",
     "discord",
     "slack",
@@ -161,6 +165,19 @@ pub fn validate_delivery_config(delivery: Option<&DeliveryConfig>) -> Result<()>
     }
     if !delivery.mode.eq_ignore_ascii_case("announce") {
         bail!("unsupported delivery mode: {}", delivery.mode);
+    }
+    // `app` alone names no agent, and the session it would write to is listed
+    // per agent — so it is rejected here, at the moment someone sets it,
+    // rather than at 03:40 when the job runs.
+    if delivery
+        .channel
+        .as_deref()
+        .is_some_and(|channel| channel.trim().eq_ignore_ascii_case("app"))
+    {
+        bail!(
+            "delivery channel \"app\" must name the owning agent: app.<agent alias> \
+             (e.g. app.curator)"
+        );
     }
 
     let channel = delivery.channel.as_deref().map(str::trim);

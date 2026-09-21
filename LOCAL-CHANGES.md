@@ -178,6 +178,35 @@ Companion change in `zeroclaw-homelab/comfy-gen`: `jobs::delivered()` completes 
 caches the receipt from the render process itself (so the lookup never races the
 observer), and `where` grew `--since` / `--deliverable`.
 
+### Cron output reaches the phone (`app.<alias>` delivery, richer `cron_result`)
+
+A scheduled job's output had two destinations: a chat channel, or nowhere. The
+phone app (`zc-codex`) is where this deployment actually reads its automations,
+so the runs now land there two ways. Durably: `delivery.channel = "app.<agent
+alias>"` writes the run into a gateway session, and the app lists sessions
+already — no channel account in between, and the session can be replied to like
+any other. Live: the `cron_result` frame the gateway broadcasts to every
+`/ws/chat` client (`is_global_chat_event`) now names the job and the run row, so
+a client can raise a notification and open the run without a follow-up fetch.
+
+The frame carried `job_id`, `success`, `output` and a timestamp; a `job_id` is a
+uuid, which is the wrong thing to put in a notification title, and the `output`
+was unbounded on a broadcast that reaches phones.
+
+| File | Why |
+|---|---|
+| `crates/zeroclaw-channels/src/orchestrator/mod.rs` | `deliver_to_app_session()` and `is_app_delivery_channel()`, taken before the registry/config lookup because `app` is not a configured channel: appends the announcement as an assistant row, stamps `agent_alias` (without it `/api/sessions` drops the row as an orphan and the app never lists it), and names the session from its id the first time only. |
+| `crates/zeroclaw-runtime/src/cron/scheduler.rs` | `CronResultEvent` builds the one frame both the scheduled loop and a manual trigger send; `MAX_CRON_EVENT_OUTPUT_BYTES` (8 KiB) bounds it with `truncated`/`output_bytes` rather than a marker; `ScheduledRunReport`/`PersistedRun` carry the name, agent, run id, status and duration out of the run; `app_delivery_body()` heads an app delivery with the job's name and its own timezone's hour. |
+| `crates/zeroclaw-runtime/src/cron/store.rs` | `insert_run_and_prune()` and both persist paths return the inserted `cron_runs.id`, which is what `run_id` names. |
+| `crates/zeroclaw-runtime/src/cron/mod.rs` | `app` joins the delivery channels the cron tool schemas accept; a bare `app` is refused at add time, since the session it would write to is listed per agent. |
+| `crates/zeroclaw-gateway/src/api.rs` | `POST /api/cron/{id}/run` answers with `run_id`, so a manual run and its broadcast collapse into one row on the client instead of being matched by timestamp. |
+| `crates/zeroclaw-infra/src/session_sqlite.rs` | `PRAGMA busy_timeout = 5000`. WAL keeps a reader out of a writer's way but not a second writer, and SQLite's default timeout is zero — the loser gets `database is locked` immediately. A cron delivery is a second writer against a store the gateway is already using. |
+
+The frame is deliberately still `session_id`-less: that is what keeps
+`is_global_chat_event` forwarding it to every socket. The app half is
+`zc-codex` `da220d7` (0.8.41), which reads every new field and degrades to the
+old shape when the gateway is older.
+
 ### Provider truncation surfacing
 
 Unrelated to the session overhaul; carried here because it is a one-file
