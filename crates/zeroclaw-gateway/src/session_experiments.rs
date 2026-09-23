@@ -85,10 +85,41 @@ pub(crate) async fn list(
     }
 }
 
-/// One whole tap: winner kept and loser rejected in a single call, or both
-/// cleared. Two requests from a phone on a flaky connection is how an
-/// experiment ends up half-rated, and a half-rated comparison reads to the
-/// promotion gate as a conflict that blocks the trial rather than advancing it.
+/// The helper's arguments for one tap: a winner, one verdict for both
+/// candidates (`keep` rates them equal, `reject` rates both bad), or a clear.
+fn pick_args(name: String, body: &Value) -> Result<Vec<String>, &'static str> {
+    let mut args = vec!["pick".to_owned(), name];
+    match (body.get("winner"), body["verdict"].as_str()) {
+        (Some(winner), _) => match winner.as_u64() {
+            Some(index @ (0 | 1)) => {
+                args.push("--winner".to_owned());
+                args.push(index.to_string());
+            }
+            _ => return Err("winner must be 0 or 1"),
+        },
+        (None, Some("unrated")) => args.push("--clear".to_owned()),
+        (None, Some(verdict @ ("keep" | "reject"))) => {
+            args.push("--both".to_owned());
+            args.push(verdict.to_owned());
+        }
+        (None, _) => {
+            return Err(
+                "send {\"winner\":0|1} to pick one, {\"verdict\":\"keep\"|\"reject\"} to rate both alike, or {\"verdict\":\"unrated\"} to clear",
+            );
+        }
+    }
+    if let Some(notes) = body["notes"].as_str().filter(|n| !n.is_empty()) {
+        args.push("--notes".to_owned());
+        args.push(notes.chars().take(1800).collect());
+    }
+    Ok(args)
+}
+
+/// One whole tap: winner kept and loser rejected in a single call, both
+/// candidates given one verdict, or both cleared. Two requests from a phone on
+/// a flaky connection is how an experiment ends up half-rated, and a half-rated
+/// comparison reads to the promotion gate as a conflict that blocks the trial
+/// rather than advancing it.
 pub(crate) async fn pick(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -101,27 +132,10 @@ pub(crate) async fn pick(
     if !valid_name(&name) {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let mut args = vec!["pick".to_owned(), name];
-    match (body.get("winner"), body["verdict"].as_str()) {
-        (Some(winner), _) => match winner.as_u64() {
-            Some(index @ (0 | 1)) => {
-                args.push("--winner".to_owned());
-                args.push(index.to_string());
-            }
-            _ => return error(StatusCode::BAD_REQUEST, "winner must be 0 or 1"),
-        },
-        (None, Some("unrated")) => args.push("--clear".to_owned()),
-        (None, _) => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "send {\"winner\":0|1} to pick, or {\"verdict\":\"unrated\"} to clear",
-            );
-        }
-    }
-    if let Some(notes) = body["notes"].as_str().filter(|n| !n.is_empty()) {
-        args.push("--notes".to_owned());
-        args.push(notes.chars().take(1800).collect());
-    }
+    let args = match pick_args(name, &body) {
+        Ok(args) => args,
+        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
     match invoke(&args).await {
         Ok(value) => json_response(value),
         Err(response) => response,
@@ -130,7 +144,43 @@ pub(crate) async fn pick(
 
 #[cfg(test)]
 mod tests {
-    use super::valid_name;
+    use super::{pick_args, valid_name};
+    use serde_json::json;
+
+    #[test]
+    fn a_tap_becomes_one_fixed_helper_call() {
+        let args = |body| pick_args("e".to_owned(), &body);
+        assert_eq!(
+            args(json!({"winner": 1})).unwrap(),
+            ["pick", "e", "--winner", "1"]
+        );
+        assert_eq!(
+            args(json!({"verdict": "unrated"})).unwrap(),
+            ["pick", "e", "--clear"]
+        );
+        assert_eq!(
+            args(json!({"verdict": "keep"})).unwrap(),
+            ["pick", "e", "--both", "keep"]
+        );
+        assert_eq!(
+            args(json!({"verdict": "reject"})).unwrap(),
+            ["pick", "e", "--both", "reject"]
+        );
+        assert_eq!(
+            args(json!({"winner": 0, "notes": "sharper"})).unwrap(),
+            ["pick", "e", "--winner", "0", "--notes", "sharper"]
+        );
+        for bad in [
+            json!({"winner": 2}),
+            json!({"winner": "1"}),
+            json!({"verdict": "maybe"}),
+            json!({"verdict": "--clear"}),
+            json!({}),
+            json!([]),
+        ] {
+            assert!(args(bad.clone()).is_err(), "{bad} should be refused");
+        }
+    }
 
     #[test]
     fn names_are_directory_names_and_never_traversals() {

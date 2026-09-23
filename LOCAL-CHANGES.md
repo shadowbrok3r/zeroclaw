@@ -178,6 +178,19 @@ Companion change in `zeroclaw-homelab/comfy-gen`: `jobs::delivered()` completes 
 caches the receipt from the render process itself (so the lookup never races the
 observer), and `where` grew `--since` / `--deliverable`.
 
+### Render experiment rating (gateway)
+
+The zc-codex app rates A/B render comparisons from its Jobs tab, which replaces the retired
+Discord vote source for the recipe promotion gate. The gateway only authorizes the paired device
+and runs the helper named by `ZEROCLAW_COMFY_EXPERIMENTS` (`zeroclaw-homelab/learning/experiments.py`)
+with a fixed argument array; the helper owns what a verdict means. Unset, both routes answer 501.
+
+| File | Why |
+|---|---|
+| `crates/zeroclaw-gateway/src/session_experiments.rs` (NEW) | `GET /api/sessions/{id}/experiments` runs `list`. `POST /api/sessions/{id}/experiments/{name}/pick` maps the body through `pick_args()`: `{"winner":0\|1}` to `--winner`, `{"verdict":"keep"\|"reject"}` to `--both` (rated equal, or both bad), `{"verdict":"unrated"}` to `--clear`; any other body is a 400 before the helper runs. |
+| `crates/zeroclaw-gateway/src/session_jobs.rs` | `authorize` and `run_args` are `pub(crate)`, so both helpers share one auth check and one no-shell, capped-stdout process contract. |
+| `crates/zeroclaw-gateway/src/lib.rs` | `mod session_experiments;` and the two routes. |
+
 ### Cron output reaches the phone (`app.<alias>` delivery, richer `cron_result`)
 
 A scheduled job's output had two destinations: a chat channel, or nowhere. The
