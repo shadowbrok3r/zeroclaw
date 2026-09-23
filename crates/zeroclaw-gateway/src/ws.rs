@@ -636,6 +636,8 @@ async fn handle_socket(
     // on, and the turn's frames are mirrored here for reconnect replay.
     let hub = crate::ws_hub::hub_for(&session_key);
     let pending_approvals: PendingApprovals = hub.pending_approvals.clone();
+    // Steering channel of the turns this socket runs; every send goes through `TurnHub::steer`.
+    let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(32);
     let approval_channel = Arc::new(WsApprovalChannel::new(
         approval_event_tx.clone(),
         pending_approvals.clone(),
@@ -681,62 +683,38 @@ async fn handle_socket(
     // reconnect: replay the turn so far and stream the rest live, then fall
     // through to normal operation once it ends. A first message that arrived on
     // the reconnect is steering for the running turn, not a new turn.
+    let mut first_content = None;
     if hub.running() {
-        if let Some(text) = first_msg_fallback.take()
-            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
-            && v["type"].as_str() == Some("message")
-            && let Some(content) = v["content"].as_str()
-            && !content.is_empty()
+        let mut unread = Vec::new();
+        if let Some(content) = first_msg_fallback
+            .as_deref()
+            .and_then(first_chat_message_content)
         {
-            hub.steer(content.to_string());
+            first_msg_fallback = None;
+            steer_from_resumed_socket(&hub, &mut sender, content, &mut unread).await;
         }
-        observe_running_turn(
-            &hub,
-            &mut sender,
-            &mut receiver,
-            &pending_approvals,
-            &mut ping_interval,
-            &state,
-            &session_id,
-            auth_subject.as_deref(),
-        )
-        .await;
+        unread.extend(
+            observe_running_turn(
+                &hub,
+                &mut sender,
+                &mut receiver,
+                &pending_approvals,
+                &mut ping_interval,
+                &state,
+                &session_id,
+                auth_subject.as_deref(),
+            )
+            .await,
+        );
+        // Messages the session stopped taking as steering run as this socket's first turn.
+        first_content = (!unread.is_empty()).then(|| unread.join("\n\n"));
     }
 
     // Process the first message if it was not a connect frame
     if let Some(ref text) = first_msg_fallback {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
             if parsed["type"].as_str() == Some("message") {
-                if let Some(content) = first_chat_message_content(text) {
-                    let _session_guard = match state.session_queue.acquire(&session_key).await {
-                        Ok(guard) => guard,
-                        Err(e) => {
-                            let err = serde_json::json!({
-                                "type": "error",
-                                "message": e.to_string(),
-                                "code": session_queue_ws_error_code(&e)
-                            });
-                            let _ = sender.send(Message::Text(err.to_string().into())).await;
-                            return;
-                        }
-                    };
-                    process_chat_message(
-                        &state,
-                        &mut agent,
-                        &mut sender,
-                        &mut receiver,
-                        &mut approval_event_rx,
-                        &pending_approvals,
-                        &mut ping_interval,
-                        &ws_memory,
-                        &content,
-                        &session_key,
-                        &session_id,
-                        auth_subject.as_deref(),
-                        &hub,
-                    )
-                    .await;
-                }
+                first_content = first_content.or_else(|| first_chat_message_content(text));
             } else {
                 let unknown_type = parsed["type"].as_str().unwrap_or("unknown");
                 let err = serde_json::json!({
@@ -753,6 +731,41 @@ async fn handle_socket(
                 "message": "Invalid JSON. Send {\"type\":\"message\",\"content\":\"your text\"}"
             });
             let _ = sender.send(Message::Text(err.to_string().into())).await;
+        }
+    }
+    if let Some(content) = first_content {
+        let _session_guard = match state.session_queue.acquire(&session_key).await {
+            Ok(guard) => guard,
+            Err(e) => {
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": e.to_string(),
+                    "code": session_queue_ws_error_code(&e)
+                });
+                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                return;
+            }
+        };
+        let mut next = Some(content);
+        while let Some(content) = next.take() {
+            next = process_chat_message(
+                &state,
+                &mut agent,
+                &mut sender,
+                &mut receiver,
+                &mut approval_event_rx,
+                &pending_approvals,
+                &mut ping_interval,
+                &ws_memory,
+                &content,
+                &session_key,
+                &session_id,
+                auth_subject.as_deref(),
+                &hub,
+                &steering_tx,
+                &mut steering_rx,
+            )
+            .await;
         }
     }
 
@@ -893,22 +906,27 @@ async fn handle_socket(
                     }
                 };
 
-                process_chat_message(
-                    &state,
-                    &mut agent,
-                    &mut sender,
-                    &mut receiver,
-                    &mut approval_event_rx,
-                    &pending_approvals,
-                    &mut ping_interval,
-                    &ws_memory,
-                    &content,
-                    &session_key,
-                    &session_id,
+                let mut next = Some(content);
+                while let Some(content) = next.take() {
+                    next = process_chat_message(
+                        &state,
+                        &mut agent,
+                        &mut sender,
+                        &mut receiver,
+                        &mut approval_event_rx,
+                        &pending_approvals,
+                        &mut ping_interval,
+                        &ws_memory,
+                        &content,
+                        &session_key,
+                        &session_id,
                         auth_subject.as_deref(),
                         &hub,
-                )
-                .await;
+                        &steering_tx,
+                        &mut steering_rx,
+                    )
+                    .await;
+                }
             }
 
             // ── Broadcast event (cron/heartbeat results) ──────────────
@@ -1162,12 +1180,13 @@ where
 /// Rejoin a turn that is already streaming for this session, for a socket that
 /// connected mid-turn (a reconnect). Sends the running turn so far as one
 /// `turn_resume` frame, then streams the rest live off the hub's broadcast,
-/// until a terminal frame (`done`/`aborted`/`error`) or the socket closes.
+/// until the session's last frame or the socket closes.
 ///
 /// The turn itself is driven by whichever socket started it and is unaffected
 /// by this observer: a failed write here detaches only this socket. Inbound
 /// `approval_response` and `message` frames are routed to the shared hub, so a
 /// resumed socket can answer a parked approval or steer the running turn.
+/// Returns, in order, the messages the session had stopped taking as steering.
 #[allow(clippy::too_many_arguments)]
 async fn observe_running_turn(
     hub: &Arc<crate::ws_hub::TurnHub>,
@@ -1178,21 +1197,22 @@ async fn observe_running_turn(
     state: &AppState,
     session_id: &str,
     auth_subject: Option<&str>,
-) {
+) -> Vec<String> {
     use futures_util::StreamExt as _;
 
     // Snapshot the turn so far and subscribe to the rest, atomically. `None`
     // means the turn ended between the caller's check and here — nothing to do.
     let Some((mut live_rx, frames)) = hub.attach() else {
-        return;
+        return Vec::new();
     };
+    let mut unread = Vec::new();
     let resume = serde_json::json!({ "type": "turn_resume", "frames": frames });
     if sender
         .send(Message::Text(resume.to_string().into()))
         .await
         .is_err()
     {
-        return;
+        return unread;
     }
 
     loop {
@@ -1200,43 +1220,34 @@ async fn observe_running_turn(
             biased;
             frame = live_rx.recv() => {
                 match frame {
-                    Ok(text) => {
-                        let is_terminal = serde_json::from_str::<serde_json::Value>(&text)
-                            .ok()
-                            .and_then(|v| {
-                                v.get("type").and_then(|t| t.as_str()).map(str::to_string)
-                            })
-                            .is_some_and(|t| matches!(t.as_str(), "done" | "aborted" | "error"));
-                        if sender.send(Message::Text(text.into())).await.is_err() {
-                            return;
-                        }
-                        if is_terminal {
-                            return;
+                    Ok(frame) => {
+                        if sender.send(Message::Text(frame.text.into())).await.is_err() || frame.last {
+                            return unread;
                         }
                     }
                     // Fell too far behind the live turn: detach and let the app
                     // re-sync from history rather than stalling the turn.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => return,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => return unread,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return unread,
                 }
             }
             _ = tick_websocket_ping(ping_interval) => {
                 if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
-                    return;
+                    return unread;
                 }
             }
             client_msg = receiver.next() => {
-                let Some(msg) = client_msg else { return };
+                let Some(msg) = client_msg else { return unread };
                 let text = match msg {
                     Ok(Message::Text(text)) => text,
                     Ok(Message::Ping(payload)) => {
                         if sender.send(Message::Pong(payload)).await.is_err() {
-                            return;
+                            return unread;
                         }
                         continue;
                     }
                     Ok(Message::Pong(_)) => continue,
-                    Ok(Message::Close(_)) | Err(_) => return,
+                    Ok(Message::Close(_)) | Err(_) => return unread,
                     _ => continue,
                 };
                 let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -1267,7 +1278,8 @@ async fn observe_running_turn(
                         if let Some(content) = parsed["content"].as_str()
                             && !content.is_empty()
                         {
-                            hub.steer(content.to_string());
+                            steer_from_resumed_socket(hub, &mut *sender, content.to_string(), &mut unread)
+                                .await;
                         }
                     }
                     _ => {}
@@ -1277,9 +1289,88 @@ async fn observe_running_turn(
     }
 }
 
+/// Steer the running turn from a resumed socket, keeping a message the session no longer takes in `unread`.
+async fn steer_from_resumed_socket<S>(
+    hub: &crate::ws_hub::TurnHub,
+    sender: &mut S,
+    content: String,
+    unread: &mut Vec<String>,
+) where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    match hub.steer(content) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(content)) => unread.push(content),
+        Err(refused) => {
+            let err = steering_refused_frame(&refused);
+            let _ = sender.send(Message::Text(err.to_string().into())).await;
+        }
+    }
+}
+
+/// Error frame refusing a steering message the running turn cannot take.
+fn steering_refused_frame(
+    refused: &tokio::sync::mpsc::error::TrySendError<String>,
+) -> serde_json::Value {
+    match refused {
+        tokio::sync::mpsc::error::TrySendError::Full(_) => serde_json::json!({
+            "type": "error",
+            "message": "Steering queue is full for the running turn",
+            "code": "STEERING_QUEUE_FULL"
+        }),
+        tokio::sync::mpsc::error::TrySendError::Closed(_) => serde_json::json!({
+            "type": "error",
+            "message": "Running turn is no longer accepting steering messages",
+            "code": "STEERING_CLOSED"
+        }),
+    }
+}
+
+/// Error frame refusing a steering message the turn ended without reading.
+fn unread_steering_frame(content: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "error",
+        "message": "The turn ended before it read this message; it was not processed",
+        "code": "STEERING_CLOSED",
+        "content": content,
+    })
+}
+
+/// Refuse on this socket and on every resumed one each steering message the turn left unread.
+async fn refuse_unread_steering<S>(
+    hub: &crate::ws_hub::TurnHub,
+    sender: &mut S,
+    client_gone: &mut bool,
+    steering_rx: &mut tokio::sync::mpsc::Receiver<String>,
+) where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    for content in hub.take_unread_steering(steering_rx, false) {
+        let frame = unread_steering_frame(&content);
+        send_turn_frame(sender, client_gone, Message::Text(frame.to_string().into())).await;
+        hub.announce(&frame);
+    }
+}
+
+/// End the turn on the hub; steering it left unread comes back joined in arrival order to run as the next turn.
+fn finish_or_chain(
+    hub: &crate::ws_hub::TurnHub,
+    terminal: &serde_json::Value,
+    steering_rx: &mut tokio::sync::mpsc::Receiver<String>,
+) -> Option<String> {
+    let unread = hub.take_unread_steering(steering_rx, true);
+    if unread.is_empty() {
+        hub.finish(terminal);
+        return None;
+    }
+    hub.finish_chained(terminal);
+    Some(unread.join("\n\n"))
+}
+
 /// Process a single chat message through the agent and send the response.
 /// Uses [`Agent::turn_streamed`] so that intermediate text chunks, tool calls,
 /// and tool results are forwarded to the WebSocket client in real time.
+/// Returns the steering the turn left unread, joined, to run as the next turn.
 #[allow(clippy::too_many_arguments)]
 async fn process_chat_message(
     state: &AppState,
@@ -1299,7 +1390,9 @@ async fn process_chat_message(
     // Per-session turn hub: every frame is mirrored here so a socket that
     // reconnects mid-turn can replay it and stream the rest live.
     hub: &Arc<crate::ws_hub::TurnHub>,
-) {
+    steering_tx: &tokio::sync::mpsc::Sender<String>,
+    steering_rx: &mut tokio::sync::mpsc::Receiver<String>,
+) -> Option<String> {
     use futures_util::StreamExt as _;
     use zeroclaw_runtime::agent::TurnEvent;
 
@@ -1363,7 +1456,6 @@ async fn process_chat_message(
 
     // Channel for streaming turn events from the agent.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
-    let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(32);
 
     // Open this turn on the session hub: reset the replay buffer, mark running,
     // and expose the steering channel so a resumed socket can steer too.
@@ -1393,7 +1485,7 @@ async fn process_chat_message(
                             &content_owned,
                             event_tx,
                             Some(cancel_token.clone()),
-                            Some(&mut steering_rx),
+                            Some(&mut *steering_rx),
                         )
                         .instrument(span),
                 ),
@@ -1614,24 +1706,9 @@ async fn process_chat_message(
                                 let _ = sender.send(Message::Text(err.to_string().into())).await;
                                 continue;
                             }
-                            match steering_tx.try_send(content) {
-                                Ok(()) => {}
-                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                    let err = serde_json::json!({
-                                        "type": "error",
-                                        "message": "Steering queue is full for the running turn",
-                                        "code": "STEERING_QUEUE_FULL"
-                                    });
-                                    let _ = sender.send(Message::Text(err.to_string().into())).await;
-                                }
-                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                    let err = serde_json::json!({
-                                        "type": "error",
-                                        "message": "Running turn is no longer accepting steering messages",
-                                        "code": "STEERING_CLOSED"
-                                    });
-                                    let _ = sender.send(Message::Text(err.to_string().into())).await;
-                                }
+                            if let Err(refused) = hub.steer(content) {
+                                let err = steering_refused_frame(&refused);
+                                let _ = sender.send(Message::Text(err.to_string().into())).await;
                             }
                         }
                         // Ignored mid-turn frame kinds resolve without an await;
@@ -1715,6 +1792,7 @@ async fn process_chat_message(
 
         // Inform the client the turn was aborted
         let aborted = serde_json::json!({ "type": "aborted" });
+        refuse_unread_steering(hub, sender, &mut client_gone, steering_rx).await;
         send_turn_frame(
             sender,
             &mut client_gone,
@@ -1760,7 +1838,7 @@ async fn process_chat_message(
             "gateway_ws_turn"
         );
 
-        return;
+        return None;
     }
 
     match result {
@@ -1852,7 +1930,7 @@ async fn process_chat_message(
             .await;
             // End the turn on the hub: any resumed socket sees `done` and the
             // replay buffer is cleared.
-            hub.finish(&done);
+            let next = finish_or_chain(hub, &done, steering_rx);
 
             // Set session state to idle
             if let Some(ref backend) = state.session_backend {
@@ -1893,6 +1971,7 @@ async fn process_chat_message(
                     })),
                 "gateway_ws_turn"
             );
+            next
         }
         Err(e) => {
             if let Some(ref backend) = state.session_backend
@@ -1917,7 +1996,7 @@ async fn process_chat_message(
                 zeroclaw_runtime::agent::terminal_completion_error_message(&e.error, None);
             let err = send_ws_turn_failure(sender, &e.error, user_message.as_deref()).await;
             // End the turn on the hub with the same error frame the socket got.
-            hub.finish(&err);
+            let next = finish_or_chain(hub, &err, steering_rx);
 
             // Broadcast error event
             let _ = state.event_tx.send(serde_json::json!({
@@ -1943,6 +2022,7 @@ async fn process_chat_message(
                     })),
                 "gateway_ws_turn"
             );
+            next
         }
     }
 }
@@ -3079,5 +3159,428 @@ data: {\"type\":\"message_stop\"}\n\n",
             Some("WaitingApproval"),
             "the gate is cleared once an authorized WS member approves"
         );
+    }
+
+    #[tokio::test]
+    async fn steering_an_aborted_turn_left_unread_is_refused_here_and_on_resumed_sockets() {
+        let hub = crate::ws_hub::hub_for("gw_refuse_unread_steering");
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(4);
+        hub.begin(tx);
+        let (mut resumed, _) = hub.attach().expect("running");
+        hub.steer("one".into()).expect("accepted");
+        hub.steer("two".into()).expect("accepted");
+
+        let mut sink = CollectSink(Vec::new());
+        let mut client_gone = false;
+        refuse_unread_steering(&hub, &mut sink, &mut client_gone, &mut rx).await;
+
+        let refused: Vec<serde_json::Value> = sink
+            .0
+            .iter()
+            .map(|text| serde_json::from_str(text).expect("JSON frame"))
+            .collect();
+        assert_eq!(refused.len(), 2);
+        for (frame, content) in refused.iter().zip(["one", "two"]) {
+            assert_eq!(frame["type"], "error");
+            assert_eq!(frame["code"], "STEERING_CLOSED");
+            assert_eq!(frame["content"], content);
+            let live = resumed.recv().await.expect("announced to resumed sockets");
+            assert!(!live.last, "a refusal does not detach the observer");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&live.text).expect("JSON")["content"],
+                content
+            );
+        }
+        assert!(
+            hub.steer("three".into()).is_err(),
+            "steering closes once the unread messages are refused"
+        );
+        hub.finish(&serde_json::json!({"type": "aborted"}));
+    }
+
+    #[tokio::test]
+    async fn steering_a_finished_turn_left_unread_comes_back_joined_as_the_next_turn() {
+        let hub = crate::ws_hub::hub_for("gw_chain_unread_steering");
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(4);
+        hub.begin(tx.clone());
+        let (mut resumed, _) = hub.attach().expect("running");
+        hub.steer("one".into()).expect("accepted");
+        hub.steer("two".into()).expect("accepted");
+
+        let done = serde_json::json!({"type": "done", "full_response": "first"});
+        assert_eq!(
+            finish_or_chain(&hub, &done, &mut rx).as_deref(),
+            Some("one\n\ntwo")
+        );
+        assert!(!resumed.recv().await.expect("done").last);
+        assert!(hub.running(), "the chained turn keeps the session running");
+
+        hub.begin(tx);
+        assert_eq!(finish_or_chain(&hub, &done, &mut rx), None);
+        assert!(resumed.recv().await.expect("done").last);
+        assert!(!hub.running());
+    }
+
+    const LATE_STEER: &str = "late steer 7f3c";
+
+    /// Session store that steers the running turn through its hub on its first append.
+    #[derive(Default)]
+    struct LateSteerBackend {
+        rows: std::sync::Mutex<Vec<zeroclaw_providers::ChatMessage>>,
+        late: std::sync::Mutex<Option<String>>,
+    }
+
+    impl zeroclaw_infra::session_backend::SessionBackend for LateSteerBackend {
+        fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            self.rows.lock().unwrap().clone()
+        }
+        fn append(
+            &self,
+            session_key: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            self.rows.lock().unwrap().push(message.clone());
+            if let Some(content) = self.late.lock().unwrap().take() {
+                crate::ws_hub::hub_for(session_key)
+                    .steer(content)
+                    .expect("the turn still takes steering while it persists");
+            }
+            Ok(())
+        }
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn session_exists(&self, _session_key: &str) -> bool {
+            true
+        }
+    }
+
+    /// Anthropic SSE for a one-delta text reply; without `end` the stream stops before it finishes.
+    fn anthropic_text_sse(text: &str, end: bool) -> String {
+        let mut events = vec![
+            (
+                "message_start",
+                serde_json::json!({"type": "message_start", "message": {"id": "msg_test", "type": "message", "role": "assistant", "model": "claude-test", "usage": {"input_tokens": 1}}}),
+            ),
+            (
+                "content_block_start",
+                serde_json::json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            ),
+            (
+                "content_block_delta",
+                serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}),
+            ),
+        ];
+        if end {
+            events.extend([
+                (
+                    "content_block_stop",
+                    serde_json::json!({"type": "content_block_stop", "index": 0}),
+                ),
+                (
+                    "message_delta",
+                    serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}}),
+                ),
+                ("message_stop", serde_json::json!({"type": "message_stop"})),
+            ]);
+        }
+        events
+            .into_iter()
+            .map(|(event, data)| format!("event: {event}\ndata: {data}\n\n"))
+            .collect()
+    }
+
+    fn anthropic_reply(text: &str) -> axum::response::Response {
+        (
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            anthropic_text_sse(text, true),
+        )
+            .into_response()
+    }
+
+    /// A reply that streams `text` and then stalls until the request is dropped.
+    fn stalled_anthropic_reply(text: &str) -> axum::response::Response {
+        let head =
+            futures_util::stream::once(std::future::ready(Ok::<_, std::convert::Infallible>(
+                axum::body::Bytes::from(anthropic_text_sse(text, false)),
+            )));
+        (
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            axum::body::Body::from_stream(head.chain(futures_util::stream::pending())),
+        )
+            .into_response()
+    }
+
+    /// Anthropic `/v1/messages` fixture that records each request and answers with `reply`.
+    async fn serve_anthropic_fixture(
+        requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        reply: fn(&serde_json::Value) -> axum::response::Response,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move |Json(request): Json<serde_json::Value>| {
+                let requests = requests.clone();
+                async move {
+                    let response = reply(&request);
+                    requests.lock().unwrap().push(request);
+                    response
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local Anthropic fixture");
+        let addr = listener.local_addr().expect("fixture address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("local Anthropic fixture serves");
+        });
+        (addr, server)
+    }
+
+    /// Live config with agent `web` on the Anthropic fixture at `provider`.
+    fn anthropic_fixture_config(
+        root: &Path,
+        provider: std::net::SocketAddr,
+    ) -> zeroclaw_config::schema::Config {
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("gateway workspace");
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: workspace.clone(),
+            config_path: root.join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.reliability.provider_retries = 0;
+        config.providers.models.anthropic.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    api_key: Some("test-key".to_string()),
+                    uri: Some(format!("http://{provider}")),
+                    model: Some("claude-test".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.risk_profiles.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        config.runtime_profiles.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
+        config.agents.insert(
+            "web".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "anthropic.fixture".into(),
+                risk_profile: "fixture".into(),
+                runtime_profile: "fixture".into(),
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(workspace),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    async fn serve_chat(state: AppState) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/ws/chat", get(handle_ws_chat))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local WebSocket gateway");
+        let addr = listener.local_addr().expect("gateway address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("local WebSocket gateway serves");
+        });
+        (addr, server)
+    }
+
+    /// The next text frame from the gateway as JSON, skipping control frames.
+    async fn next_json_frame<S>(client: &mut S) -> serde_json::Value
+    where
+        S: futures_util::Stream<
+                Item = Result<ClientMessage, tokio_tungstenite::tungstenite::Error>,
+            > + Unpin,
+    {
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(10), client.next())
+                .await
+                .expect("gateway frame deadline")
+                .expect("gateway stays connected")
+                .expect("gateway frame");
+            if let ClientMessage::Text(text) = frame {
+                return serde_json::from_str(&text).expect("JSON gateway frame");
+            }
+        }
+    }
+
+    /// Runs a production-shaped WebSocket fixture on a thread with room for its stack.
+    fn on_large_stack<F, Fut>(name: &str, test: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()>,
+    {
+        std::thread::Builder::new()
+            .name(name.to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(test());
+            })
+            .expect("spawn WebSocket fixture thread")
+            .join()
+            .expect("WebSocket fixture thread must not panic");
+    }
+
+    #[test]
+    fn a_steer_accepted_after_the_last_round_runs_as_the_next_turn() {
+        on_large_stack("ws-late-steer-chain", || async {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (provider, provider_server) =
+                serve_anthropic_fixture(requests.clone(), |request| {
+                    anthropic_reply(if request.to_string().contains(LATE_STEER) {
+                        "two"
+                    } else {
+                        "one"
+                    })
+                })
+                .await;
+            let tmp = tempfile::tempdir().expect("temporary gateway root");
+            let backend = Arc::new(LateSteerBackend::default());
+            *backend.late.lock().unwrap() = Some(LATE_STEER.to_string());
+            let mut state =
+                crate::api::tests::test_state(anthropic_fixture_config(tmp.path(), provider));
+            state.session_backend = Some(backend.clone());
+            let (gateway, gateway_server) = serve_chat(state).await;
+
+            let (mut client, _) = connect_async(format!(
+                "ws://{gateway}/ws/chat?agent=web&session_id=late-steer-chain"
+            ))
+            .await
+            .expect("WebSocket upgrade");
+            assert_eq!(next_json_frame(&mut client).await["type"], "session_start");
+            client
+                .send(ClientMessage::Text(
+                    serde_json::json!({"type": "message", "content": "first"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("chat message");
+
+            let mut replies = Vec::new();
+            while replies.len() < 2 {
+                let frame = next_json_frame(&mut client).await;
+                assert_ne!(frame["type"], "error", "unexpected error frame: {frame}");
+                if frame["type"] == "done" {
+                    replies.push(frame["full_response"].clone());
+                }
+            }
+            assert_eq!(
+                replies,
+                ["one", "two"],
+                "the late steer ran as the next turn"
+            );
+
+            let requests = requests.lock().unwrap().clone();
+            assert_eq!(requests.len(), 2, "one provider request per turn");
+            assert!(requests[1].to_string().contains(LATE_STEER));
+            let rows = backend.rows.lock().unwrap().clone();
+            let roles: Vec<&str> = rows.iter().map(|row| row.role.as_str()).collect();
+            assert_eq!(roles, ["user", "assistant", "user", "assistant"]);
+            assert!(rows[0].content.contains("first"));
+            assert!(
+                rows[2].content.contains(LATE_STEER),
+                "the steer is persisted as the next turn's user message"
+            );
+
+            gateway_server.abort();
+            provider_server.abort();
+        });
+    }
+
+    #[test]
+    fn a_steer_an_aborted_turn_never_read_is_refused_with_its_content() {
+        on_large_stack("ws-late-steer-abort", || async {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (provider, provider_server) =
+                serve_anthropic_fixture(requests.clone(), |request| {
+                    if request.to_string().contains(LATE_STEER) {
+                        anthropic_reply("two")
+                    } else {
+                        stalled_anthropic_reply("partial")
+                    }
+                })
+                .await;
+            let tmp = tempfile::tempdir().expect("temporary gateway root");
+            let backend = Arc::new(LateSteerBackend::default());
+            *backend.late.lock().unwrap() = Some(LATE_STEER.to_string());
+            let mut state =
+                crate::api::tests::test_state(anthropic_fixture_config(tmp.path(), provider));
+            state.session_backend = Some(backend.clone());
+            let cancel_tokens = state.cancel_tokens.clone();
+            let (gateway, gateway_server) = serve_chat(state).await;
+
+            let (mut client, _) = connect_async(format!(
+                "ws://{gateway}/ws/chat?agent=web&session_id=late-steer-abort"
+            ))
+            .await
+            .expect("WebSocket upgrade");
+            assert_eq!(next_json_frame(&mut client).await["type"], "session_start");
+            client
+                .send(ClientMessage::Text(
+                    serde_json::json!({"type": "message", "content": "first"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("chat message");
+            while next_json_frame(&mut client).await["type"] != "chunk" {}
+            cancel_tokens
+                .lock()
+                .unwrap()
+                .get("gw_late-steer-abort")
+                .expect("the running turn's cancel token")
+                .cancel();
+
+            let mut refused = Vec::new();
+            loop {
+                let frame = next_json_frame(&mut client).await;
+                if frame["type"] == "aborted" {
+                    break;
+                }
+                if frame["code"] == "STEERING_CLOSED" {
+                    refused.push(frame["content"].clone());
+                }
+            }
+            assert_eq!(
+                refused,
+                [LATE_STEER],
+                "the unread steer is refused, with its text, before `aborted`"
+            );
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                1,
+                "an aborted turn chains no further turn"
+            );
+
+            gateway_server.abort();
+            provider_server.abort();
+        });
     }
 }

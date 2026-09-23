@@ -78,6 +78,47 @@ must add the matching hub call, or a reconnect will replay an incomplete turn (n
 error). A new turn-failure code must also be told to zc-codex, which ends the turn on
 `PROVIDER_ERROR`/`AUTH_ERROR`/`AGENT_ERROR`.
 
+### Steering a turn never read runs next or is refused, never dropped (gateway)
+
+A `message` frame sent while a turn runs is steering. The agent
+(`turn_streamed_with_steering_state`) reads its steering channel only between rounds,
+checks it once more after the last round, and returns. Anything accepted after that
+check was acknowledged by nothing and processed by nothing: on the driving socket until
+`tokio::join!(turn_fut, forward_fut)` completed, and on a resumed socket until
+`hub.finish`, which is longer. The agent also leaves steering unread when it reaches
+`max_tool_iterations` or is cancelled. A resumed socket additionally ignored `steer`'s
+refusal, so a full queue or a finished turn dropped its message silently too. Verified
+from source on 2026-09-23.
+
+Every steer now goes through `TurnHub::steer`, and each turn ends by draining its
+channel under the same lock (`take_unread_steering`), so every message is either drained
+or refused, never both and never neither. What a `done` or `error` turn left unread runs
+as the next turn on the same session, joined in arrival order with a blank line, through
+the same `process_chat_message` a fresh `message` takes. Steering stays open between the
+two turns, and resumed sockets stay attached (`finish_chained`). What an aborted turn left
+unread does not run, because the operator stopped the turn or deleted the session. Each
+such message is answered with `STEERING_CLOSED` carrying its text in `content`, on the
+driving socket and on every resumed one. A resumed socket's steer refused because the
+session had stopped taking steering runs as that socket's next turn, and a full queue
+answers `STEERING_QUEUE_FULL` there as it already did on the driving socket.
+
+zc-codex needs no change. It starts a turn on that turn's first frame (`translate`), so a
+chained turn renders as a new turn after `done`, and it already treats `STEERING_*` as
+refusals that do not end a turn. It does not read `content` yet.
+
+| File | Why |
+|---|---|
+| `crates/zeroclaw-gateway/src/ws_hub.rs` | `steer` returns `Result<(), TrySendError<String>>`, handing a refused message back. `take_unread_steering` drains under the steering lock and closes steering unless a chained turn will read what it took. `finish_chained` ends a turn without ending the session's run; `announce` fans out a frame without buffering it. The live broadcast carries `LiveFrame { text, last }`, so an observer detaches on `last` instead of on any `done`/`aborted`/`error` type. |
+| `crates/zeroclaw-gateway/src/ws.rs` | The steering channel is per socket (`handle_socket`) and outlives a turn. `process_chat_message` returns the unread steering, joined, and both call sites loop on it under the same session guard. The `done`/`error` arms end through `finish_or_chain`; the aborted arm calls `refuse_unread_steering` before `aborted`. `observe_running_turn` returns the messages the session refused as closed, which run as that socket's first turn. The forward loop and the observer share `steering_refused_frame`. |
+| `crates/zeroclaw-runtime/src/agent/agent.rs` | Tests only. `turn_streamed_with_steering_reads_messages_queued_before_it_starts_in_order` covers steering that reached a chained turn between turns (read in round 0). `..._leaves_what_it_never_read_in_the_channel_at_its_round_limit` and `..._when_cancelled` pin the contract the gateway drain relies on. |
+
+Conflict note: every terminal path of `process_chat_message` must end through
+`finish_or_chain` or `refuse_unread_steering`, never a bare `hub.finish`. A bare `finish`
+closes steering without draining it, and since the channel belongs to the socket, what it
+held surfaces in that socket's next turn or is lost with the socket, with no compile
+error. A new steering path must go through `TurnHub::steer`, not a raw sender, because
+the drain is only complete when every send happens under the steering lock.
+
 ### Session lifecycle SSE events
 
 | File | Why |
@@ -498,3 +539,16 @@ Re-check these after every upstream merge; they are easy to silently lose:
   one chunk. A merge that takes upstream's `stream_guard.rs` drops the release
   and its tests together, with no compile error; the symptom is a `default`
   agent reply arriving on `/ws/chat` as a single `chunk`.
+
+- **Steering is never dropped at a turn's end.** Upstream accepts a mid-turn
+  `message` into a channel the agent reads only between rounds, then drops the
+  channel with the turn. A message accepted after the agent's last check, or left
+  unread at `max_tool_iterations` or on cancel, is gone without an error frame.
+  Ours runs what a `done` or `error` turn left unread as the next turn (joined in
+  arrival order), and answers what an aborted turn left unread with
+  `STEERING_CLOSED` plus the message in `content`. A merge that restores a bare
+  `hub.finish` in the `done`/`error` arms, or a raw `steering_tx.try_send` in the
+  forward loop, reopens the loss with no compile error.
+  `a_steer_accepted_after_the_last_round_runs_as_the_next_turn` and
+  `a_steer_an_aborted_turn_never_read_is_refused_with_its_content` in `ws.rs`
+  fail when it does.

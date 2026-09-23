@@ -9963,6 +9963,195 @@ mod tests {
         );
     }
 
+    fn streaming_steering_agent(seen_messages: Arc<Mutex<Vec<Vec<ChatMessage>>>>) -> Agent {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        Agent::builder()
+            .model_provider(Box::new(StreamingSteeringModelProvider {
+                seen_messages,
+                call_count: AtomicUsize::new(0),
+                fail_on_call: None,
+                fail_chat_on_call: None,
+                fail_after_delta_on_call: None,
+                delay_chat_on_call: None,
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config")
+    }
+
+    fn user_turns(messages: &[ConversationMessage]) -> Vec<&str> {
+        messages
+            .iter()
+            .filter_map(|msg| match msg {
+                ConversationMessage::Chat(message) if message.role == "user" => {
+                    Some(message.content.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_with_steering_reads_messages_queued_before_it_starts_in_order() {
+        let seen_messages = Arc::new(Mutex::new(Vec::new()));
+        let mut agent = streaming_steering_agent(seen_messages.clone());
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(4);
+        for queued in ["second", "third"] {
+            steering_tx
+                .send(queued.into())
+                .await
+                .expect("steering message should enqueue");
+        }
+
+        let outcome = agent
+            .turn_streamed_with_steering_state("first", event_tx, None, Some(&mut steering_rx))
+            .await
+            .expect("turn should succeed");
+
+        assert_eq!(outcome.response, "draft", "one round reads all three");
+        let users = user_turns(&outcome.new_messages);
+        assert_eq!(
+            users.len(),
+            3,
+            "each message is its own user turn: {users:?}"
+        );
+        for (turn, text) in users.iter().zip(["first", "second", "third"]) {
+            assert!(turn.ends_with(text), "arrival order must hold: {users:?}");
+        }
+        let seen = seen_messages.lock();
+        assert_eq!(seen.len(), 1);
+        let provider_users: Vec<&str> = seen[0]
+            .iter()
+            .filter(|msg| msg.role == "user")
+            .map(|msg| msg.content.as_str())
+            .collect();
+        assert_eq!(provider_users.len(), 3);
+        for (turn, text) in provider_users.iter().zip(["first", "second", "third"]) {
+            assert!(
+                turn.ends_with(text),
+                "the provider must see arrival order: {provider_users:?}"
+            );
+        }
+        assert!(steering_rx.try_recv().is_err(), "nothing is left unread");
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_with_steering_leaves_what_it_never_read_in_the_channel_at_its_round_limit()
+     {
+        let mut agent = streaming_steering_agent(Arc::new(Mutex::new(Vec::new())));
+        agent.config.resolved.max_tool_iterations = 1;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let handle = zeroclaw_spawn::spawn!(async move {
+            let result = agent
+                .turn_streamed_with_steering_state("first", event_tx, None, Some(&mut steering_rx))
+                .await;
+            (result, steering_rx)
+        });
+
+        loop {
+            match event_rx.recv().await.expect("turn event should arrive") {
+                TurnEvent::Chunk { delta } if delta == "draft" => {
+                    steering_tx
+                        .send("second".into())
+                        .await
+                        .expect("steering message should enqueue");
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        let (result, mut steering_rx) = handle.await.expect("turn task should finish");
+        let err = result.expect_err("the round limit ends the turn before a steering round");
+        assert!(
+            err.error.to_string().contains("maximum tool iterations"),
+            "unexpected error: {}",
+            err.error
+        );
+        assert_eq!(err.committed_response, "draft");
+        assert!(
+            !user_turns(&err.new_messages)
+                .iter()
+                .any(|turn| turn.contains("second")),
+            "a message the turn never read must not be reported as read"
+        );
+        assert_eq!(
+            steering_rx
+                .try_recv()
+                .expect("the caller can still take it"),
+            "second"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_with_steering_leaves_what_it_never_read_in_the_channel_when_cancelled() {
+        let mut agent = streaming_steering_agent(Arc::new(Mutex::new(Vec::new())));
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let cancel_for_task = cancel_token.clone();
+        let handle = zeroclaw_spawn::spawn!(async move {
+            let result = agent
+                .turn_streamed_with_steering_state(
+                    "first",
+                    event_tx,
+                    Some(cancel_for_task),
+                    Some(&mut steering_rx),
+                )
+                .await;
+            (result, steering_rx)
+        });
+
+        loop {
+            match event_rx.recv().await.expect("turn event should arrive") {
+                TurnEvent::Chunk { delta } if delta == "draft" => {
+                    steering_tx
+                        .send("second".into())
+                        .await
+                        .expect("steering message should enqueue");
+                    cancel_token.cancel();
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        let (result, mut steering_rx) = handle.await.expect("turn task should finish");
+        let err = result.expect_err("a cancelled turn fails");
+        assert!(
+            crate::agent::loop_::is_tool_loop_cancelled(&err.error),
+            "unexpected error: {}",
+            err.error
+        );
+        assert!(
+            !user_turns(&err.new_messages)
+                .iter()
+                .any(|turn| turn.contains("second")),
+            "a message the turn never read must not be reported as read"
+        );
+        assert_eq!(
+            steering_rx
+                .try_recv()
+                .expect("the caller can still take it"),
+            "second"
+        );
+    }
+
     #[tokio::test]
     async fn turn_streamed_error_before_visible_output_falls_back_to_chat() {
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {

@@ -33,6 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 use serde_json::Value;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::ws_approval::{PendingApprovals, new_pending_approvals};
@@ -53,6 +54,14 @@ pub fn is_replayable(frame_type: &str) -> bool {
     )
 }
 
+/// One serialized frame on the live broadcast.
+#[derive(Clone, Debug)]
+pub struct LiveFrame {
+    pub text: String,
+    /// The session goes idle after this frame, so observers detach.
+    pub last: bool,
+}
+
 /// One session's running-turn state. Shared (`Arc`) between the socket that
 /// drives the turn and any socket that attaches to observe it.
 pub struct TurnHub {
@@ -60,14 +69,13 @@ pub struct TurnHub {
     /// thinking deltas merged. Cleared at the start and end of every turn.
     replay: Mutex<Vec<Value>>,
     /// Live serialized frames to every attached observer socket.
-    live: broadcast::Sender<String>,
+    live: broadcast::Sender<LiveFrame>,
     /// True only while a turn is streaming for this session.
     running: AtomicBool,
     /// Tool-approval prompts awaiting an operator decision, keyed by request id.
     /// On the hub (not per socket) so a resumed socket can answer them.
     pub pending_approvals: PendingApprovals,
-    /// Steering channel of the running turn, so a resumed socket can inject a
-    /// mid-turn message. `None` between turns.
+    /// Sender into the running turn's steering channel; every steer goes through it, `None` refuses.
     steering: Mutex<Option<mpsc::Sender<String>>>,
 }
 
@@ -133,7 +141,19 @@ impl TurnHub {
         if !merged_into_last {
             replay.push(frame.clone());
         }
-        let _ = self.live.send(frame.to_string());
+        let _ = self.live.send(LiveFrame {
+            text: frame.to_string(),
+            last: false,
+        });
+    }
+
+    /// Fan a frame out to observers without buffering it for replay.
+    pub fn announce(&self, frame: &Value) {
+        let _replay = self.replay.lock();
+        let _ = self.live.send(LiveFrame {
+            text: frame.to_string(),
+            last: false,
+        });
     }
 
     /// Broadcast a terminal frame (`done`/`aborted`/`error`) and end the turn.
@@ -141,10 +161,23 @@ impl TurnHub {
     /// receives this frame) or sees `running() == false` and skips resume.
     pub fn finish(&self, frame: &Value) {
         let mut replay = self.replay.lock();
-        let _ = self.live.send(frame.to_string());
+        let _ = self.live.send(LiveFrame {
+            text: frame.to_string(),
+            last: true,
+        });
         replay.clear();
         *self.steering.lock() = None;
         self.running.store(false, Ordering::Release);
+    }
+
+    /// Broadcast a terminal frame with the next turn chained behind it; observers and steering stay attached.
+    pub fn finish_chained(&self, frame: &Value) {
+        let mut replay = self.replay.lock();
+        let _ = self.live.send(LiveFrame {
+            text: frame.to_string(),
+            last: false,
+        });
+        replay.clear();
     }
 
     /// Attach an observer to a running turn: atomically snapshot the replay
@@ -159,7 +192,7 @@ impl TurnHub {
     /// the app opens a modal for every replayed request — an answer to a stale
     /// one would go nowhere. A request raised after this snapshot arrives live.
     /// Lock order is replay → pending_approvals; nothing takes them in reverse.
-    pub fn attach(&self) -> Option<(broadcast::Receiver<String>, Vec<Value>)> {
+    pub fn attach(&self) -> Option<(broadcast::Receiver<LiveFrame>, Vec<Value>)> {
         let replay = self.replay.lock();
         if !self.running.load(Ordering::Acquire) {
             return None;
@@ -180,13 +213,29 @@ impl TurnHub {
         Some((rx, frames))
     }
 
-    /// Inject a steering message into the running turn. `false` if no turn is
-    /// running or its steering queue is full/closed.
-    pub fn steer(&self, content: String) -> bool {
-        self.steering
-            .lock()
-            .as_ref()
-            .is_some_and(|tx| tx.try_send(content).is_ok())
+    /// Inject a steering message into the running turn; a refusal hands the message back.
+    pub fn steer(&self, content: String) -> Result<(), TrySendError<String>> {
+        match self.steering.lock().as_ref() {
+            Some(tx) => tx.try_send(content),
+            None => Err(TrySendError::Closed(content)),
+        }
+    }
+
+    /// Drain what the finished turn accepted but never read, in arrival order, and close steering unless `chain` has a turn to run it.
+    pub fn take_unread_steering(
+        &self,
+        steering: &mut mpsc::Receiver<String>,
+        chain: bool,
+    ) -> Vec<String> {
+        let mut open = self.steering.lock();
+        let mut unread = Vec::new();
+        while let Ok(content) = steering.try_recv() {
+            unread.push(content);
+        }
+        if !chain || unread.is_empty() {
+            *open = None;
+        }
+        unread
     }
 }
 
@@ -282,11 +331,15 @@ mod tests {
         assert!(rx.try_recv().is_err());
         // A frame pushed after attach arrives live, and only live.
         hub.push(&json!({"type":"chunk","content":"after"}));
-        let live: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        let live = rx.recv().await.unwrap();
+        assert!(!live.last);
+        let live: Value = serde_json::from_str(&live.text).unwrap();
         assert_eq!(live["type"], "chunk");
         assert_eq!(live["content"], "after");
         hub.finish(&json!({"type":"done"}));
-        let term: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        let term = rx.recv().await.unwrap();
+        assert!(term.last, "the observer detaches after the terminal frame");
+        let term: Value = serde_json::from_str(&term.text).unwrap();
         assert_eq!(term["type"], "done");
     }
 
@@ -327,10 +380,93 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let hub = TurnHub::new();
         hub.begin(tx);
-        assert!(hub.steer("keep going".into()));
+        assert!(hub.steer("keep going".into()).is_ok());
         assert_eq!(rx.try_recv().unwrap(), "keep going");
         hub.finish(&json!({"type":"done"}));
-        assert!(!hub.steer("too late".into()), "no steering between turns");
+        assert!(
+            hub.steer("too late".into()).is_err(),
+            "no steering between turns"
+        );
+    }
+
+    #[test]
+    fn a_refused_steer_hands_the_message_back() {
+        let (tx, _rx) = mpsc::channel(1);
+        let hub = TurnHub::new();
+        assert!(
+            matches!(hub.steer("no turn".into()), Err(TrySendError::Closed(m)) if m == "no turn"),
+            "nothing takes steering between turns"
+        );
+        hub.begin(tx);
+        assert!(hub.steer("first".into()).is_ok());
+        assert!(
+            matches!(hub.steer("second".into()), Err(TrySendError::Full(m)) if m == "second"),
+            "a full queue refuses and returns the message"
+        );
+    }
+
+    #[test]
+    fn steering_the_turn_never_read_is_taken_and_later_steering_is_refused() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let hub = TurnHub::new();
+        hub.begin(tx);
+        assert!(hub.steer("one".into()).is_ok());
+        assert!(hub.steer("two".into()).is_ok());
+        assert_eq!(hub.take_unread_steering(&mut rx, false), ["one", "two"]);
+        assert!(
+            matches!(hub.steer("three".into()), Err(TrySendError::Closed(m)) if m == "three"),
+            "steering closes with the drain, so nothing lands behind it unread"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_chained_turn_keeps_its_observers_and_its_steering_open() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let hub = TurnHub::new();
+        hub.begin(tx.clone());
+        let (mut live, _) = hub.attach().expect("running");
+        assert!(hub.steer("next".into()).is_ok());
+
+        assert_eq!(hub.take_unread_steering(&mut rx, true), ["next"]);
+        assert!(
+            hub.steer("between turns".into()).is_ok(),
+            "steering stays open for the chained turn"
+        );
+        hub.finish_chained(&json!({"type":"done","full_response":"one"}));
+        assert!(
+            !live.recv().await.unwrap().last,
+            "the observer stays for the chained turn"
+        );
+        assert!(hub.running());
+        let (_, frames) = hub
+            .attach()
+            .expect("a socket arriving between the turns attaches");
+        assert!(frames.is_empty(), "the finished turn is not replayed");
+
+        hub.begin(tx);
+        assert_eq!(rx.try_recv().unwrap(), "between turns");
+        hub.push(&json!({"type":"chunk","content":"two"}));
+        let chunk: Value = serde_json::from_str(&live.recv().await.unwrap().text).unwrap();
+        assert_eq!(chunk["content"], "two");
+
+        assert!(hub.take_unread_steering(&mut rx, true).is_empty());
+        hub.finish(&json!({"type":"done","full_response":"two"}));
+        assert!(live.recv().await.unwrap().last);
+        assert!(!hub.running());
+        assert!(hub.steer("after".into()).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_announcement_reaches_observers_but_is_not_replayed() {
+        let hub = TurnHub::new();
+        hub.begin(mpsc::channel(1).0);
+        let (mut live, _) = hub.attach().expect("running");
+        hub.announce(&json!({"type":"error","code":"STEERING_CLOSED","content":"x"}));
+        let frame = live.recv().await.unwrap();
+        assert!(!frame.last);
+        assert!(frame.text.contains("STEERING_CLOSED"));
+        assert!(hub.attach().expect("running").1.is_empty());
     }
 
     #[test]
