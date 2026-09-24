@@ -40,6 +40,62 @@ pub fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
     err.chain().any(|source| source.is::<ToolLoopCancelled>())
 }
 
+/// Why the tool loop ended a turn before the model finished it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolLoopStop {
+    /// The turn used all `max_tool_iterations` rounds.
+    MaxIterations(usize),
+    /// The loop detector's circuit breaker fired with this message.
+    LoopDetected(String),
+    /// Tool output repeated for this many consecutive rounds.
+    IdenticalOutput(usize),
+}
+
+impl ToolLoopStop {
+    /// Short reason for run records and alerts.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::MaxIterations(n) => format!("reached maximum tool iterations ({n})"),
+            Self::LoopDetected(msg) => format!("loop detector: {msg}"),
+            Self::IdenticalOutput(n) => {
+                format!("identical tool output for {n} consecutive rounds")
+            }
+        }
+    }
+}
+
+/// A turn the tool loop stopped, with the text it produced before stopping.
+#[derive(Debug)]
+pub struct ToolLoopStopped {
+    pub stop: ToolLoopStop,
+    pub partial_output: String,
+}
+
+impl std::fmt::Display for ToolLoopStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.stop {
+            ToolLoopStop::MaxIterations(n) => {
+                write!(f, "Agent exceeded maximum tool iterations ({n})")
+            }
+            ToolLoopStop::LoopDetected(msg) => {
+                write!(f, "Agent loop aborted by loop detector: {msg}")
+            }
+            ToolLoopStop::IdenticalOutput(n) => write!(
+                f,
+                "Agent loop aborted: identical tool output detected {n} consecutive times"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ToolLoopStopped {}
+
+/// The `ToolLoopStopped` in `err`'s chain, if the tool loop stopped the turn.
+pub fn tool_loop_stopped(err: &anyhow::Error) -> Option<&ToolLoopStopped> {
+    err.chain()
+        .find_map(|source| source.downcast_ref::<ToolLoopStopped>())
+}
+
 #[derive(Debug)]
 pub(crate) struct StreamInterruptedAfterOutput {
     pub(crate) partial_text: String,

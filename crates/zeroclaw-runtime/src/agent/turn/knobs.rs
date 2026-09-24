@@ -10,6 +10,8 @@ pub enum MaxIterationBehavior {
     GracefulSummary,
     /// Bail with "exceeded maximum tool iterations" (embedder control signal).
     ErrorAtCap,
+    /// Ask for the final summary, then fail the turn with it as a `ToolLoopStopped` error.
+    SummaryThenStop,
 }
 
 /// Explicit knobs for per-caller loop behaviour.

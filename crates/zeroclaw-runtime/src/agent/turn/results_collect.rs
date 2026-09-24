@@ -2,6 +2,7 @@
 //! feed the pattern-based loop detector, and run the time-gated
 //! identical-output abort.
 
+use super::outcome::{ToolLoopStop, ToolLoopStopped};
 use crate::agent::history::{
     append_or_merge_system_message, canonicalize_tool_result_media_markers_for,
     truncate_tool_result,
@@ -117,7 +118,11 @@ pub(crate) fn collect_tool_results(
                             })),
                         "loop_detector_circuit_breaker"
                     );
-                    anyhow::bail!("Agent loop aborted by loop detector: {msg}");
+                    return Err(ToolLoopStopped {
+                        stop: ToolLoopStop::LoopDetected(msg),
+                        partial_output: String::new(),
+                    }
+                    .into());
                 }
             }
         }
@@ -202,10 +207,11 @@ pub(crate) fn check_identical_output_abort(
                     })),
                 "tool_loop_identical_output_abort"
             );
-            anyhow::bail!(
-                "Agent loop aborted: identical tool output detected {} consecutive times",
-                *consecutive_identical_outputs
-            );
+            return Err(ToolLoopStopped {
+                stop: ToolLoopStop::IdenticalOutput(*consecutive_identical_outputs),
+                partial_output: String::new(),
+            }
+            .into());
         }
     }
     Ok(())
