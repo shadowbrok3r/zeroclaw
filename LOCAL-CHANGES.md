@@ -119,6 +119,32 @@ held surfaces in that socket's next turn or is lost with the socket, with no com
 error. A new steering path must go through `TurnHub::steer`, not a raw sender, because
 the drain is only complete when every send happens under the steering lock.
 
+### A socket reloads history that turns it did not run left behind (gateway)
+
+Each `/ws/chat` socket seeds its agent once, from the session store at connect, and then
+keeps that history in memory. A socket that connected while a turn was running watched it
+through `turn_resume` but never received it, because the turn is persisted only when it
+ends, after that load. Every later turn on the socket reached the model without the
+exchange it had just shown. The same held for turns chained behind it from unread
+steering, and for any turn another socket ran on the session. Verified from source on
+2026-09-23.
+
+The hub now counts finished turns (`turns_finished`), and `finish` and `finish_chained`
+count each one after it is persisted. A socket records the count just before its
+connect-time load. Before each turn it runs, holding the session guard, it compares: if
+the count moved, it clears the agent's history (`Agent::clear_history`) and seeds it from
+the store as at connect, forwarding a `history_trimmed` frame if seeding trims. After its
+own turns it records the count again, so they never trigger a reload. The store keeps
+plain chat rows only, so a reload drops tool calls and results from that socket's
+in-memory history, leaving the same history a fresh connect would have. Rows written
+outside a WebSocket turn, such as cron `app.<alias>` deliveries and REST message posts, do
+not move the count and are still not picked up by a connected socket.
+
+| File | Why |
+|---|---|
+| `crates/zeroclaw-gateway/src/ws_hub.rs` | `finished: AtomicU64` and `turns_finished()`; `finish` and `finish_chained` count each turn. |
+| `crates/zeroclaw-gateway/src/ws.rs` | `handle_socket` takes the hub before the connect-time load and records `synced_turns` there. `resync_history` runs once the session guard is held, at both places a turn starts, and the count is recorded again after the turn and anything chained behind it. Test `a_socket_that_resumed_mid_turn_answers_with_that_turn_in_its_history`. |
+
 ### Session lifecycle SSE events
 
 | File | Why |
@@ -552,3 +578,11 @@ Re-check these after every upstream merge; they are easy to silently lose:
   `a_steer_accepted_after_the_last_round_runs_as_the_next_turn` and
   `a_steer_an_aborted_turn_never_read_is_refused_with_its_content` in `ws.rs`
   fail when it does.
+
+- **A socket's agent reloads turns it did not run.** Upstream seeds a socket's
+  agent once at connect, so a turn it watched or another socket ran never
+  reaches its later prompts. Ours reloads from the session store before a turn
+  whenever the hub's finished-turn count moved. A merge that drops
+  `resync_history`, or moves the hub lookup after the connect-time load, reopens
+  the gap with no compile error; `a_socket_that_resumed_mid_turn_answers_with_that_turn_in_its_history`
+  fails when it does.

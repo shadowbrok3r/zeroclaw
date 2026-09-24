@@ -29,7 +29,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -72,6 +72,8 @@ pub struct TurnHub {
     live: broadcast::Sender<LiveFrame>,
     /// True only while a turn is streaming for this session.
     running: AtomicBool,
+    /// Turns finished on this session, chained ones included.
+    finished: AtomicU64,
     /// Tool-approval prompts awaiting an operator decision, keyed by request id.
     /// On the hub (not per socket) so a resumed socket can answer them.
     pub pending_approvals: PendingApprovals,
@@ -86,6 +88,7 @@ impl TurnHub {
             replay: Mutex::new(Vec::new()),
             live,
             running: AtomicBool::new(false),
+            finished: AtomicU64::new(0),
             pending_approvals: new_pending_approvals(),
             steering: Mutex::new(None),
         })
@@ -93,6 +96,11 @@ impl TurnHub {
 
     pub fn running(&self) -> bool {
         self.running.load(Ordering::Acquire)
+    }
+
+    /// How many turns have finished on this session; each is persisted before it counts.
+    pub fn turns_finished(&self) -> u64 {
+        self.finished.load(Ordering::Acquire)
     }
 
     /// Mark a turn started: reset the replay buffer and install its steering
@@ -167,6 +175,7 @@ impl TurnHub {
         });
         replay.clear();
         *self.steering.lock() = None;
+        self.finished.fetch_add(1, Ordering::Release);
         self.running.store(false, Ordering::Release);
     }
 
@@ -178,6 +187,7 @@ impl TurnHub {
             last: false,
         });
         replay.clear();
+        self.finished.fetch_add(1, Ordering::Release);
     }
 
     /// Attach an observer to a running turn: atomically snapshot the replay
@@ -455,6 +465,17 @@ mod tests {
         assert!(live.recv().await.unwrap().last);
         assert!(!hub.running());
         assert!(hub.steer("after".into()).is_err());
+    }
+
+    #[test]
+    fn every_finished_turn_is_counted_chained_or_not() {
+        let hub = TurnHub::new();
+        assert_eq!(hub.turns_finished(), 0);
+        hub.begin(mpsc::channel(1).0);
+        hub.finish_chained(&json!({"type":"done"}));
+        hub.begin(mpsc::channel(1).0);
+        hub.finish(&json!({"type":"aborted"}));
+        assert_eq!(hub.turns_finished(), 2);
     }
 
     #[tokio::test]

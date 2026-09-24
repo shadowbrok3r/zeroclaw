@@ -385,6 +385,12 @@ async fn handle_socket(
             None
         }
     };
+    // Per-session turn hub. Pending approvals live here (not per socket) so a
+    // socket that resumes a running turn can answer a prompt the turn is parked
+    // on, and the turn's frames are mirrored here for reconnect replay.
+    let hub = crate::ws_hub::hub_for(&session_key);
+    // Finished-turn count the loaded history reflects; read before the load.
+    let mut synced_turns = hub.turns_finished();
     let mut resumed = false;
     let mut message_count: usize = 0;
     let mut effective_name: Option<String> = None;
@@ -631,10 +637,6 @@ async fn handle_socket(
 
     let (approval_event_tx, mut approval_event_rx) =
         tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(8);
-    // Per-session turn hub. Pending approvals live here (not per socket) so a
-    // socket that resumes a running turn can answer a prompt the turn is parked
-    // on, and the turn's frames are mirrored here for reconnect replay.
-    let hub = crate::ws_hub::hub_for(&session_key);
     let pending_approvals: PendingApprovals = hub.pending_approvals.clone();
     // Steering channel of the turns this socket runs; every send goes through `TurnHub::steer`.
     let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(32);
@@ -746,6 +748,15 @@ async fn handle_socket(
                 return;
             }
         };
+        resync_history(
+            &state,
+            &mut agent,
+            &mut sender,
+            &session_key,
+            &hub,
+            &mut synced_turns,
+        )
+        .await;
         let mut next = Some(content);
         while let Some(content) = next.take() {
             next = process_chat_message(
@@ -767,6 +778,7 @@ async fn handle_socket(
             )
             .await;
         }
+        synced_turns = hub.turns_finished();
     }
 
     // Subscribe to the shared broadcast channel so cron/heartbeat events
@@ -906,6 +918,15 @@ async fn handle_socket(
                     }
                 };
 
+                resync_history(
+                    &state,
+                    &mut agent,
+                    &mut sender,
+                    &session_key,
+                    &hub,
+                    &mut synced_turns,
+                )
+                .await;
                 let mut next = Some(content);
                 while let Some(content) = next.take() {
                     next = process_chat_message(
@@ -927,6 +948,7 @@ async fn handle_socket(
                     )
                     .await;
                 }
+                synced_turns = hub.turns_finished();
             }
 
             // ── Broadcast event (cron/heartbeat results) ──────────────
@@ -1365,6 +1387,41 @@ fn finish_or_chain(
     }
     hub.finish_chained(terminal);
     Some(unread.join("\n\n"))
+}
+
+/// Reload the agent's history from the session store when a turn it did not run has finished since it last synced.
+async fn resync_history<S>(
+    state: &AppState,
+    agent: &mut zeroclaw_runtime::agent::Agent,
+    sender: &mut S,
+    session_key: &str,
+    hub: &crate::ws_hub::TurnHub,
+    synced_turns: &mut u64,
+) where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    let finished = hub.turns_finished();
+    if finished == *synced_turns {
+        return;
+    }
+    *synced_turns = finished;
+    let Some(ref backend) = state.session_backend else {
+        return;
+    };
+    let stored = backend.load(session_key);
+    agent.clear_history();
+    if stored.is_empty() {
+        return;
+    }
+    if let Some(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+        dropped_messages,
+        kept_turns,
+        reason,
+    }) = agent.seed_history_with_event(&stored)
+    {
+        let frame = history_trimmed_ws_frame(dropped_messages, kept_turns, &reason);
+        let _ = sender.send(Message::Text(frame.to_string().into())).await;
+    }
 }
 
 /// Process a single chat message through the agent and send the response.
@@ -3314,6 +3371,28 @@ data: {\"type\":\"message_stop\"}\n\n",
             .into_response()
     }
 
+    /// Holds `gated_anthropic_reply` open until notified.
+    static REPLY_GATE: std::sync::LazyLock<tokio::sync::Notify> =
+        std::sync::LazyLock::new(tokio::sync::Notify::new);
+
+    /// A reply that streams `text`, then finishes once `REPLY_GATE` is notified.
+    fn gated_anthropic_reply(text: &str) -> axum::response::Response {
+        let head = anthropic_text_sse(text, false);
+        let tail = anthropic_text_sse(text, true)[head.len()..].to_string();
+        let body = futures_util::stream::once(std::future::ready(
+            Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(head)),
+        ))
+        .chain(futures_util::stream::once(async move {
+            REPLY_GATE.notified().await;
+            Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(tail))
+        }));
+        (
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            axum::body::Body::from_stream(body),
+        )
+            .into_response()
+    }
+
     /// Anthropic `/v1/messages` fixture that records each request and answers with `reply`.
     async fn serve_anthropic_fixture(
         requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
@@ -3577,6 +3656,84 @@ data: {\"type\":\"message_stop\"}\n\n",
                 requests.lock().unwrap().len(),
                 1,
                 "an aborted turn chains no further turn"
+            );
+
+            gateway_server.abort();
+            provider_server.abort();
+        });
+    }
+
+    #[test]
+    fn a_socket_that_resumed_mid_turn_answers_with_that_turn_in_its_history() {
+        on_large_stack("ws-resume-history", || async {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (provider, provider_server) =
+                serve_anthropic_fixture(requests.clone(), |request| {
+                    if request.to_string().contains("follow-up 5d1e") {
+                        anthropic_reply("follow-up reply")
+                    } else {
+                        gated_anthropic_reply("observed reply 5d1e")
+                    }
+                })
+                .await;
+            let tmp = tempfile::tempdir().expect("temporary gateway root");
+            let backend = Arc::new(LateSteerBackend::default());
+            let mut state =
+                crate::api::tests::test_state(anthropic_fixture_config(tmp.path(), provider));
+            state.session_backend = Some(backend.clone());
+            let (gateway, gateway_server) = serve_chat(state).await;
+            let url = format!("ws://{gateway}/ws/chat?agent=web&session_id=resume-history");
+            let message = |content: &str| {
+                ClientMessage::Text(
+                    serde_json::json!({"type": "message", "content": content})
+                        .to_string()
+                        .into(),
+                )
+            };
+
+            let (mut driver, _) = connect_async(&url).await.expect("WebSocket upgrade");
+            assert_eq!(next_json_frame(&mut driver).await["type"], "session_start");
+            driver
+                .send(message("observed ask 5d1e"))
+                .await
+                .expect("chat message");
+            while next_json_frame(&mut driver).await["type"] != "chunk" {}
+
+            let (mut resumed, _) = connect_async(&url).await.expect("WebSocket upgrade");
+            assert_eq!(next_json_frame(&mut resumed).await["type"], "session_start");
+            resumed
+                .send(ClientMessage::Text(r#"{"type":"connect"}"#.into()))
+                .await
+                .expect("connect frame");
+            assert_eq!(next_json_frame(&mut resumed).await["type"], "connected");
+            assert_eq!(
+                next_json_frame(&mut resumed).await["type"],
+                "turn_resume",
+                "the second socket joins the running turn"
+            );
+            REPLY_GATE.notify_one();
+            while next_json_frame(&mut resumed).await["type"] != "done" {}
+
+            resumed
+                .send(message("follow-up 5d1e"))
+                .await
+                .expect("chat message");
+            let done = loop {
+                let frame = next_json_frame(&mut resumed).await;
+                assert_ne!(frame["type"], "error", "unexpected error frame: {frame}");
+                if frame["type"] == "done" {
+                    break frame;
+                }
+            };
+            assert_eq!(done["full_response"], "follow-up reply");
+
+            let requests = requests.lock().unwrap().clone();
+            assert_eq!(requests.len(), 2, "one provider request per turn");
+            let follow_up = requests[1].to_string();
+            assert!(
+                follow_up.contains("observed ask 5d1e")
+                    && follow_up.contains("observed reply 5d1e"),
+                "the resumed socket's turn must carry the turn it watched: {follow_up}"
             );
 
             gateway_server.abort();
