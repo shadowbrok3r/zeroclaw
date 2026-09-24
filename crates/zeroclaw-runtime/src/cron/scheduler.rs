@@ -1247,7 +1247,9 @@ async fn deliver_if_configured(
     output: &str,
 ) -> Result<()> {
     let delivery: &DeliveryConfig = &job.delivery;
-    if !delivery.mode.eq_ignore_ascii_case("announce") {
+    let every_run = delivery.mode.eq_ignore_ascii_case("announce");
+    let failed_run = delivery.mode.eq_ignore_ascii_case("on_failure") && !success;
+    if !every_run && !failed_run {
         return Ok(());
     }
 
@@ -3339,6 +3341,12 @@ mod tests {
     /// Channel name the recorder counts. Used only by the suppression test.
     const COUNT_CHANNEL: &str = "count-delivery";
 
+    static ON_FAILURE_DELIVERED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// Channel name the recorder counts for the `on_failure` tests.
+    const ON_FAILURE_CHANNEL: &str = "on-failure-count-delivery";
+
     fn register_recording_delivery_fn() {
         // Idempotent: register_delivery_fn is a no-op once the OnceLock is set,
         // so repeated calls across tests are safe and the first writer wins. The
@@ -3352,9 +3360,75 @@ mod tests {
                 if channel == COUNT_CHANNEL {
                     DELIVERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
+                if channel == ON_FAILURE_CHANNEL {
+                    ON_FAILURE_DELIVERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 Ok(())
             })
         }));
+    }
+
+    #[tokio::test]
+    async fn on_failure_delivery_sends_failed_runs_only() {
+        register_recording_delivery_fn();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = test_job("echo ok");
+        job.delivery = DeliveryConfig {
+            mode: "on_failure".to_string(),
+            channel: Some(ON_FAILURE_CHANNEL.to_string()),
+            to: Some("chat-id".to_string()),
+            thread_id: None,
+            best_effort: true,
+        };
+        crate::cron::validate_delivery_config(Some(&job.delivery))
+            .expect("on_failure validates like announce");
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let before = ON_FAILURE_DELIVERED.load(SeqCst);
+        deliver_if_configured(&config, &job, true, "sweep clean")
+            .await
+            .unwrap();
+        assert_eq!(
+            ON_FAILURE_DELIVERED.load(SeqCst),
+            before,
+            "a successful run must not be delivered"
+        );
+
+        deliver_if_configured(
+            &config,
+            &job,
+            false,
+            "agent job stopped: reached maximum tool iterations (30)",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ON_FAILURE_DELIVERED.load(SeqCst),
+            before + 1,
+            "a failed run must be delivered"
+        );
+    }
+
+    #[test]
+    fn on_failure_delivery_requires_a_channel_and_target() {
+        let missing_channel = DeliveryConfig {
+            mode: "on_failure".to_string(),
+            channel: None,
+            to: Some("chat-id".to_string()),
+            thread_id: None,
+            best_effort: true,
+        };
+        assert!(crate::cron::validate_delivery_config(Some(&missing_channel)).is_err());
+
+        let missing_target = DeliveryConfig {
+            mode: "on_failure".to_string(),
+            channel: Some(ON_FAILURE_CHANNEL.to_string()),
+            to: None,
+            thread_id: None,
+            best_effort: true,
+        };
+        assert!(crate::cron::validate_delivery_config(Some(&missing_target)).is_err());
     }
 
     fn announce_job() -> CronJob {
