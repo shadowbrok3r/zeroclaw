@@ -419,10 +419,107 @@ without anyone being asked. Tests pinning this: `supervised_operator_approval_li
 `full_autonomy_approval_does_not_lift_the_allowlist_or_the_block`, and
 `needs_operator_approval_matches_what_validate_would_refuse`.
 
+### MCP calls to one server overlap, and time only their own round trip (tools)
+
+With `parallel_tools = true` a sweep step issues several `mastertech__*` calls at
+once, but the client serialized every HTTP and SSE request to a server behind one
+lock, and each call's `tool_timeout_secs` deadline started before it queued for that
+lock. One hung call held the lock for its full 120 s and every call queued behind it
+timed out on time it spent waiting (91 such timeouts in the 2026-09-24 audit of the
+shop box). The server was not the bottleneck: rmcp 3.4.0 runs every request of a
+session as its own task.
+
+| File | Why |
+|---|---|
+| `crates/zeroclaw-tools/src/mcp_client.rs` | `serial_gate` is built for `sse` only; stdio and streamable HTTP multiplex by JSON-RPC id. `send_request` wraps only `transport.send_and_recv` in `timeout(call_timeout, …)`, so waiting for the gate or for a recovery is never charged to the call, and `dispatch_rpc` no longer carries one deadline across attempts. Tests: `queued_call_timeout_excludes_time_spent_waiting_for_the_gate` (paused clock; fails against the old code) and `http_tool_calls_to_one_server_run_concurrently`. |
+| `crates/zeroclaw-tools/src/mcp_transport.rs` | `HttpTransport::send_and_recv` checks the recovery barrier after taking the epoch permit (a pending recovery sends nothing), and records a response's `Mcp-Session-Id` before releasing the permit, so an overlapping response cannot overwrite the session a recovery just negotiated. Test: `http_transport_sends_nothing_while_recovery_is_pending`. |
+
+### A cron agent run the tool loop stopped is an error (runtime)
+
+A cron agent run that used all `max_tool_iterations` rounds got a tools-free summary
+and returned `Ok`, so it was stored as `ok` with the stop reason as a last line of
+prose. A run the loop detector broke was stored as `error` but then retried twice,
+repeating whatever side effects it had already had.
+
+| File | Why |
+|---|---|
+| `crates/zeroclaw-runtime/src/agent/turn/outcome.rs` | `ToolLoopStopped { stop: ToolLoopStop, partial_output }` and `tool_loop_stopped()`. `Display` keeps the exact strings the old `bail!`s produced, so text matchers elsewhere are unaffected. |
+| `crates/zeroclaw-runtime/src/agent/turn/knobs.rs`, `max_iter.rs` | `MaxIterationBehavior::SummaryThenStop`: ask for the summary as `GracefulSummary` does, then fail the turn with it as `ToolLoopStopped`. A failed summary becomes a note in `partial_output`; cancellation passes through. |
+| `crates/zeroclaw-runtime/src/agent/turn/results_collect.rs` | The circuit breaker and the identical-output abort return `ToolLoopStopped`. |
+| `crates/zeroclaw-runtime/src/agent/loop_.rs` | `AgentRunOverrides::max_iteration_behavior` reaches both `run_tool_call_loop` call sites in `run`. |
+| `crates/zeroclaw-runtime/src/cron/scheduler.rs` | `run_agent_job` passes `SummaryThenStop` and turns `ToolLoopStopped` into `(false, "agent job stopped: <reason>\n\n<summary>")`; `execute_job_with_retry` does not retry that prefix. Tests drive a scripted provider through `execute_and_persist_job` and read `cron_runs`: `agent_run_that_hits_max_tool_iterations_is_recorded_as_error_once`, `agent_run_stopped_by_the_loop_detector_is_recorded_as_error_once`, `agent_run_that_finishes_within_the_cap_is_still_ok`. |
+| `crates/zeroclaw-runtime/src/tools/spawn_subagent.rs` | Sets the new override field to the default. |
+
+### Cron delivery can be failures-only (`delivery.mode = "on_failure"`)
+
+`announce` delivered every run, so the only way to be told about a failure was to be
+told about every success too, and nothing else alerted on a failed run.
+
+| File | Why |
+|---|---|
+| `crates/zeroclaw-runtime/src/cron/scheduler.rs` | `deliver_if_configured` sends an `on_failure` job's output only when the run did not succeed. Tests: `on_failure_delivery_sends_failed_runs_only`, `on_failure_delivery_requires_a_channel_and_target`. |
+| `crates/zeroclaw-runtime/src/cron/mod.rs` | `validate_delivery_config` accepts `on_failure` with the same channel/target rules as `announce`. |
+| `crates/zeroclaw-runtime/src/tools/cron_add.rs`, `cron_update.rs` | The `delivery.mode` enum lists `on_failure`. |
+| `crates/zeroclaw-config/src/schema.rs` | `DeliveryConfigDecl.mode` doc. |
+
+The dashboard's cron page is unchanged: it can create only `none`/`announce` jobs and
+shows an `on_failure` job's delivery as `none` (read-only; it never rewrites it).
+
+### `allowed_tools` names MCP tools like any other tool (tools, runtime)
+
+Upstream (#7547) auto-admitted every `<server>__<tool>` name once a risk profile's
+`allowed_tools` was non-empty, so an allowlist of read tools still offered and ran
+`mastertech__remote_exec_start` and `mastertech__plugin_deploy_remote`. A non-empty
+list now admits exactly the names it contains; `excluded_tools` still subtracts; a
+cron job's per-run list still intersects with the profile's.
+
+| File | Why |
+|---|---|
+| `crates/zeroclaw-tools/src/tool_search.rs` | `ToolAccessPolicy::is_tool_allowed` drops `\|\| name.contains("__")`. This one policy gates eager registration, the deferred prompt section, `tool_search` search/select/activation, pinned resources and `mcp_resources`/`mcp_prompts`. Tests: `risk_profile_allowlist_admits_only_the_mcp_tools_it_names`, `excluded_tools_*`. |
+| `crates/zeroclaw-runtime/src/tools/delegate.rs` | `delegate_admits_with_mcp` (its own copy of the exception) becomes `delegate_admits`. |
+| `crates/zeroclaw-runtime/src/tools/scoped.rs` | Tests at the assembly boundary against a mock `mastertech` MCP server, eager and deferred: `risk_profile_allowed_tools_registers_only_the_listed_mcp_tools`, `risk_profile_allowed_tools_keeps_unlisted_mcp_tools_out_of_tool_search`, `excluded_tools_subtract_a_listed_mcp_tool_and_leave_others`, `cron_allowed_tools_intersects_with_the_risk_profile_list`. |
+| `crates/zeroclaw-runtime/src/agent/loop_.rs`, `crates/zeroclaw-channels/src/orchestrator/mod.rs`, `crates/zeroclaw-gateway/src/lib.rs` | Tests and doc comments that pinned the auto-admit. |
+| `crates/zeroclaw-config/src/schema.rs`, `docs/book/src/tools/mcp.md`, `docs/book/src/tools/overview.md` | The documented contract. |
+
+Skill tools with `kind = "mcp"` are unchanged: a skill that names an MCP target is an
+explicit grant and still reaches it (the shop's skills declare no tools).
+
+### A loop-detector repeat means the same call (runtime)
+
+Measured on the shop box (trace 2026-09-17..24): five of eight `shelf_triage` breaks
+were the no-progress detector counting per-service lookups with different arguments
+that all returned the same empty result, and the ping-pong detector compared tool
+names only, so per-item `record_shelf_candidate`/`ensure_order_records` pairs could
+trip it. The exact-repeat detector already keyed on name plus arguments; the other
+three breaks were genuine (`list_waiting_services` with identical arguments five
+times running).
+
+| File | Why |
+|---|---|
+| `crates/zeroclaw-runtime/src/agent/loop_detector.rs` | `ToolCallRecord::same_call` (name and arguments). Ping-pong needs the same two calls alternating; no-progress needs the same call returning the same result five or more times, non-contiguously (contiguous runs stay with exact-repeat and `max_repeats`). Tests: `per_item_calls_with_identical_acknowledgements_never_trip_the_detector`, `no_progress_ignores_distinct_arguments_with_identical_results`, `ping_pong_ignores_alternation_with_varying_args`. |
+| `crates/zeroclaw-runtime/src/agent/turn/results_collect.rs` | Tests: distinct arguments with identical output pass; the same call repeated still breaks. |
+
+This narrows upstream #7681, which targeted near-duplicate shell commands with
+different arguments and identical output. Those are now bounded by
+`max_tool_iterations` and, when set, `pacing.loop_detection_min_elapsed_secs`.
+
+### Rolling trace trim runs once per quarter window (log)
+
+`rolling` counted and rewrote the whole trace on every event once it was at the cap:
+with `log_persistence_max_entries = 20000` that rewrote a 310 MB file about 2,900
+times a day (~0.9 TB/day on the shop box), and a trim that failed or a process that
+died mid-trim left its temp file behind (3.1 GB of `runtime-trace.tmp.*`).
+
+| File | Why |
+|---|---|
+| `crates/zeroclaw-log/src/writer.rs` | The worker counts appends and trims back to `max_entries` only once the file holds `max_entries + max_entries / 4` lines, counting the file once at startup. A failed trim removes its temp file, and writer init removes `<stem>.tmp.<pid>.<nanos>` files not written for ten minutes. Tests: `rolling_trims_only_after_a_quarter_window_past_max_entries`, `rolling_appends_below_the_high_water_mark_keep_the_same_file`, `rolling_counts_lines_already_in_the_file_at_startup`, `init_removes_stale_rolling_trim_temp_files`. |
+| `crates/zeroclaw-config/src/schema.rs`, `docs/book/src/ops/observability.md`, `docs/book/src/architecture/logging.md` | The window and cleanup contract; `rotating` added to the mode list. |
+
 ### Documentation
 
 | File | Why |
 |---|---|
+| `docs/book/src/architecture/background-work-lifecycle.md` | Cron run statuses, stopped runs, and `on_failure` delivery. |
 | `docs/book/src/architecture/session-lifecycle.md` (NEW) | Deep-dive: store, key families, sessionless surfaces, lifecycle, fork surfaces. |
 | `docs/book/src/SUMMARY.md` | Registers the new page under Architecture. |
 | `docs/book/src/architecture/runtime-state-and-persistence.md` | Chat/channel-sessions row: scoped TTL sweeps and `origin_principal` note. |
@@ -461,6 +558,21 @@ Conflicts concentrate in the shared files below.
 ## Behavior deltas vs upstream
 
 Re-check these after every upstream merge; they are easy to silently lose:
+
+- **`allowed_tools` has no MCP exception.** A merge that brings back
+  `|| name.contains("__")` in `ToolAccessPolicy::is_tool_allowed` or
+  `DelegateTool::delegate_admits` re-opens every MCP tool to every allowlisted
+  profile with no compile error. `risk_profile_allowlist_admits_only_the_mcp_tools_it_names`
+  and the `scoped.rs` `risk_profile_allowed_tools_*` tests pin it.
+- **HTTP MCP requests are not serialized, and a call's timeout starts at the
+  transport.** A merge that restores `serial_gate` for `http` or a `timeout_at`
+  around all of `send_request` brings back queue-time timeouts.
+- **Cron agent runs use `MaxIterationBehavior::SummaryThenStop`** and stopped runs
+  are not retried. Upstream's `GracefulSummary` default records a capped run as `ok`.
+- **Loop-detector repeats are same tool plus same arguments** in all three
+  detectors; upstream's no-progress and ping-pong detectors trip on per-item calls.
+- **Rolling trace trim is chunked** (`rolling_high_water`) and stale trim temps are
+  removed at init; upstream rewrites the file on every event past the cap.
 
 - **Gateway TTL sweep is `gw_`-scoped and hourly.** Upstream runs
   `cleanup_stale` once at startup and deletes stale rows of every family,
