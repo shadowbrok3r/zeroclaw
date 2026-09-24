@@ -12483,7 +12483,7 @@ pub struct ObservabilityConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub otel_headers: Option<std::collections::HashMap<String, String>>,
 
-    /// Log persistence mode: "none" | "rolling" | "full".
+    /// Log persistence mode: "none" | "rolling" | "full" | "rotating".
     /// Controls whether every event passing through `zeroclaw_log::record!`
     /// is appended to the on-disk JSONL log.
     #[serde(
@@ -12497,7 +12497,7 @@ pub struct ObservabilityConfig {
     #[serde(default = "default_log_persistence_path", alias = "runtime_trace_path")]
     pub log_persistence_path: String,
 
-    /// Maximum entries retained when `log_persistence = "rolling"`.
+    /// Entries kept when `log_persistence = "rolling"`; the file is trimmed back to this count once it holds a quarter more.
     #[serde(
         default = "default_log_persistence_max_entries",
         alias = "runtime_trace_max_entries"
