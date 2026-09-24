@@ -181,8 +181,8 @@ impl Tool for CronUpdateTool {
                             "properties": {
                                 "mode": {
                                     "type": "string",
-                                    "enum": ["none", "announce"],
-                                    "description": "'announce' sends output to the specified channel; 'none' disables delivery"
+                                    "enum": ["none", "announce", "on_failure"],
+                                    "description": "'announce' sends every run's output to the specified channel; 'on_failure' sends only failed runs; 'none' disables delivery"
                                 },
                                 "channel": {
                                     "type": "string",

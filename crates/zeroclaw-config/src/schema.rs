@@ -13848,7 +13848,7 @@ impl Default for CronScheduleDecl {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "cron_delivery"]
 pub struct DeliveryConfigDecl {
-    /// Delivery mode: `"none"` or `"announce"`.
+    /// Delivery mode: `"none"`, `"announce"` (every run) or `"on_failure"` (failed runs only).
     #[serde(default = "default_delivery_mode")]
     pub mode: String,
     /// Channel to deliver to, as `<type>.<alias>` (e.g.
