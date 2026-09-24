@@ -239,6 +239,16 @@ mod tests {
     /// different args but return an identical `output` string, with the given
     /// `success` flag.
     fn run(n: usize, output: &str, success: bool) -> Result<CollectedResults> {
+        run_with_paths(n, output, success, |i| format!("file_{i}.rs"))
+    }
+
+    /// Like `run`, with the `path` argument of call `i` produced by `path`.
+    fn run_with_paths(
+        n: usize,
+        output: &str,
+        success: bool,
+        path: impl Fn(usize) -> String,
+    ) -> Result<CollectedResults> {
         let mut detector = LoopDetector::new(LoopDetectorConfig::default());
         let ignore: HashSet<&str> = HashSet::new();
         let mut history: Vec<ChatMessage> = Vec::new();
@@ -247,7 +257,7 @@ mod tests {
         for i in 0..n {
             tool_calls.push(ParsedToolCall {
                 name: "file_read".to_string(),
-                arguments: serde_json::json!({ "path": format!("file_{i}.rs") }),
+                arguments: serde_json::json!({ "path": path(i) }),
                 tool_call_id: None,
             });
             ordered.push(Some((
@@ -280,11 +290,16 @@ mod tests {
     }
 
     #[test]
-    fn successful_identical_results_still_trip_no_progress_breaker() {
-        // Identical *successful* output across different args is the genuine
-        // stuck-loop signaland must still hard-abort the turn.
-        let err = match run(8, "byte-identical successful output", true) {
-            Ok(_) => panic!("expected the no-progress circuit breaker to abort the turn"),
+    fn identical_results_for_distinct_arguments_do_not_trip_the_breaker() {
+        assert!(run(8, "byte-identical successful output", true).is_ok());
+    }
+
+    #[test]
+    fn repeating_the_same_call_still_trips_the_breaker() {
+        let err = match run_with_paths(8, "byte-identical successful output", true, |_| {
+            "file_0.rs".to_string()
+        }) {
+            Ok(_) => panic!("expected the circuit breaker to abort the turn"),
             Err(e) => e.to_string(),
         };
         assert!(err.contains("loop detector"), "got: {err}");
