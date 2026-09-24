@@ -57,6 +57,13 @@ struct ToolCallRecord {
     result_hash: u64,
 }
 
+impl ToolCallRecord {
+    /// Whether both records call the same tool with the same arguments.
+    fn same_call(&self, other: &Self) -> bool {
+        self.name == other.name && self.args_hash == other.args_hash
+    }
+}
+
 /// Produce a deterministic hash for a JSON value that is invariant under
 /// object-key reordering.  Implemented as a streaming walker that feeds
 /// structural tags + sorted keys + leaves directly to a [`Hasher`], so the
@@ -212,7 +219,7 @@ impl LoopDetector {
             .window
             .iter()
             .rev()
-            .take_while(|r| r.name == last.name && r.args_hash == last.args_hash)
+            .take_while(|r| r.same_call(last))
             .count();
 
         if consecutive >= max + 2 {
@@ -236,8 +243,7 @@ impl LoopDetector {
         }
     }
 
-    /// Pattern 2: Two tools alternating (A->B->A->B) for 4+ full cycles
-    /// (i.e. 8 consecutive entries following the pattern).
+    /// Pattern 2: the same two calls to different tools alternating (A->B->A->B) for 4+ cycles.
     fn detect_ping_pong(&self) -> Option<LoopDetectionResult> {
         const MIN_CYCLES: usize = 4;
         let needed = MIN_CYCLES * 2; // each cycle = 2 calls
@@ -248,8 +254,10 @@ impl LoopDetector {
 
         let tail: Vec<&ToolCallRecord> = self.window.iter().rev().take(needed).collect();
         // tail[0] is most recent; pattern: A, B, A, B, ...
-        let a_name = &tail[0].name;
-        let b_name = &tail[1].name;
+        let a = tail[0];
+        let b = tail[1];
+        let a_name = &a.name;
+        let b_name = &b.name;
 
         if a_name == b_name {
             return None;
@@ -257,9 +265,9 @@ impl LoopDetector {
 
         let is_ping_pong = tail.iter().enumerate().all(|(i, r)| {
             if i % 2 == 0 {
-                &r.name == a_name
+                r.same_call(a)
             } else {
-                &r.name == b_name
+                r.same_call(b)
             }
         });
 
@@ -271,10 +279,7 @@ impl LoopDetector {
         let mut cycles = MIN_CYCLES;
         let extended: Vec<&ToolCallRecord> = self.window.iter().rev().collect();
         for extra_pair in extended.chunks(2).skip(MIN_CYCLES) {
-            if extra_pair.len() == 2
-                && &extra_pair[0].name == a_name
-                && &extra_pair[1].name == b_name
-            {
+            if extra_pair.len() == 2 && extra_pair[0].same_call(a) && extra_pair[1].same_call(b) {
                 cycles += 1;
             } else {
                 break;
@@ -300,9 +305,7 @@ impl LoopDetector {
         }
     }
 
-    /// Pattern 3: Same tool called 5+ times (with different args each time)
-    /// but producing the exact same result hash every time, counted across the
-    /// whole window so interleaved unrelated calls do not reset the streak.
+    /// Pattern 3: the same call returning the same result 5+ times anywhere in the window.
     fn detect_no_progress(&self) -> Option<LoopDetectionResult> {
         const MIN_CALLS: usize = 5;
 
@@ -311,41 +314,38 @@ impl LoopDetector {
         }
 
         let last = self.window.back()?;
-        // the stuck agent ran 43 near-duplicate shell calls returning
-        // byte-identical output, interleaved with other tools; filter (not a
-        // consecutive take_while) is what lets that non-adjacent run be counted.
-        let same_tool_same_result: Vec<&ToolCallRecord> = self
+        let positions: Vec<usize> = self
             .window
             .iter()
-            .filter(|r| r.name == last.name && r.result_hash == last.result_hash)
+            .enumerate()
+            .filter(|(_, r)| r.same_call(last) && r.result_hash == last.result_hash)
+            .map(|(i, _)| i)
             .collect();
 
-        let count = same_tool_same_result.len();
+        let count = positions.len();
         if count < MIN_CALLS {
             return None;
         }
 
-        // Verify they have *different* args (otherwise exact_repeat handles it).
-        let unique_args: std::collections::HashSet<u64> =
-            same_tool_same_result.iter().map(|r| r.args_hash).collect();
-        if unique_args.len() < 2 {
-            // All same args — this is exact-repeat territory, not no-progress.
+        // Contiguous matches are a consecutive run, left to `detect_exact_repeat`.
+        let span = positions[count - 1] - positions[0] + 1;
+        if span == count {
             return None;
         }
 
         if count >= MIN_CALLS + 2 {
             Some(LoopDetectionResult::Break(format!(
-                "Circuit breaker: tool '{}' called {} times with different arguments but identical results — no progress",
+                "Circuit breaker: tool '{}' called {} times with identical arguments and identical results — no progress",
                 last.name, count
             )))
         } else if count > MIN_CALLS {
             Some(LoopDetectionResult::Block(format!(
-                "Blocked: tool '{}' called {} times with different arguments but identical results",
+                "Blocked: tool '{}' called {} times with identical arguments and identical results",
                 last.name, count
             )))
         } else {
             Some(LoopDetectionResult::Warning(format!(
-                "Warning: tool '{}' called {} times with different arguments but identical results. \
+                "Warning: tool '{}' called {} times with identical arguments and identical results. \
                  The current approach may not be making progress.",
                 last.name, count
             )))
@@ -518,44 +518,92 @@ mod tests {
     // ── No-progress tests ────────────────────────────────────────
 
     #[test]
-    fn no_progress_warning_at_five_different_args_same_result() {
+    fn no_progress_ignores_distinct_arguments_with_identical_results() {
         let mut det = LoopDetector::new(default_config());
 
-        for i in 0..5 {
-            let args = json!({"query": format!("attempt_{i}")});
-            let result = det.record("search", &args, "no results found");
-            if i < 4 {
-                assert_eq!(result, LoopDetectionResult::Ok, "iteration {i}");
-            } else {
-                match result {
-                    LoopDetectionResult::Warning(msg) => {
-                        assert!(msg.contains("search"));
-                        assert!(msg.contains("identical results"));
-                    }
-                    other => panic!("expected Warning, got {other:?}"),
-                }
-            }
+        for i in 0..12 {
+            let args = json!({"query": format!("service_{i}")});
+            assert_eq!(
+                det.record("mastertech__search_diagnostics", &args, "[]"),
+                LoopDetectionResult::Ok,
+                "lookup {i} for a distinct item must not count as a repeat"
+            );
+        }
+    }
+
+    #[test]
+    fn per_item_calls_with_identical_acknowledgements_never_trip_the_detector() {
+        let mut det = LoopDetector::new(default_config());
+
+        for i in 0..10 {
+            let service = json!({"service_number": format!("21550{i:02}")});
+            assert_eq!(
+                det.record(
+                    "mastertech__record_shelf_candidate",
+                    &service,
+                    "{\"ok\":true}"
+                ),
+                LoopDetectionResult::Ok,
+                "record call {i}"
+            );
+            assert_eq!(
+                det.record(
+                    "mastertech__ensure_order_records",
+                    &service,
+                    "{\"ok\":true}"
+                ),
+                LoopDetectionResult::Ok,
+                "ensure call {i}"
+            );
         }
     }
 
     #[test]
     fn no_progress_escalates_to_block_and_break() {
         let mut det = LoopDetector::new(default_config());
+        let args = json!({"q": "same"});
 
-        // 6 calls with different args, same result.
-        for i in 0..6 {
-            let args = json!({"q": format!("v{i}")});
-            det.record("web_fetch", &args, "timeout");
+        let mut outcomes = Vec::new();
+        for i in 0..7 {
+            outcomes.push(det.record("web_fetch", &args, "timeout"));
+            det.record(
+                &format!("reader_{i}"),
+                &json!({"path": format!("/f{i}")}),
+                &format!("body_{i}"),
+            );
         }
-        // 7th call: count=7 which is >= MIN_CALLS(5)+2 -> Break.
-        let r7 = det.record("web_fetch", &json!({"q": "v6"}), "timeout");
-        match r7 {
+        assert!(matches!(outcomes[4], LoopDetectionResult::Warning(_)));
+        assert!(matches!(outcomes[5], LoopDetectionResult::Block(_)));
+        match &outcomes[6] {
             LoopDetectionResult::Break(msg) => {
                 assert!(msg.contains("web_fetch"));
                 assert!(msg.contains("7 times"));
                 assert!(msg.contains("no progress"));
             }
             other => panic!("expected Break at 7 calls, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_progress_ignores_same_arguments_with_changing_results() {
+        let mut det = LoopDetector::new(default_config());
+        let args = json!({"status": "checkin_shelf", "store": "RIV"});
+
+        for i in 0..8 {
+            assert_eq!(
+                det.record(
+                    "mastertech__list_waiting_services",
+                    &args,
+                    &format!("hours_{i}")
+                ),
+                LoopDetectionResult::Ok,
+                "call {i}"
+            );
+            det.record(
+                "mastertech__search_diagnostics",
+                &json!({"query": format!("service_{i}")}),
+                "[]",
+            );
         }
     }
 
@@ -572,14 +620,14 @@ mod tests {
 
     #[test]
     fn no_progress_triggered_when_interleaved_with_other_calls() {
-        // same tool + same result repeated non-consecutively, with
+        // same call + same result repeated non-consecutively, with
         // varied unrelated calls interleaved, must still be detected. The old
         // take_while logic reset the streak on any interleaved call.
         let mut det = LoopDetector::new(default_config());
 
         let mut last = LoopDetectionResult::Ok;
         for i in 0..5 {
-            let args = json!({"q": format!("v{i}")});
+            let args = json!({"q": "same"});
             last = det.record("search", &args, "no results found");
             // Interleave a distinct unrelated tool each time so neither
             // ping-pong nor exact-repeat fires before no-progress.
@@ -601,15 +649,18 @@ mod tests {
 
     #[test]
     fn no_progress_not_triggered_when_all_args_identical() {
-        // If args are all the same, exact_repeat should fire, not no_progress.
+        // Consecutive identical calls are graded by exact_repeat, not no_progress.
         let mut det = LoopDetector::new(config_with_repeats(6));
         let args = json!({"q": "same"});
 
-        for _ in 0..5 {
-            det.record("search", &args, "no results");
+        for i in 0..5 {
+            assert_eq!(
+                det.record("search", &args, "no results"),
+                LoopDetectionResult::Ok,
+                "call {i} is below max_repeats"
+            );
         }
         // 6th call = exact repeat at threshold (max_repeats=6) -> Warning.
-        // no_progress requires >=2 unique args, so it must NOT fire.
         let r = det.record("search", &args, "no results");
         match r {
             LoopDetectionResult::Warning(msg) => {
@@ -663,15 +714,33 @@ mod tests {
     // ── Ping-pong with varying args ─────────────────────────────
 
     #[test]
-    fn ping_pong_detects_alternation_with_varying_args() {
+    fn ping_pong_ignores_alternation_with_varying_args() {
         let mut det = LoopDetector::new(default_config());
 
-        // A->B->A->B with different args each time — ping-pong cares only
-        // about tool names, not argument equality.
-        for i in 0..8 {
+        for i in 0..16 {
             let name = if i % 2 == 0 { "read" } else { "write" };
-            let args = json!({"attempt": i});
-            let result = det.record(name, &args, &format!("r{i}"));
+            let args = json!({"item": i / 2});
+            assert_eq!(
+                det.record(name, &args, &format!("r{i}")),
+                LoopDetectionResult::Ok,
+                "iteration {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn ping_pong_detects_alternation_of_the_same_two_calls() {
+        let mut det = LoopDetector::new(default_config());
+        let read_args = json!({"path": "/a"});
+        let write_args = json!({"path": "/b"});
+
+        for i in 0..8 {
+            let (name, args) = if i % 2 == 0 {
+                ("read", &read_args)
+            } else {
+                ("write", &write_args)
+            };
+            let result = det.record(name, args, &format!("r{i}"));
             if i < 7 {
                 assert_eq!(result, LoopDetectionResult::Ok, "iteration {i}");
             } else {
