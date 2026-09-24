@@ -1252,12 +1252,16 @@ impl SharedMcpTransportConn for HttpTransport {
         }
 
         let epoch_guard = lifecycle.begin_write().await;
+        lifecycle.check_writer_boundary()?;
         req = self.apply_session_header(req);
         lifecycle.mark_outcome_unknown(epoch_guard.epoch());
         let resp = req
             .send()
             .await
             .context("HTTP request to MCP server failed")?;
+        if resp.status().is_success() {
+            self.update_session_id_from_headers(resp.headers());
+        }
         drop(epoch_guard);
 
         if !resp.status().is_success() {
@@ -1273,8 +1277,6 @@ impl SharedMcpTransportConn for HttpTransport {
             lifecycle.mark_completed();
             bail!("MCP server returned HTTP {}", status);
         }
-
-        self.update_session_id_from_headers(resp.headers());
 
         if request.id.is_none() {
             return finish_response(
@@ -3588,6 +3590,59 @@ mod tests {
             Some(McpTransportError::StaleSession { status }) => assert_eq!(*status, 404),
             other => panic!("expected StaleSession, got {other:?}"),
         }
+    }
+
+    /// Recovery gate that always reports a pending recovery.
+    struct PendingRecoveryGate;
+
+    impl McpRecoveryGate for PendingRecoveryGate {
+        fn arm(&self, _epoch: u64) {}
+
+        fn write_blocked(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn http_transport_sends_nothing_while_recovery_is_pending() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let config = McpServerConfig {
+            name: "test-http".into(),
+            transport: McpTransport::Http,
+            url: Some(server.uri()),
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(&config).expect("build transport");
+        let req = JsonRpcRequest::new(7, "tools/call", serde_json::json!({}));
+        let lifecycle = McpRequestLifecycle::coordinated(
+            Arc::new(RwLock::new(0)),
+            Some(Arc::new(PendingRecoveryGate)),
+        );
+        let err = transport
+            .send_and_recv(&req, &lifecycle)
+            .await
+            .expect_err("a pending recovery must block the write");
+        assert!(
+            matches!(
+                err.downcast_ref::<McpTransportError>(),
+                Some(McpTransportError::RecoveryPending)
+            ),
+            "got: {err:#}"
+        );
+        assert!(
+            lifecycle.pre_write_epoch().is_some(),
+            "a refused write must stay pre-write"
+        );
+        server.verify().await;
     }
 
     #[tokio::test]
