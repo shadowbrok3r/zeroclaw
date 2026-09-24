@@ -43,7 +43,7 @@ pub use knobs::{LoopKnobs, MaxIterationBehavior};
 pub(crate) use max_iter::finish_after_max_iterations;
 pub(crate) use outcome::StreamCancelledAfterOutput;
 pub use outcome::{
-    ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled, ToolLoopStop, ToolLoopStopped,
+    ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled, ToolLoopStopped,
     is_model_switch_requested, is_tool_loop_cancelled, tool_loop_stopped,
 };
 pub(crate) use outcome::{current_model_switch_state, scope_model_switch_state};

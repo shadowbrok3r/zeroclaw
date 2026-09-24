@@ -437,10 +437,7 @@ mod graceful_summary_metering_tests {
 
         let stopped = crate::agent::turn::tool_loop_stopped(&error)
             .expect("the error must carry ToolLoopStopped");
-        assert_eq!(
-            stopped.stop,
-            crate::agent::turn::ToolLoopStop::MaxIterations(2)
-        );
+        assert_eq!(stopped.stop, super::ToolLoopStop::MaxIterations(2));
         assert!(stopped.partial_output.contains("earlier narration"));
         assert!(stopped.partial_output.contains("wrap-up summary"));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
