@@ -1091,6 +1091,8 @@ pub struct AgentRunOverrides {
     /// (CLI / one-shot), which is correct for callers that have no
     /// cross-turn reuse contract.
     pub mcp_registry: Option<Arc<crate::tools::McpRegistry>>,
+    /// What the turn does when it reaches `max_tool_iterations`.
+    pub max_iteration_behavior: MaxIterationBehavior,
 }
 
 fn agent_provider_composite(
@@ -1265,6 +1267,10 @@ pub async fn run(
         let is_subagent_caller = overrides.is_subagent;
         let suppress_memory_inject = overrides.suppress_memory_inject;
         let memory_free = overrides.memory_free;
+        let loop_knobs = LoopKnobs {
+            max_iteration_behavior: overrides.max_iteration_behavior,
+            ..LoopKnobs::default()
+        };
         let security = match overrides.security {
             Some(sec) => sec,
             None => Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?),
@@ -1961,7 +1967,7 @@ pub async fn run(
                                         context_token_budget: agent
                                             .resolved
                                             .effective_context_budget(),
-                                        knobs: &LoopKnobs::default(),
+                                        knobs: &loop_knobs,
                                     },
                                 ),
                                 history: &mut history,
@@ -2521,7 +2527,7 @@ pub async fn run(
                                             context_token_budget: agent
                                                 .resolved
                                                 .effective_context_budget(),
-                                            knobs: &LoopKnobs::default(),
+                                            knobs: &loop_knobs,
                                         },
                                     ),
                                     history: &mut history,

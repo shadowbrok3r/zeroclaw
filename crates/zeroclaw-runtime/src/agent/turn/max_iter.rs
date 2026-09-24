@@ -3,7 +3,7 @@
 //! and return it appended to the accumulated display text, or bail.
 
 use super::knobs::{LoopKnobs, MaxIterationBehavior};
-use super::outcome::ToolLoopCancelled;
+use super::outcome::{ToolLoopCancelled, ToolLoopStop, ToolLoopStopped, is_tool_loop_cancelled};
 use anyhow::{Context, Result};
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
@@ -15,6 +15,77 @@ use zeroclaw_tool_call_parser::{strip_think_tags, strip_trailing_terminal_marker
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finish_after_max_iterations(
+    model_provider: &dyn ModelProvider,
+    history: &mut Vec<ChatMessage>,
+    provider_name: &str,
+    model: &str,
+    temperature: Option<f64>,
+    pacing: &PacingConfig,
+    cancellation_token: Option<&CancellationToken>,
+    max_iterations: usize,
+    accumulated_display_text: String,
+    turn_id: &str,
+    knobs: &LoopKnobs,
+    event_tx: Option<&Sender<TurnEvent>>,
+    new_messages_out: Option<&mut Vec<ChatMessage>>,
+) -> Result<String> {
+    if knobs.max_iteration_behavior != MaxIterationBehavior::SummaryThenStop {
+        return summarize_after_max_iterations(
+            model_provider,
+            history,
+            provider_name,
+            model,
+            temperature,
+            pacing,
+            cancellation_token,
+            max_iterations,
+            accumulated_display_text,
+            turn_id,
+            knobs,
+            event_tx,
+            new_messages_out,
+        )
+        .await;
+    }
+
+    let before_summary = accumulated_display_text.clone();
+    let partial_output = match summarize_after_max_iterations(
+        model_provider,
+        history,
+        provider_name,
+        model,
+        temperature,
+        pacing,
+        cancellation_token,
+        max_iterations,
+        accumulated_display_text,
+        turn_id,
+        knobs,
+        event_tx,
+        new_messages_out,
+    )
+    .await
+    {
+        Ok(text) => text,
+        Err(error) if is_tool_loop_cancelled(&error) => return Err(error),
+        Err(error) => {
+            let note = format!("final summary failed: {error:#}");
+            if before_summary.trim().is_empty() {
+                note
+            } else {
+                format!("{before_summary}\n\n{note}")
+            }
+        }
+    };
+    Err(ToolLoopStopped {
+        stop: ToolLoopStop::MaxIterations(max_iterations),
+        partial_output,
+    }
+    .into())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn summarize_after_max_iterations(
     model_provider: &dyn ModelProvider,
     history: &mut Vec<ChatMessage>,
     provider_name: &str,
@@ -332,6 +403,51 @@ mod graceful_summary_metering_tests {
 
     async fn run_summary(provider: &dyn ModelProvider) -> anyhow::Result<String> {
         run_summary_with_events(provider, String::new(), None).await
+    }
+
+    #[tokio::test]
+    async fn summary_then_stop_fails_the_turn_with_the_summary() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingUsageProvider {
+            calls: Arc::clone(&calls),
+        };
+        let mut history = vec![ChatMessage::user("do the work")];
+        let knobs = LoopKnobs {
+            max_iteration_behavior: crate::agent::turn::MaxIterationBehavior::SummaryThenStop,
+            ..LoopKnobs::default()
+        };
+
+        let error = finish_after_max_iterations(
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            None,
+            &PacingConfig::default(),
+            None,
+            2,
+            "earlier narration".to_string(),
+            "trace-req-test",
+            &knobs,
+            None,
+            None,
+        )
+        .await
+        .expect_err("SummaryThenStop must fail the turn");
+
+        let stopped = crate::agent::turn::tool_loop_stopped(&error)
+            .expect("the error must carry ToolLoopStopped");
+        assert_eq!(
+            stopped.stop,
+            crate::agent::turn::ToolLoopStop::MaxIterations(2)
+        );
+        assert!(stopped.partial_output.contains("earlier narration"));
+        assert!(stopped.partial_output.contains("wrap-up summary"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            error.to_string(),
+            "Agent exceeded maximum tool iterations (2)"
+        );
     }
 
     // The graceful summary now routes through the metered provider seam: under a
