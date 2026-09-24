@@ -4276,7 +4276,7 @@ mod tests {
         );
         assert!(
             registered_allowed,
-            "gateway must register a non-denied MCP tool (allowlist auto-admit)"
+            "gateway must register a non-denied MCP tool when no allowlist is set"
         );
         let names: Vec<&str> = gw_tools.iter().map(|t| t.name()).collect();
         assert!(

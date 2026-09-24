@@ -981,7 +981,7 @@ impl DelegateTool {
         })
     }
 
-    fn delegate_admits_with_mcp(policy: &SecurityPolicy, name: &str) -> bool {
+    fn delegate_admits(policy: &SecurityPolicy, name: &str) -> bool {
         let denied = policy
             .excluded_tools
             .as_ref()
@@ -991,8 +991,7 @@ impl DelegateTool {
         }
         match policy.allowed_tools.as_ref() {
             None => true,
-            Some(list) if list.is_empty() => false,
-            Some(list) => list.iter().any(|t| t == name) || name.contains("__"),
+            Some(list) => list.iter().any(|t| t == name),
         }
     }
 
@@ -2672,7 +2671,7 @@ impl DelegateTool {
                     parent_tools.iter().any(|tool| {
                         self.security.is_tool_allowed(tool.name())
                             && zeroclaw_tools::MEMORY_TOOL_NAMES.contains(&tool.name())
-                            && Self::delegate_admits_with_mcp(&tool_policy, tool.name())
+                            && Self::delegate_admits(&tool_policy, tool.name())
                     })
                 };
                 let mut target_memory_tools: HashMap<String, Box<dyn Tool>> = if needs_memory_tools
@@ -2699,7 +2698,7 @@ impl DelegateTool {
 
                 // Build the bounded tool set exactly as before: the parent's
                 // tools, filtered by the caller's own `is_tool_allowed` +
-                // `delegate_admits_with_mcp`, with the target's memory tools
+                // `delegate_admits`, with the target's memory tools
                 // substituted in. The `parent_tools` read guard is scoped to
                 // this block so it drops BEFORE the `assemble().await` below - a
                 // parking_lot guard held across an await would make the delegate
@@ -2710,7 +2709,7 @@ impl DelegateTool {
                         .iter()
                         .filter(|tool| tool.name() != Self::NAME)
                         .filter(|tool| self.security.is_tool_allowed(tool.name()))
-                        .filter(|tool| Self::delegate_admits_with_mcp(&tool_policy, tool.name()))
+                        .filter(|tool| Self::delegate_admits(&tool_policy, tool.name()))
                         .map(|tool| {
                             target_memory_tools.remove(tool.name()).unwrap_or_else(|| {
                                 Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>
@@ -4778,10 +4777,7 @@ mod tests {
         let policy = tool
             .resolve_tool_policy("agentic_test")
             .expect("policy resolves");
-        assert!(!DelegateTool::delegate_admits_with_mcp(
-            &policy,
-            "echo_tool"
-        ));
+        assert!(!DelegateTool::delegate_admits(&policy, "echo_tool"));
         let result = tool
             .execute_agentic(
                 "agentic",
@@ -4812,10 +4808,7 @@ mod tests {
         let policy = tool
             .resolve_tool_policy("agentic_test")
             .expect("policy resolves");
-        assert!(!DelegateTool::delegate_admits_with_mcp(
-            &policy,
-            "echo_tool"
-        ));
+        assert!(!DelegateTool::delegate_admits(&policy, "echo_tool"));
         let result = tool
             .execute_agentic(
                 "agentic",
@@ -4847,10 +4840,7 @@ mod tests {
         let policy = tool
             .resolve_tool_policy("agentic_test")
             .expect("policy resolves");
-        assert!(!DelegateTool::delegate_admits_with_mcp(
-            &policy,
-            "echo_tool"
-        ));
+        assert!(!DelegateTool::delegate_admits(&policy, "echo_tool"));
         let result = tool
             .execute_agentic(
                 "agentic",
@@ -6374,30 +6364,32 @@ mod tests {
     }
 
     #[test]
-    fn delegate_admits_with_mcp_auto_admits_double_underscore_mcp_names() {
+    fn delegate_admits_only_listed_mcp_names() {
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
-            .with_risk_profiles(agentic_risk_profiles(vec!["shell".to_string()]))
+            .with_risk_profiles(agentic_risk_profiles(vec![
+                "shell".to_string(),
+                "filesystem__read_file".to_string(),
+            ]))
             .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
 
         let policy = tool
             .resolve_tool_policy("agentic_test")
             .expect("agentic_test risk profile is configured");
 
-        // The explicit allow-list entry is admitted.
         assert!(
-            DelegateTool::delegate_admits_with_mcp(&policy, "shell"),
+            DelegateTool::delegate_admits(&policy, "shell"),
             "explicit allow-list entry must be admitted"
         );
-        // A runtime-discovered MCP wrapper (matching `<server>__<tool>`) is
-        // auto-admitted even though it is not in `allowed_tools`. This is
-        // the destructive capability the reviewer called out.
         assert!(
-            DelegateTool::delegate_admits_with_mcp(&policy, "filesystem__write_file"),
-            "double-underscore MCP name must be auto-admitted"
+            DelegateTool::delegate_admits(&policy, "filesystem__read_file"),
+            "a listed MCP name must be admitted"
         );
-        // Non-MCP names outside the allow-list still get rejected.
         assert!(
-            !DelegateTool::delegate_admits_with_mcp(&policy, "memory_recall"),
+            !DelegateTool::delegate_admits(&policy, "filesystem__write_file"),
+            "an MCP name missing from allowed_tools must be rejected"
+        );
+        assert!(
+            !DelegateTool::delegate_admits(&policy, "memory_recall"),
             "non-MCP names outside allow-list must be rejected"
         );
     }
@@ -6417,12 +6409,12 @@ mod tests {
     }
 
     #[test]
-    fn delegate_admits_with_mcp_honors_excluded_tools_for_auto_admitted_mcp() {
+    fn delegate_admits_honors_excluded_tools_for_listed_mcp() {
         let mut profiles = HashMap::new();
         profiles.insert(
             "agentic_test".to_string(),
             RiskProfileConfig {
-                allowed_tools: vec!["shell".to_string()],
+                allowed_tools: vec!["shell".to_string(), "filesystem__write_file".to_string()],
                 excluded_tools: vec!["filesystem__write_file".to_string()],
                 ..Default::default()
             },
@@ -6437,17 +6429,17 @@ mod tests {
             .expect("agentic_test risk profile is configured");
 
         assert!(
-            DelegateTool::delegate_admits_with_mcp(&policy, "shell"),
+            DelegateTool::delegate_admits(&policy, "shell"),
             "non-excluded allow-list entry must be admitted"
         );
         assert!(
-            !DelegateTool::delegate_admits_with_mcp(&policy, "filesystem__write_file"),
-            "excluded_tools must block auto-admitted MCP name"
+            !DelegateTool::delegate_admits(&policy, "filesystem__write_file"),
+            "excluded_tools must block a listed MCP name"
         );
     }
 
     #[test]
-    fn delegate_admits_with_mcp_honors_excluded_tools_for_explicit_allow_list_entries() {
+    fn delegate_admits_honors_excluded_tools_for_explicit_allow_list_entries() {
         let mut profiles = HashMap::new();
         profiles.insert(
             "agentic_test".to_string(),
@@ -6467,11 +6459,11 @@ mod tests {
             .expect("agentic_test risk profile is configured");
 
         assert!(
-            !DelegateTool::delegate_admits_with_mcp(&policy, "shell"),
+            !DelegateTool::delegate_admits(&policy, "shell"),
             "excluded entry must be rejected even when allow-listed"
         );
         assert!(
-            DelegateTool::delegate_admits_with_mcp(&policy, "memory_recall"),
+            DelegateTool::delegate_admits(&policy, "memory_recall"),
             "non-excluded entry must be admitted"
         );
     }
@@ -8669,7 +8661,7 @@ mod tests {
         let target_tool_policy = tool
             .resolve_tool_policy(&target_config.risk_profile)
             .expect("target tool policy resolves");
-        assert!(DelegateTool::delegate_admits_with_mcp(
+        assert!(DelegateTool::delegate_admits(
             &target_tool_policy,
             "deliver_file"
         ));

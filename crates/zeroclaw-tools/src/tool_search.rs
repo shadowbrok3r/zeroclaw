@@ -53,13 +53,10 @@ impl ToolAccessPolicy {
             return false;
         }
 
-        // Risk-profile gate: MCP `<server>__<tool>` names are auto-admitted
-        // when the list is non-empty. An explicit empty list (`Some(vec![])`)
-        // still means "deny everything".
+        // Risk-profile gate: exact names, MCP `<server>__<tool>` included; `Some(vec![])` denies all.
         let risk_ok = match self.allowed.as_ref() {
             None => true,
-            Some(list) if list.is_empty() => false,
-            Some(list) => list.iter().any(|t| t == name) || name.contains("__"),
+            Some(list) => list.iter().any(|t| t == name),
         };
         if !risk_ok {
             return false;
@@ -710,10 +707,6 @@ mod tests {
             make_stub("srv__ok", "OK tool"),
             make_stub("srv__nope", "Blocked tool"),
         ];
-        // Runtime-discovered MCP tools (names containing "__") are auto-admitted
-        // when an allow-list is present, so the operator-visible way to block a
-        // specific MCP tool is the deny-list (the `excluded_tools` equivalent).
-        // See `ToolAccessPolicy::is_tool_allowed` and
         let policy = ToolAccessPolicy {
             allowed: Some(vec!["srv__ok".into()]),
             denied: Some(vec!["srv__nope".into()]),
@@ -841,29 +834,77 @@ mod tests {
     }
 
     #[test]
-    fn caller_allowed_per_run_gate_narrows_after_risk_profile_auto_admit() {
+    fn caller_allowed_per_run_gate_narrows_the_risk_profile_list() {
         let policy = ToolAccessPolicy::from_security(
-            Some(&["shell".to_string()]),
+            Some(&[
+                "shell".to_string(),
+                "github__search".to_string(),
+                "filesystem__write_file".to_string(),
+            ]),
             None,
             Some(&["shell".to_string(), "github__search".to_string()]),
         )
         .expect("risk + caller lists should produce a policy");
 
-        // `shell`: in risk allow + in caller list → admitted.
         assert!(policy.is_tool_allowed("shell"));
-        // `github__search`: auto-admitted by risk MCP exception + in caller
-        // list → admitted.
         assert!(policy.is_tool_allowed("github__search"));
-        // `filesystem__write_file`: auto-admitted by risk MCP exception
-        // (would pass the risk gate) but NOT in caller list → rejected.
-        // This is the per-run narrowing the bug used to break.
         assert!(
             !policy.is_tool_allowed("filesystem__write_file"),
-            "MCP wrapper not in caller list must be rejected even when \
-             the risk-profile auto-admit would let it through"
+            "an MCP tool the risk profile lists but the caller list omits must be rejected"
         );
-        // Non-MCP outside both lists: rejected.
         assert!(!policy.is_tool_allowed("memory_recall"));
+    }
+
+    #[test]
+    fn risk_profile_allowlist_admits_only_the_mcp_tools_it_names() {
+        let policy = ToolAccessPolicy::from_security(
+            Some(&[
+                "tool_search".to_string(),
+                "mastertech__query_surrealdb".to_string(),
+                "mastertech__remote_channel_health".to_string(),
+            ]),
+            None,
+            None,
+        )
+        .expect("risk list should produce a policy");
+
+        assert!(policy.is_tool_allowed("mastertech__query_surrealdb"));
+        assert!(policy.is_tool_allowed("mastertech__remote_channel_health"));
+        assert!(
+            !policy.is_tool_allowed("mastertech__remote_exec_start"),
+            "an MCP tool missing from a non-empty allowed_tools must be rejected"
+        );
+        assert!(!policy.is_tool_allowed("mastertech__plugin_deploy_remote"));
+        assert!(!policy.is_tool_allowed("remote_exec_start"));
+    }
+
+    #[test]
+    fn excluded_tools_still_subtract_from_a_listed_mcp_tool() {
+        let policy = ToolAccessPolicy::from_security(
+            Some(&[
+                "mastertech__query_surrealdb".to_string(),
+                "mastertech__remote_exec_start".to_string(),
+            ]),
+            Some(&["mastertech__remote_exec_start".to_string()]),
+            None,
+        )
+        .expect("risk + deny lists should produce a policy");
+
+        assert!(policy.is_tool_allowed("mastertech__query_surrealdb"));
+        assert!(!policy.is_tool_allowed("mastertech__remote_exec_start"));
+    }
+
+    #[test]
+    fn excluded_tools_alone_leave_other_mcp_tools_reachable() {
+        let policy = ToolAccessPolicy::from_security(
+            None,
+            Some(&["mastertech__remote_exec_start".to_string()]),
+            None,
+        )
+        .expect("deny list should produce a policy");
+
+        assert!(policy.is_tool_allowed("mastertech__query_surrealdb"));
+        assert!(!policy.is_tool_allowed("mastertech__remote_exec_start"));
     }
 
     #[test]
