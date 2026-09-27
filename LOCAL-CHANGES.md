@@ -134,9 +134,9 @@ count each one after it is persisted. A socket records the count just before its
 connect-time load. Before each turn it runs, holding the session guard, it compares: if
 the count moved, it clears the agent's history (`Agent::clear_history`) and seeds it from
 the store as at connect, forwarding a `history_trimmed` frame if seeding trims. After its
-own turns it records the count again, so they never trigger a reload. The store keeps
-plain chat rows only, so a reload drops tool calls and results from that socket's
-in-memory history, leaving the same history a fresh connect would have. Rows written
+own turns it records the count again, so they never trigger a reload. A reload leaves the
+same history a fresh connect would have: chat rows plus the stored tool context of the
+newest `keep_tool_context_turns` turns (next section). Rows written
 outside a WebSocket turn, such as cron `app.<alias>` deliveries and REST message posts, do
 not move the count and are still not picked up by a connected socket.
 
@@ -144,6 +144,57 @@ not move the count and are still not picked up by a connected socket.
 |---|---|
 | `crates/zeroclaw-gateway/src/ws_hub.rs` | `finished: AtomicU64` and `turns_finished()`; `finish` and `finish_chained` count each turn. |
 | `crates/zeroclaw-gateway/src/ws.rs` | `handle_socket` takes the hub before the connect-time load and records `synced_turns` there. `resync_history` runs once the session guard is held, at both places a turn starts, and the count is recorded again after the turn and anything chained behind it. Test `a_socket_that_resumed_mid_turn_answers_with_that_turn_in_its_history`. |
+
+### A new socket's agent gets the earlier turns' tool calls and results back (gateway)
+
+A socket's agent keeps every turn's tool calls and results in memory, but every new socket
+(phone reconnect, interrupt, idle rebuild, `resync_history`) was seeded from the session
+store, and `persist_conversation_messages` stored only `ConversationMessage::Chat`. The
+agent lost what its tools had returned (file labels, written prompts, check results) and
+went back to re-read skills and receipt files. Measured 2026-09-27 on the comfy agent:
+turn-start requests went from `SUATTATATATAUATTATATATAU` on a live socket to `SUAUAUAU`
+after any reconnect.
+
+Each turn's tool calls and results are now stored beside the transcript, never in it: a
+third table, `session_tool_context`, one serialized `ConversationMessage` per row, placed
+after the `sessions` row it followed. `load`, `load_with_timestamps`, the message count,
+FTS search, `GET /api/sessions/{id}/messages`, `zeroclaw sessions show` and the session
+tools read only `sessions`, so what clients see is unchanged. A socket seeds from
+`load_conversation` through `Agent::seed_conversation_history_with_event`, which trims to
+the message cap exactly as the live history does (tool calls and results count as messages
+there too, so a long session seeds fewer, fuller turns than a text-only reseed did, the
+same turns a live socket holds).
+
+Bounds. Only the newest `keep_tool_context_turns` turns (runtime profile, resolved at use)
+keep their tool context, at seed time and in storage (`retain_tool_context_turns` after
+each turn); older turns seed as chat text, as before. A turn starts at a user chat row,
+the boundary whole-turn trimming uses. The live agent itself never reads that knob (only
+the channel orchestrator does, as an on/off), so with comfy's 50 the message cap binds
+first and a reseed matches the live history. Each stored text (result, call text,
+arguments, reasoning) is cut with the runtime's `truncate_tool_result` to the profile's
+`max_tool_result_chars` if set, else 16,000 chars; over-long arguments are wrapped as
+`{"truncated_arguments": …}` so they stay JSON. Inline `data:…;base64,` payloads, whole
+`[IMAGE:data:…]` markers included, become `[truncated inline data removed]`. A call is
+stored only with all its results, and a result only with its call, so an interrupted turn
+never seeds an unpaired call.
+
+Writes go through `SessionBackend::append_turn`, one transaction that checks the metadata
+row first, so a session deleted mid-turn is not resurrected by its chat rows or its tool
+context. `delete_session`, `clear_messages`, `replace_messages`, both TTL sweeps and
+`remove_last` (for the row it removes) delete the tool context too. Sessions stored before
+this change have none and seed exactly as before; the JSONL backend keeps the trait
+defaults (chat rows only). Rolling back to an older binary leaves the table unused.
+
+| File | Why |
+|---|---|
+| `crates/zeroclaw-infra/src/session_backend.rs` | `append_turn`, `load_conversation`, `retain_tool_context_turns`, with chat-only defaults. |
+| `crates/zeroclaw-infra/src/session_sqlite.rs` | `session_tool_context` table; the three methods; `append_on` returns the row id; every deleting path deletes tool context. |
+| `crates/zeroclaw-gateway/src/session_tool_context.rs` (NEW) | `ToolContextLimits::for_agent`, `storable_turn` (pairing, caps, inline-data removal), `retain_recent_tool_context`. |
+| `crates/zeroclaw-gateway/src/ws.rs` | `persist_conversation_messages` takes the limits and writes through `append_turn`; connect and `resync_history` seed through `seed_from_store`; the connect frame's `message_count` still counts chat rows. Tests `a_reconnecting_socket_is_seeded_with_the_previous_turns_tool_calls_and_results`, `a_reconnect_seeds_tool_context_only_for_the_newest_keep_tool_context_turns`, `seeding_tool_context_trims_to_the_message_cap_like_the_live_history`, `an_interrupted_turn_keeps_its_finished_tool_round_for_the_next_socket`, `persisting_into_a_deleted_session_writes_neither_rows_nor_tool_context`. |
+| `crates/zeroclaw-gateway/src/lib.rs` | `mod session_tool_context;` |
+
+The RPC chat path (`rpc/dispatch.rs`) still seeds chat rows only; it has no tool-context
+writer.
 
 ### Session lifecycle SSE events
 
@@ -440,6 +491,7 @@ git switch main && git merge --ff-only upstream-merge/<tag>
 ```
 
 New-file additions never conflict: `crates/zeroclaw-gateway/src/session_events.rs`,
+`crates/zeroclaw-gateway/src/session_tool_context.rs`,
 `crates/zeroclaw-gateway/src/ws_hub.rs`,
 `src/sessions_cli/`, `docs/book/src/architecture/session-lifecycle.md`,
 `web/src/components/ThreadsPanel.tsx`, and this file are fork-only paths.
@@ -578,6 +630,16 @@ Re-check these after every upstream merge; they are easy to silently lose:
   `a_steer_accepted_after_the_last_round_runs_as_the_next_turn` and
   `a_steer_an_aborted_turn_never_read_is_refused_with_its_content` in `ws.rs`
   fail when it does.
+
+- **A new socket's agent gets its tool context back.** Upstream stores only chat
+  text, so every reconnect seeds an agent that has forgotten what its tools
+  returned. Ours stores tool calls and results in `session_tool_context` and seeds
+  them through `load_conversation`. A merge that restores upstream's
+  `persist_conversation_messages` loop over `append`, or seeds with
+  `seed_history_with_event(&backend.load(..))`, drops it with no compile error;
+  `a_reconnecting_socket_is_seeded_with_the_previous_turns_tool_calls_and_results`
+  fails when it does. Any new SQLite path that deletes a session's rows must also
+  delete its tool context.
 
 - **A socket's agent reloads turns it did not run.** Upstream seeds a socket's
   agent once at connect, so a turn it watched or another socket ran never

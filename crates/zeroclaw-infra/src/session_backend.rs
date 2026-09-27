@@ -1,7 +1,7 @@
 //! Trait abstraction for session persistence backends.
 
 use chrono::{DateTime, Utc};
-use zeroclaw_api::model_provider::ChatMessage;
+use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
 
 /// Metadata about a persisted session.
 #[derive(Debug, Clone)]
@@ -104,6 +104,53 @@ pub trait SessionBackend: Send + Sync {
 
     /// Append a single message to a session.
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()>;
+
+    /// Append one turn in order, and only while the session still exists: chat
+    /// rows as [`append`](Self::append) writes them, and tool calls and tool
+    /// results as the session's tool context, placed after the chat row they
+    /// followed. Tool context is agent state, not transcript: `load`, the
+    /// message count and search never see it, only
+    /// [`load_conversation`](Self::load_conversation) does. The default keeps
+    /// the chat rows and drops the tool context.
+    fn append_turn(
+        &self,
+        session_key: &str,
+        messages: &[ConversationMessage],
+    ) -> std::io::Result<()> {
+        if !self.session_exists(session_key) {
+            return Ok(());
+        }
+        let mut first_error = None;
+        for message in messages {
+            if let ConversationMessage::Chat(chat) = message
+                && let Err(error) = self.append(session_key, chat)
+            {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// The session as an agent is seeded with it: every chat row in order, each
+    /// followed by the tool context [`append_turn`](Self::append_turn) stored
+    /// after it. The default has no tool context and returns the chat rows.
+    fn load_conversation(&self, session_key: &str) -> Vec<ConversationMessage> {
+        self.load(session_key)
+            .into_iter()
+            .map(ConversationMessage::Chat)
+            .collect()
+    }
+
+    /// Drop the stored tool context of every turn before the newest
+    /// `keep_turns`, where a turn starts at a user chat row. Returns the number
+    /// of tool-context entries removed. No-op for backends without tool context.
+    fn retain_tool_context_turns(
+        &self,
+        _session_key: &str,
+        _keep_turns: usize,
+    ) -> std::io::Result<usize> {
+        Ok(0)
+    }
 
     /// Remove the last message from a session. Returns `true` if a message was removed.
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool>;

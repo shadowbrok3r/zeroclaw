@@ -396,9 +396,15 @@ async fn handle_socket(
     let mut effective_name: Option<String> = None;
     let mut stored_messages = Vec::new();
     if let Some(ref backend) = state.session_backend {
-        let messages = backend.load(&session_key);
-        if !messages.is_empty() {
-            message_count = messages.len();
+        // Chat rows plus the tool context stored after them; the count clients
+        // see stays the number of chat rows.
+        let messages = backend.load_conversation(&session_key);
+        let chat_rows = messages
+            .iter()
+            .filter(|message| matches!(message, zeroclaw_providers::ConversationMessage::Chat(_)))
+            .count();
+        if chat_rows > 0 {
+            message_count = chat_rows;
             stored_messages = messages;
             resumed = true;
         }
@@ -632,7 +638,11 @@ async fn handle_socket(
     let restore_trim_event = if stored_messages.is_empty() {
         None
     } else {
-        agent.seed_history_with_event(&stored_messages)
+        seed_from_store(
+            &mut agent,
+            stored_messages,
+            config.effective_keep_tool_context_turns(&agent_alias),
+        )
     };
 
     let (approval_event_tx, mut approval_event_rx) =
@@ -1057,27 +1067,40 @@ fn session_queue_ws_error_code(error: &crate::session_queue::SessionQueueError) 
     }
 }
 
+/// Store a turn: its chat messages as the session transcript, and its tool calls
+/// and results as tool context a later socket is seeded with, bounded by
+/// `limits` (see `session_tool_context`).
 fn persist_conversation_messages(
     backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
     session_key: &str,
     messages: &[zeroclaw_providers::ConversationMessage],
+    limits: crate::session_tool_context::ToolContextLimits,
 ) {
     // if the user deleted the session between the turn starting and
     // the post-turn persistence, don't resurrect it. The `aborted` / `done`
     // / `error` frames are still sent to the client; we just refuse to
     // re-create the row that `DELETE /api/sessions/{id}` just wiped.
+    // `append_turn` checks again inside its own write, for the chat rows and
+    // the tool context alike.
     if !backend.session_exists(session_key) {
         return;
     }
-    for message in messages {
-        let zeroclaw_providers::ConversationMessage::Chat(message) = message else {
-            continue;
-        };
-        if message.role == "system" {
-            continue;
-        }
-        let _ = backend.append(session_key, message);
-    }
+    let turn = crate::session_tool_context::storable_turn(messages, limits);
+    let _ = backend.append_turn(session_key, &turn);
+    let _ = backend.retain_tool_context_turns(session_key, limits.keep_turns);
+}
+
+/// Seed a socket's agent from the session store: every chat row, plus the tool
+/// calls and results of the newest `keep_tool_context_turns` turns. Seeding
+/// trims to the message cap exactly as the live history does.
+fn seed_from_store(
+    agent: &mut zeroclaw_runtime::agent::Agent,
+    stored: Vec<zeroclaw_providers::ConversationMessage>,
+    keep_tool_context_turns: usize,
+) -> Option<zeroclaw_api::agent::TurnEvent> {
+    agent.seed_conversation_history_with_event(
+        crate::session_tool_context::retain_recent_tool_context(stored, keep_tool_context_turns),
+    )
 }
 
 fn has_assistant_chat_message(messages: &[zeroclaw_providers::ConversationMessage]) -> bool {
@@ -1408,16 +1431,23 @@ async fn resync_history<S>(
     let Some(ref backend) = state.session_backend else {
         return;
     };
-    let stored = backend.load(session_key);
+    let stored = backend.load_conversation(session_key);
     agent.clear_history();
     if stored.is_empty() {
         return;
     }
+    let keep_turns = {
+        let (agent_alias, _, _) = agent.attribution_fields();
+        state
+            .config
+            .read()
+            .effective_keep_tool_context_turns(&agent_alias)
+    };
     if let Some(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
         dropped_messages,
         kept_turns,
         reason,
-    }) = agent.seed_history_with_event(&stored)
+    }) = seed_from_store(agent, stored, keep_turns)
     {
         let frame = history_trimmed_ws_frame(dropped_messages, kept_turns, &reason);
         let _ = sender.send(Message::Text(frame.to_string().into())).await;
@@ -1781,6 +1811,10 @@ async fn process_chat_message(
     };
 
     let (result, ()) = tokio::join!(turn_fut, forward_fut);
+    // Resolved from live config when the turn is stored, like every runtime knob.
+    let tool_context_limits = || {
+        crate::session_tool_context::ToolContextLimits::for_agent(&state.config.read(), &turn_alias)
+    };
 
     // ── Remove cancel token (turn finished) ──────────────────────
     {
@@ -1808,6 +1842,7 @@ async fn process_chat_message(
                             backend.as_ref(),
                             session_key,
                             &error.new_messages,
+                            tool_context_limits(),
                         );
                         if !has_assistant_chat_message(&error.new_messages) {
                             let marker = zeroclaw_runtime::i18n::get_required_cli_string(
@@ -1910,7 +1945,12 @@ async fn process_chat_message(
             )
             .await;
             if let Some(ref backend) = state.session_backend {
-                persist_conversation_messages(backend.as_ref(), session_key, &outcome.new_messages);
+                persist_conversation_messages(
+                    backend.as_ref(),
+                    session_key,
+                    &outcome.new_messages,
+                    tool_context_limits(),
+                );
             }
 
             // Fire-and-forget memory consolidation so facts from WS sessions
@@ -2034,7 +2074,12 @@ async fn process_chat_message(
             if let Some(ref backend) = state.session_backend
                 && !e.new_messages.is_empty()
             {
-                persist_conversation_messages(backend.as_ref(), session_key, &e.new_messages);
+                persist_conversation_messages(
+                    backend.as_ref(),
+                    session_key,
+                    &e.new_messages,
+                    tool_context_limits(),
+                );
             }
 
             // Set session state to error
@@ -3123,7 +3168,15 @@ data: {\"type\":\"message_stop\"}\n\n",
             ConversationMessage::Chat(ChatMessage::assistant("[interrupted by user]")),
         ];
 
-        persist_conversation_messages(&backend, "gw_deleted", &messages);
+        persist_conversation_messages(
+            &backend,
+            "gw_deleted",
+            &messages,
+            crate::session_tool_context::ToolContextLimits {
+                max_chars: 16_000,
+                keep_turns: 50,
+            },
+        );
 
         assert!(
             backend.append_calls.lock().unwrap().is_empty(),
@@ -3739,5 +3792,456 @@ data: {\"type\":\"message_stop\"}\n\n",
             gateway_server.abort();
             provider_server.abort();
         });
+    }
+
+    // ── Tool context across reconnects ────────────────────────────
+
+    /// Anthropic SSE for one `tool_use` block.
+    fn anthropic_tool_use(
+        id: &str,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> axum::response::Response {
+        let events = [
+            (
+                "message_start",
+                serde_json::json!({"type": "message_start", "message": {"id": "msg_test", "type": "message", "role": "assistant", "model": "claude-test", "usage": {"input_tokens": 1}}}),
+            ),
+            (
+                "content_block_start",
+                serde_json::json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}}),
+            ),
+            (
+                "content_block_delta",
+                serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": input.to_string()}}),
+            ),
+            (
+                "content_block_stop",
+                serde_json::json!({"type": "content_block_stop", "index": 0}),
+            ),
+            (
+                "message_delta",
+                serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 1}}),
+            ),
+            ("message_stop", serde_json::json!({"type": "message_stop"})),
+        ];
+        let body: String = events
+            .into_iter()
+            .map(|(event, data)| format!("event: {event}\ndata: {data}\n\n"))
+            .collect();
+        ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
+    }
+
+    /// Whether the request shows the model a tool result it has not answered yet.
+    fn answers_a_tool_result(request: &serde_json::Value) -> bool {
+        request["messages"]
+            .as_array()
+            .and_then(|messages| messages.last())
+            .is_some_and(|last| last.to_string().contains("tool_result"))
+    }
+
+    fn chat_frame(content: &str) -> ClientMessage {
+        ClientMessage::Text(
+            serde_json::json!({"type": "message", "content": content})
+                .to_string()
+                .into(),
+        )
+    }
+
+    /// Read frames until `done`, failing on any error frame; returns the types seen.
+    async fn frames_until_done<S>(client: &mut S) -> Vec<String>
+    where
+        S: futures_util::Stream<
+                Item = Result<ClientMessage, tokio_tungstenite::tungstenite::Error>,
+            > + Unpin,
+    {
+        let mut seen = Vec::new();
+        loop {
+            let frame = next_json_frame(client).await;
+            assert_ne!(frame["type"], "error", "unexpected error frame: {frame}");
+            let kind = frame["type"].as_str().unwrap_or_default().to_string();
+            let done = kind == "done";
+            seen.push(kind);
+            if done {
+                return seen;
+            }
+        }
+    }
+
+    /// A stored turn with one answered `file_read` round.
+    fn stored_tool_turn(n: usize) -> Vec<zeroclaw_providers::ConversationMessage> {
+        use zeroclaw_providers::{ChatMessage, ConversationMessage};
+        vec![
+            ConversationMessage::Chat(ChatMessage::user(format!("ask {n}"))),
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![zeroclaw_api::model_provider::ToolCall {
+                    id: format!("toolu_keep_{n}"),
+                    name: "file_read".into(),
+                    arguments: r#"{"path":"label.txt"}"#.into(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![
+                zeroclaw_api::model_provider::ToolResultMessage {
+                    tool_call_id: format!("toolu_keep_{n}"),
+                    content: format!("result {n}"),
+                    tool_name: "file_read".into(),
+                },
+            ]),
+            ConversationMessage::Chat(ChatMessage::assistant(format!("reply {n}"))),
+        ]
+    }
+
+    const STORE_ALL: crate::session_tool_context::ToolContextLimits =
+        crate::session_tool_context::ToolContextLimits {
+            max_chars: 16_000,
+            keep_turns: 50,
+        };
+
+    /// The session's transcript as `GET /api/sessions/{id}/messages` returns it.
+    async fn api_transcript(state: &AppState, id: &str) -> serde_json::Value {
+        let response = crate::api::handle_api_session_messages(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(id.to_string()),
+        )
+        .await
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("transcript body");
+        serde_json::from_slice(&body).expect("transcript JSON")
+    }
+
+    #[test]
+    fn a_reconnecting_socket_is_seeded_with_the_previous_turns_tool_calls_and_results() {
+        use zeroclaw_infra::session_backend::SessionBackend as _;
+        on_large_stack("ws-tool-context-reconnect", || async {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (provider, provider_server) =
+                serve_anthropic_fixture(requests.clone(), |request| {
+                    if answers_a_tool_result(request) {
+                        anthropic_reply("read the label")
+                    } else if request.to_string().contains("second ask 2e61") {
+                        anthropic_reply("second reply")
+                    } else {
+                        anthropic_tool_use(
+                            "toolu_label_4b1d",
+                            "file_read",
+                            &serde_json::json!({"path": "label.txt"}),
+                        )
+                    }
+                })
+                .await;
+            let tmp = tempfile::tempdir().expect("temporary gateway root");
+            let config = anthropic_fixture_config(tmp.path(), provider);
+            std::fs::write(tmp.path().join("workspace/label.txt"), "label 9c4e").expect("label");
+            let backend = Arc::new(
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path())
+                    .expect("session store"),
+            );
+            let mut state = crate::api::tests::test_state(config);
+            state.session_backend = Some(backend.clone());
+            let (gateway, gateway_server) = serve_chat(state.clone()).await;
+            let url = format!("ws://{gateway}/ws/chat?agent=web&session_id=tool-context");
+
+            let (mut first, _) = connect_async(&url).await.expect("WebSocket upgrade");
+            assert_eq!(next_json_frame(&mut first).await["type"], "session_start");
+            first
+                .send(chat_frame("first ask"))
+                .await
+                .expect("chat message");
+            let seen = frames_until_done(&mut first).await;
+            assert!(
+                seen.iter().any(|kind| kind == "tool_result"),
+                "the first turn ran its tool: {seen:?}"
+            );
+            first.close(None).await.expect("close the first socket");
+
+            // A new socket builds a new agent, seeded only from the store.
+            let (mut second, _) = connect_async(&url).await.expect("WebSocket upgrade");
+            let start = next_json_frame(&mut second).await;
+            assert_eq!(start["type"], "session_start");
+            assert_eq!(start["message_count"], 2, "clients still count chat rows");
+            second
+                .send(chat_frame("second ask 2e61"))
+                .await
+                .expect("chat message");
+            frames_until_done(&mut second).await;
+
+            let requests = requests.lock().unwrap().clone();
+            assert_eq!(requests.len(), 3, "tool call, its answer, the second turn");
+            let seeded = requests[2]["messages"].to_string();
+            assert!(
+                seeded.contains(r#""type":"tool_use""#)
+                    && seeded.contains(r#""id":"toolu_label_4b1d""#)
+                    && seeded.contains(r#""tool_use_id":"toolu_label_4b1d""#)
+                    && seeded.contains("label 9c4e"),
+                "the reconnected agent must see the earlier call and its result: {seeded}"
+            );
+
+            // What clients read is unchanged: the chat transcript only.
+            let transcript = api_transcript(&state, "tool-context").await;
+            let rows: Vec<(String, String)> = transcript["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .map(|row| {
+                    (
+                        row["role"].as_str().unwrap_or_default().to_string(),
+                        row["content"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect();
+            let roles: Vec<&str> = rows.iter().map(|(role, _)| role.as_str()).collect();
+            assert_eq!(roles, ["user", "assistant", "user", "assistant"]);
+            assert_eq!(rows[1].1, "read the label");
+            assert_eq!(rows[3].1, "second reply");
+            assert!(
+                !transcript.to_string().contains("label 9c4e")
+                    && !transcript.to_string().contains("toolu_label_4b1d"),
+                "tool context never reaches the transcript: {transcript}"
+            );
+            assert_eq!(
+                backend
+                    .get_session_metadata("gw_tool-context")
+                    .expect("session")
+                    .message_count,
+                4
+            );
+
+            gateway_server.abort();
+            provider_server.abort();
+        });
+    }
+
+    #[test]
+    fn a_reconnect_seeds_tool_context_only_for_the_newest_keep_tool_context_turns() {
+        on_large_stack("ws-tool-context-keep", || async {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (provider, provider_server) =
+                serve_anthropic_fixture(requests.clone(), |_| anthropic_reply("fourth reply"))
+                    .await;
+            let tmp = tempfile::tempdir().expect("temporary gateway root");
+            let mut config = anthropic_fixture_config(tmp.path(), provider);
+            config
+                .runtime_profiles
+                .get_mut("fixture")
+                .expect("fixture profile")
+                .keep_tool_context_turns = Some(2);
+            let backend = Arc::new(
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path())
+                    .expect("session store"),
+            );
+            use zeroclaw_infra::session_backend::SessionBackend as _;
+            let key = "gw_keep-turns";
+            backend.set_session_agent_alias(key, "web").expect("alias");
+            // A turn stored before tool context existed, then three with it.
+            backend
+                .append(key, &zeroclaw_providers::ChatMessage::user("ask 0"))
+                .expect("old row");
+            backend
+                .append(key, &zeroclaw_providers::ChatMessage::assistant("reply 0"))
+                .expect("old row");
+            for n in 1..=3 {
+                persist_conversation_messages(
+                    backend.as_ref(),
+                    key,
+                    &stored_tool_turn(n),
+                    STORE_ALL,
+                );
+            }
+            let mut state = crate::api::tests::test_state(config);
+            state.session_backend = Some(backend.clone());
+            let (gateway, gateway_server) = serve_chat(state).await;
+
+            let (mut client, _) = connect_async(format!(
+                "ws://{gateway}/ws/chat?agent=web&session_id=keep-turns"
+            ))
+            .await
+            .expect("WebSocket upgrade");
+            assert_eq!(next_json_frame(&mut client).await["type"], "session_start");
+            client
+                .send(chat_frame("fourth ask"))
+                .await
+                .expect("chat message");
+            frames_until_done(&mut client).await;
+
+            let seeded = requests.lock().unwrap()[0]["messages"].to_string();
+            for n in 0..=3 {
+                assert!(
+                    seeded.contains(&format!("ask {n}")) && seeded.contains(&format!("reply {n}")),
+                    "every turn keeps its chat text: {seeded}"
+                );
+            }
+            assert!(
+                seeded.contains("toolu_keep_2") && seeded.contains("toolu_keep_3"),
+                "the newest two turns keep their tool context: {seeded}"
+            );
+            assert!(
+                !seeded.contains("toolu_keep_1") && !seeded.contains("result 1"),
+                "the oldest turn seeds as chat text only: {seeded}"
+            );
+
+            gateway_server.abort();
+            provider_server.abort();
+        });
+    }
+
+    #[test]
+    fn seeding_tool_context_trims_to_the_message_cap_like_the_live_history() {
+        on_large_stack("ws-tool-context-trim", || async {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (provider, provider_server) =
+                serve_anthropic_fixture(requests.clone(), |_| anthropic_reply("unused")).await;
+            let tmp = tempfile::tempdir().expect("temporary gateway root");
+            let mut config = anthropic_fixture_config(tmp.path(), provider);
+            let profile = config
+                .runtime_profiles
+                .get_mut("fixture")
+                .expect("fixture profile");
+            profile.max_history_messages = Some(6);
+            profile.keep_tool_context_turns = Some(50);
+            let backend = Arc::new(
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path())
+                    .expect("session store"),
+            );
+            use zeroclaw_infra::session_backend::SessionBackend as _;
+            let key = "gw_trim-turns";
+            backend.set_session_agent_alias(key, "web").expect("alias");
+            for n in 1..=3 {
+                persist_conversation_messages(
+                    backend.as_ref(),
+                    key,
+                    &stored_tool_turn(n),
+                    STORE_ALL,
+                );
+            }
+            let mut state = crate::api::tests::test_state(config);
+            state.session_backend = Some(backend.clone());
+            let (gateway, gateway_server) = serve_chat(state).await;
+
+            let (mut client, _) = connect_async(format!(
+                "ws://{gateway}/ws/chat?agent=web&session_id=trim-turns"
+            ))
+            .await
+            .expect("WebSocket upgrade");
+            let start = next_json_frame(&mut client).await;
+            assert_eq!(start["type"], "session_start");
+            assert_eq!(start["message_count"], 6);
+            client
+                .send(ClientMessage::Text(r#"{"type":"connect"}"#.into()))
+                .await
+                .expect("connect frame");
+            assert_eq!(next_json_frame(&mut client).await["type"], "connected");
+            // Twelve seeded messages (six of them tool context) against a cap of
+            // six: the two oldest whole turns go, as they would in a live socket.
+            let trimmed = next_json_frame(&mut client).await;
+            assert_eq!(trimmed["type"], "history_trimmed", "{trimmed}");
+            assert_eq!(trimmed["dropped_messages"], 8);
+            assert_eq!(trimmed["kept_turns"], 1);
+
+            gateway_server.abort();
+            provider_server.abort();
+        });
+    }
+
+    #[test]
+    fn an_interrupted_turn_keeps_its_finished_tool_round_for_the_next_socket() {
+        on_large_stack("ws-tool-context-interrupted", || async {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (provider, provider_server) =
+                serve_anthropic_fixture(requests.clone(), |request| {
+                    if request.to_string().contains("after ask 91c0") {
+                        anthropic_reply("after reply")
+                    } else if answers_a_tool_result(request) {
+                        stalled_anthropic_reply("partial 8d0f")
+                    } else {
+                        anthropic_tool_use(
+                            "toolu_cut_6a3e",
+                            "file_read",
+                            &serde_json::json!({"path": "label.txt"}),
+                        )
+                    }
+                })
+                .await;
+            let tmp = tempfile::tempdir().expect("temporary gateway root");
+            let config = anthropic_fixture_config(tmp.path(), provider);
+            std::fs::write(tmp.path().join("workspace/label.txt"), "label 9c4e").expect("label");
+            let backend = Arc::new(
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path())
+                    .expect("session store"),
+            );
+            let mut state = crate::api::tests::test_state(config);
+            state.session_backend = Some(backend.clone());
+            let cancel_tokens = state.cancel_tokens.clone();
+            let (gateway, gateway_server) = serve_chat(state.clone()).await;
+            let url = format!("ws://{gateway}/ws/chat?agent=web&session_id=cut-turn");
+
+            let (mut first, _) = connect_async(&url).await.expect("WebSocket upgrade");
+            assert_eq!(next_json_frame(&mut first).await["type"], "session_start");
+            first
+                .send(chat_frame("cut ask"))
+                .await
+                .expect("chat message");
+            while next_json_frame(&mut first).await["type"] != "chunk" {}
+            cancel_tokens
+                .lock()
+                .unwrap()
+                .get("gw_cut-turn")
+                .expect("the running turn's cancel token")
+                .cancel();
+            while next_json_frame(&mut first).await["type"] != "aborted" {}
+            first.close(None).await.expect("close the first socket");
+
+            let (mut second, _) = connect_async(&url).await.expect("WebSocket upgrade");
+            assert_eq!(next_json_frame(&mut second).await["type"], "session_start");
+            second
+                .send(chat_frame("after ask 91c0"))
+                .await
+                .expect("chat message");
+            frames_until_done(&mut second).await;
+
+            let requests = requests.lock().unwrap().clone();
+            let seeded =
+                requests.last().expect("the second turn's request")["messages"].to_string();
+            assert!(
+                seeded.contains(r#""tool_use_id":"toolu_cut_6a3e""#)
+                    && seeded.contains("label 9c4e"),
+                "the interrupted turn's finished tool round is seeded: {seeded}"
+            );
+            let transcript = api_transcript(&state, "cut-turn").await;
+            let roles: Vec<&str> = transcript["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .map(|row| row["role"].as_str().unwrap_or_default())
+                .collect();
+            assert_eq!(roles, ["user", "assistant", "user", "assistant"]);
+
+            gateway_server.abort();
+            provider_server.abort();
+        });
+    }
+
+    #[test]
+    fn persisting_into_a_deleted_session_writes_neither_rows_nor_tool_context() {
+        use zeroclaw_infra::session_backend::SessionBackend as _;
+        let tmp = tempfile::tempdir().expect("temporary store root");
+        let backend = zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path())
+            .expect("session store");
+        backend
+            .set_session_agent_alias("gw_deleted", "web")
+            .expect("alias");
+        persist_conversation_messages(&backend, "gw_deleted", &stored_tool_turn(1), STORE_ALL);
+        assert_eq!(backend.load_conversation("gw_deleted").len(), 4);
+
+        assert!(backend.delete_session("gw_deleted").expect("delete"));
+        persist_conversation_messages(&backend, "gw_deleted", &stored_tool_turn(2), STORE_ALL);
+
+        assert!(!backend.session_exists("gw_deleted"), "not resurrected");
+        assert!(backend.load_conversation("gw_deleted").is_empty());
     }
 }

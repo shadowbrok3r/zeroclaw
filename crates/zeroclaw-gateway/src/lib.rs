@@ -44,6 +44,7 @@ mod session_experiments;
 mod session_jobs;
 mod session_media;
 pub mod session_queue;
+mod session_tool_context;
 pub mod sse;
 pub mod static_files;
 pub mod tls;

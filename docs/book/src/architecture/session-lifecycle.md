@@ -25,6 +25,13 @@ All chat-shaped sessions share one SQLite database:
   name, agent alias, channel id, per-turn state, origin principal, and
   timestamps), additive `ALTER TABLE`-style migrations, and an FTS5 index for
   transcript search.
+- A third table, `session_tool_context`, holds the tool calls and tool results
+  of gateway WebSocket turns (fork-local). It is agent seeding state, not
+  transcript: only `append_turn` writes it and only `load_conversation` reads
+  it, so the message count, search, and every transcript surface ignore it.
+  Each row sits after the `sessions` row it followed, is bounded per text field,
+  and is kept only for the newest `keep_tool_context_turns` turns; every path
+  that deletes a session's rows deletes it too.
 - The legacy JSONL implementation lives in
   `crates/zeroclaw-infra/src/session_store.rs` and is still selectable via
   `[channels].session_backend`.
@@ -38,9 +45,11 @@ flowchart LR
     subgraph DB["sessions.db"]
         S["sessions<br/>append-only message rows"]
         M["session_metadata<br/>name · agent_alias · channel_id<br/>state · origin_principal · timestamps"]
+        T["session_tool_context<br/>tool calls and results after a message row"]
     end
     K["session key (string)"] --> S
     K --> M
+    K --> T
 ```
 
 ## Session families and keyspaces

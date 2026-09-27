@@ -10,7 +10,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 use sha2::{Digest, Sha256};
 use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
-use zeroclaw_api::model_provider::ChatMessage;
+use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
 
 /// SQLite-backed session store with FTS5 and WAL mode.
 pub struct SqliteSessionBackend {
@@ -105,6 +105,20 @@ impl SqliteSessionBackend {
                 source_len   INTEGER NOT NULL,
                 imported_at  TEXT NOT NULL
              );
+
+             -- Tool calls and tool results of agent turns, one serialized
+             -- ConversationMessage per row, placed after the `sessions` row
+             -- `after_id`. Seeding state for a reconnecting agent, not
+             -- transcript: no FTS, no message_count.
+             CREATE TABLE IF NOT EXISTS session_tool_context (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_key TEXT NOT NULL,
+                after_id    INTEGER NOT NULL,
+                message     TEXT NOT NULL,
+                created_at  TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_session_tool_context_key_id
+                ON session_tool_context(session_key, id);
 
              CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
                 session_key, content, content=sessions, content_rowid=id
@@ -211,17 +225,19 @@ impl SqliteSessionBackend {
         Ok(())
     }
 
+    /// Insert one chat row and count it in the metadata row; returns the row id.
     fn append_on(
         conn: &Connection,
         session_key: &str,
         message: &ChatMessage,
         now: &str,
-    ) -> rusqlite::Result<()> {
+    ) -> rusqlite::Result<i64> {
         conn.execute(
             "INSERT INTO sessions (session_key, role, content, created_at)
              VALUES (?1, ?2, ?3, ?4)",
             params![session_key, message.role, message.content, now],
         )?;
+        let id = conn.last_insert_rowid();
         conn.execute(
             "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count)
              VALUES (?1, ?2, ?3, 1)
@@ -230,7 +246,15 @@ impl SqliteSessionBackend {
                 message_count = message_count + 1",
             params![session_key, now, now],
         )?;
-        Ok(())
+        Ok(id)
+    }
+
+    /// Delete a session's stored tool context (see `append_turn`).
+    fn delete_tool_context_on(conn: &Connection, session_key: &str) -> rusqlite::Result<usize> {
+        conn.execute(
+            "DELETE FROM session_tool_context WHERE session_key = ?1",
+            params![session_key],
+        )
     }
 
     fn source_fingerprint(path: &Path, name: &str) -> Result<(String, i64)> {
@@ -831,7 +855,148 @@ impl SessionBackend for SqliteSessionBackend {
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
         let conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
-        Self::append_on(&conn, session_key, message, &now).map_err(std::io::Error::other)
+        Self::append_on(&conn, session_key, message, &now)
+            .map(drop)
+            .map_err(std::io::Error::other)
+    }
+
+    fn append_turn(
+        &self,
+        session_key: &str,
+        messages: &[ConversationMessage],
+    ) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        // One transaction, checked against the metadata row inside it: a chat
+        // row would recreate the metadata row of a session deleted since the
+        // turn began, and tool context must never outlive its session.
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(std::io::Error::other)?;
+        let exists = tx
+            .query_row(
+                "SELECT 1 FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?
+            .is_some();
+        if !exists {
+            return Ok(());
+        }
+        let mut after_id: Option<i64> = tx
+            .query_row(
+                "SELECT MAX(id) FROM sessions WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get(0),
+            )
+            .map_err(std::io::Error::other)?;
+        for message in messages {
+            // Each row is stamped when it is written, as `append` stamps it.
+            let now = Utc::now().to_rfc3339();
+            if let ConversationMessage::Chat(chat) = message {
+                after_id = Some(
+                    Self::append_on(&tx, session_key, chat, &now).map_err(std::io::Error::other)?,
+                );
+                continue;
+            }
+            // Tool context is placed after a chat row; with none yet there is
+            // nowhere to put it.
+            let Some(after_id) = after_id else {
+                continue;
+            };
+            let serialized = serde_json::to_string(message).map_err(std::io::Error::other)?;
+            tx.execute(
+                "INSERT INTO session_tool_context (session_key, after_id, message, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![session_key, after_id, serialized, now],
+            )
+            .map_err(std::io::Error::other)?;
+        }
+        tx.commit().map_err(std::io::Error::other)
+    }
+
+    fn load_conversation(&self, session_key: &str) -> Vec<ConversationMessage> {
+        let conn = self.conn.lock();
+        let chat: Vec<(i64, ChatMessage)> = {
+            let Ok(mut stmt) = conn.prepare(
+                "SELECT id, role, content FROM sessions WHERE session_key = ?1 ORDER BY id ASC",
+            ) else {
+                return Vec::new();
+            };
+            let Ok(rows) = stmt.query_map(params![session_key], |row| {
+                Ok((
+                    row.get(0)?,
+                    ChatMessage {
+                        role: row.get(1)?,
+                        content: row.get(2)?,
+                    },
+                ))
+            }) else {
+                return Vec::new();
+            };
+            rows.filter_map(Result::ok).collect()
+        };
+
+        let mut tool_context: std::collections::HashMap<i64, Vec<ConversationMessage>> =
+            std::collections::HashMap::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT after_id, message FROM session_tool_context \
+             WHERE session_key = ?1 ORDER BY id ASC",
+        ) && let Ok(rows) = stmt.query_map(params![session_key], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        }) {
+            for (after_id, serialized) in rows.filter_map(Result::ok) {
+                // A row this build cannot read is skipped, never guessed at:
+                // the turn then seeds as chat text, as it did before.
+                if let Ok(
+                    message @ (ConversationMessage::AssistantToolCalls { .. }
+                    | ConversationMessage::ToolResults(_)),
+                ) = serde_json::from_str::<ConversationMessage>(&serialized)
+                {
+                    tool_context.entry(after_id).or_default().push(message);
+                }
+            }
+        }
+
+        let mut conversation = Vec::with_capacity(chat.len());
+        for (id, message) in chat {
+            conversation.push(ConversationMessage::Chat(message));
+            // Context whose chat row is gone (`remove_last`) is not placed.
+            if let Some(entries) = tool_context.remove(&id) {
+                conversation.extend(entries);
+            }
+        }
+        conversation
+    }
+
+    fn retain_tool_context_turns(
+        &self,
+        session_key: &str,
+        keep_turns: usize,
+    ) -> std::io::Result<usize> {
+        let conn = self.conn.lock();
+        // Tool context placed before the oldest user row of the kept turns goes.
+        let floor: Option<i64> = match keep_turns.checked_sub(1) {
+            None => Some(i64::MAX),
+            Some(offset) => conn
+                .query_row(
+                    "SELECT id FROM sessions WHERE session_key = ?1 AND role = 'user' \
+                     ORDER BY id DESC LIMIT 1 OFFSET ?2",
+                    params![session_key, i64::try_from(offset).unwrap_or(i64::MAX)],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(std::io::Error::other)?,
+        };
+        let Some(floor) = floor else {
+            return Ok(0);
+        };
+        conn.execute(
+            "DELETE FROM session_tool_context WHERE session_key = ?1 AND after_id < ?2",
+            params![session_key, floor],
+        )
+        .map_err(std::io::Error::other)
     }
 
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
@@ -851,6 +1016,11 @@ impl SessionBackend for SqliteSessionBackend {
 
         conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])
             .map_err(std::io::Error::other)?;
+        conn.execute(
+            "DELETE FROM session_tool_context WHERE session_key = ?1 AND after_id = ?2",
+            params![session_key, id],
+        )
+        .map_err(std::io::Error::other)?;
 
         // Update metadata count
         conn.execute(
@@ -986,6 +1156,7 @@ impl SessionBackend for SqliteSessionBackend {
         let count = stale_keys.len();
         for key in &stale_keys {
             let _ = conn.execute("DELETE FROM sessions WHERE session_key = ?1", params![key]);
+            let _ = Self::delete_tool_context_on(&conn, key);
             let _ = conn.execute(
                 "DELETE FROM session_metadata WHERE session_key = ?1",
                 params![key],
@@ -1035,6 +1206,7 @@ impl SessionBackend for SqliteSessionBackend {
         for key in &stale_keys {
             // FTS rows are removed by the sessions_ad delete trigger.
             let _ = conn.execute("DELETE FROM sessions WHERE session_key = ?1", params![key]);
+            let _ = Self::delete_tool_context_on(&conn, key);
             let _ = conn.execute(
                 "DELETE FROM session_metadata WHERE session_key = ?1",
                 params![key],
@@ -1054,6 +1226,7 @@ impl SessionBackend for SqliteSessionBackend {
         .map_err(std::io::Error::other)?;
 
         let count = conn.changes() as usize;
+        Self::delete_tool_context_on(&conn, session_key).map_err(std::io::Error::other)?;
 
         if count > 0 {
             conn.execute(
@@ -1084,6 +1257,8 @@ impl SessionBackend for SqliteSessionBackend {
             params![session_key],
         )
         .map_err(std::io::Error::other)?;
+        // The rows tool context was placed after are gone.
+        Self::delete_tool_context_on(&tx, session_key).map_err(std::io::Error::other)?;
         for message in messages {
             tx.execute(
                 "INSERT INTO sessions (session_key, role, content, created_at)
@@ -1127,6 +1302,7 @@ impl SessionBackend for SqliteSessionBackend {
             params![session_key],
         )
         .map_err(std::io::Error::other)?;
+        Self::delete_tool_context_on(&conn, session_key).map_err(std::io::Error::other)?;
 
         // Delete metadata
         conn.execute(
@@ -3358,5 +3534,241 @@ mod tests {
         assert_eq!(single.name, from_list.name);
         assert_eq!(single.created_at, from_list.created_at);
         assert_eq!(single.last_activity, from_list.last_activity);
+    }
+
+    // ── Tool context ──────────────────────────────────────────────
+
+    /// One agent turn with a single tool round: user, tool call, tool result, reply.
+    fn tool_turn(ask: &str, call_id: &str, result: &str, reply: &str) -> Vec<ConversationMessage> {
+        vec![
+            ConversationMessage::Chat(ChatMessage::user(ask)),
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![zeroclaw_api::model_provider::ToolCall {
+                    id: call_id.to_string(),
+                    name: "file_read".to_string(),
+                    arguments: r#"{"path":"label.txt"}"#.to_string(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![
+                zeroclaw_api::model_provider::ToolResultMessage {
+                    tool_call_id: call_id.to_string(),
+                    content: result.to_string(),
+                    tool_name: "file_read".to_string(),
+                },
+            ]),
+            ConversationMessage::Chat(ChatMessage::assistant(reply)),
+        ]
+    }
+
+    /// The conversation reduced to comparable tags: chat as `role:content`,
+    /// tool context as `call:<id>` / `result:<id>=<content>`.
+    fn conversation_tags(conversation: &[ConversationMessage]) -> Vec<String> {
+        conversation
+            .iter()
+            .flat_map(|message| match message {
+                ConversationMessage::Chat(chat) => vec![format!("{}:{}", chat.role, chat.content)],
+                ConversationMessage::AssistantToolCalls { tool_calls, .. } => tool_calls
+                    .iter()
+                    .map(|call| format!("call:{}", call.id))
+                    .collect(),
+                ConversationMessage::ToolResults(results) => results
+                    .iter()
+                    .map(|result| format!("result:{}={}", result.tool_call_id, result.content))
+                    .collect(),
+            })
+            .collect()
+    }
+
+    fn tool_context_rows(backend: &SqliteSessionBackend, key: &str) -> i64 {
+        backend
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM session_tool_context WHERE session_key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn append_turn_seeds_tool_context_that_the_transcript_never_shows() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.set_session_agent_alias("gw_t", "comfy").unwrap();
+
+        backend
+            .append_turn("gw_t", &tool_turn("ask", "call-1", "label 9c4e", "reply"))
+            .unwrap();
+
+        assert_eq!(
+            conversation_tags(&backend.load_conversation("gw_t")),
+            [
+                "user:ask",
+                "call:call-1",
+                "result:call-1=label 9c4e",
+                "assistant:reply"
+            ]
+        );
+        // Everything a client reads is the chat transcript, unchanged.
+        let transcript: Vec<String> = backend
+            .load("gw_t")
+            .iter()
+            .map(|m| format!("{}:{}", m.role, m.content))
+            .collect();
+        assert_eq!(transcript, ["user:ask", "assistant:reply"]);
+        assert_eq!(backend.load_with_timestamps("gw_t").len(), 2);
+        assert_eq!(
+            backend.get_session_metadata("gw_t").unwrap().message_count,
+            2
+        );
+        assert!(
+            backend
+                .search(&SessionQuery {
+                    keyword: Some("9c4e".into()),
+                    limit: None,
+                })
+                .is_empty(),
+            "tool results are not searchable transcript"
+        );
+    }
+
+    #[test]
+    fn append_turn_writes_nothing_for_a_session_that_is_gone() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend
+            .append_turn("gw_gone", &tool_turn("ask", "call-1", "out", "reply"))
+            .unwrap();
+
+        assert!(!backend.session_exists("gw_gone"), "no resurrection");
+        assert!(backend.load("gw_gone").is_empty());
+        assert_eq!(tool_context_rows(&backend, "gw_gone"), 0);
+    }
+
+    #[test]
+    fn a_session_without_tool_context_loads_as_its_chat_rows() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.append("gw_old", &ChatMessage::user("ask")).unwrap();
+        backend
+            .append("gw_old", &ChatMessage::assistant("reply"))
+            .unwrap();
+
+        assert_eq!(
+            conversation_tags(&backend.load_conversation("gw_old")),
+            ["user:ask", "assistant:reply"]
+        );
+    }
+
+    #[test]
+    fn every_session_deleting_path_deletes_its_tool_context() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let seeded = |key: &str| {
+            backend.set_session_agent_alias(key, "comfy").unwrap();
+            backend
+                .append_turn(key, &tool_turn("ask", "call-1", "out", "reply"))
+                .unwrap();
+            assert_eq!(tool_context_rows(&backend, key), 2);
+        };
+
+        seeded("gw_delete");
+        assert!(backend.delete_session("gw_delete").unwrap());
+        assert_eq!(tool_context_rows(&backend, "gw_delete"), 0);
+        // The same key reused later starts without the old tool context.
+        backend
+            .append("gw_delete", &ChatMessage::user("again"))
+            .unwrap();
+        assert_eq!(
+            conversation_tags(&backend.load_conversation("gw_delete")),
+            ["user:again"]
+        );
+
+        seeded("gw_clear");
+        backend.clear_messages("gw_clear").unwrap();
+        assert_eq!(tool_context_rows(&backend, "gw_clear"), 0);
+
+        seeded("gw_replace");
+        backend
+            .replace_messages("gw_replace", &[ChatMessage::user("new")])
+            .unwrap();
+        assert_eq!(tool_context_rows(&backend, "gw_replace"), 0);
+
+        seeded("gw_sweep");
+        let old = (Utc::now() - Duration::hours(48)).to_rfc3339();
+        backend
+            .conn
+            .lock()
+            .execute(
+                "UPDATE session_metadata SET last_activity = ?1 WHERE session_key = 'gw_sweep'",
+                params![old],
+            )
+            .unwrap();
+        backend
+            .cleanup_stale_scoped(24, crate::session_backend::SessionCleanupScope::Gateway)
+            .unwrap();
+        assert!(!backend.session_exists("gw_sweep"));
+        assert_eq!(tool_context_rows(&backend, "gw_sweep"), 0);
+    }
+
+    #[test]
+    fn remove_last_takes_the_tool_context_placed_after_that_row() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.set_session_agent_alias("gw_t", "comfy").unwrap();
+        let mut turn = tool_turn("ask", "call-1", "out", "reply");
+        turn.pop();
+        backend.append_turn("gw_t", &turn).unwrap();
+
+        assert!(backend.remove_last("gw_t").unwrap());
+
+        assert!(backend.load_conversation("gw_t").is_empty());
+        assert_eq!(tool_context_rows(&backend, "gw_t"), 0);
+    }
+
+    #[test]
+    fn retain_tool_context_turns_keeps_the_newest_turns_only() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.set_session_agent_alias("gw_t", "comfy").unwrap();
+        for turn in 1..=3 {
+            backend
+                .append_turn(
+                    "gw_t",
+                    &tool_turn(
+                        &format!("ask {turn}"),
+                        &format!("call-{turn}"),
+                        &format!("out {turn}"),
+                        &format!("reply {turn}"),
+                    ),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(backend.retain_tool_context_turns("gw_t", 5).unwrap(), 0);
+        assert_eq!(backend.retain_tool_context_turns("gw_t", 2).unwrap(), 2);
+        assert_eq!(
+            conversation_tags(&backend.load_conversation("gw_t")),
+            [
+                "user:ask 1",
+                "assistant:reply 1",
+                "user:ask 2",
+                "call:call-2",
+                "result:call-2=out 2",
+                "assistant:reply 2",
+                "user:ask 3",
+                "call:call-3",
+                "result:call-3=out 3",
+                "assistant:reply 3",
+            ]
+        );
+        assert_eq!(backend.retain_tool_context_turns("gw_t", 0).unwrap(), 4);
+        assert_eq!(tool_context_rows(&backend, "gw_t"), 0);
+        assert_eq!(backend.load("gw_t").len(), 6, "chat rows are never pruned");
     }
 }
