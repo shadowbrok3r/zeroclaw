@@ -26,12 +26,14 @@ All chat-shaped sessions share one SQLite database:
   timestamps), additive `ALTER TABLE`-style migrations, and an FTS5 index for
   transcript search.
 - A third table, `session_tool_context`, holds the tool calls and tool results
-  of gateway WebSocket turns (fork-local). It is agent seeding state, not
-  transcript: only `append_turn` writes it and only `load_conversation` reads
-  it, so the message count, search, and every transcript surface ignore it.
-  Each row sits after the `sessions` row it followed, is bounded per text field,
-  and is kept only for the newest `keep_tool_context_turns` turns; every path
-  that deletes a session's rows deletes it too.
+  of gateway WebSocket turns, plus the thinking before each final answer
+  (fork-local). It is agent seeding state, not transcript: only `append_turn`
+  writes it, and the message count, search, and every transcript surface ignore
+  it unless a reader asks with `GET /api/sessions/{id}/messages?tool_context=true`.
+  Each row sits after the `sessions` row it followed and is bounded per text
+  field. Storage keeps the newest `max(keep_tool_context_turns, 50)` turns and
+  seeding the newest `keep_tool_context_turns`; every path that deletes a
+  session's rows deletes it too.
 - The legacy JSONL implementation lives in
   `crates/zeroclaw-infra/src/session_store.rs` and is still selectable via
   `[channels].session_backend`.

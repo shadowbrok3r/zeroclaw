@@ -196,6 +196,29 @@ defaults (chat rows only). Rolling back to an older binary leaves the table unus
 The RPC chat path (`rpc/dispatch.rs`) still seeds chat rows only; it has no tool-context
 writer.
 
+**Transcript readers can ask for the tool context (2026-09-28).** Clients that show a
+session (Mastertech's Ai tab, zc-codex history) saw only chat text, so a session run from
+the phone showed no tool calls or thinking anywhere else. `GET
+/api/sessions/{id}/messages?tool_context=true` returns `load_conversation_with_timestamps`
+flattened into the same row shape: an `AssistantToolCalls` entry becomes an assistant row
+whose `content` is the runtime's history envelope (`{"content", "tool_calls",
+"reasoning_content"}`), each tool result a `tool` row (`{"tool_call_id", "content",
+"tool_name"}`), every row with its own `created_at`. Without the parameter the response is
+unchanged. Storage now keeps tool context for the newest
+`max(keep_tool_context_turns, 50)` turns (`ToolContextLimits::stored_turns`); seeding still
+trims to `keep_tool_context_turns`, and `0` still stores none. The thinking a turn streams
+after its last tool call is stored as a call-less `AssistantToolCalls` note just before the
+answer (`with_final_reasoning`, from the forward loop's `TurnEvent::Thinking` deltas);
+`retain_recent_tool_context` never seeds a note.
+
+| File | Why |
+|---|---|
+| `crates/zeroclaw-infra/src/session_backend.rs` | `TimestampedConversationMessage`; `load_conversation_with_timestamps` with a chat-only default. |
+| `crates/zeroclaw-infra/src/session_sqlite.rs` | `load_conversation_with_timestamps` stamps chat and tool-context rows; `load_conversation` wraps it. Test `the_timestamped_conversation_stamps_every_row_in_order`. |
+| `crates/zeroclaw-gateway/src/session_tool_context.rs` | `STORED_TOOL_CONTEXT_TURNS`, `stored_turns`, `with_final_reasoning`; notes skipped at seed. Tests `final_reasoning_is_stored_before_the_answer_and_never_seeded`, `stored_turns_outlast_the_seeded_ones`. |
+| `crates/zeroclaw-gateway/src/ws.rs` | `persist_turn` stores the final thinking and retains `stored_turns`; the forward loop collects thinking since the last tool call. Test `transcript_readers_see_tool_context_and_final_thinking_in_order`. |
+| `crates/zeroclaw-gateway/src/api.rs` | `SessionMessagesQuery`, `transcript_rows`. |
+
 ### Session lifecycle SSE events
 
 | File | Why |
@@ -751,7 +774,10 @@ Re-check these after every upstream merge; they are easy to silently lose:
   `seed_history_with_event(&backend.load(..))`, drops it with no compile error;
   `a_reconnecting_socket_is_seeded_with_the_previous_turns_tool_calls_and_results`
   fails when it does. Any new SQLite path that deletes a session's rows must also
-  delete its tool context.
+  delete its tool context. Upstream's `/api/sessions/{id}/messages` has no
+  `tool_context` parameter; a merge that takes upstream's handler drops it and
+  `transcript_readers_see_tool_context_and_final_thinking_in_order` still passes,
+  so check the handler by hand.
 
 - **A socket's agent reloads turns it did not run.** Upstream seeds a socket's
   agent once at connect, so a turn it watched or another socket ran never

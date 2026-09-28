@@ -23,14 +23,17 @@ const INLINE_DATA_PLACEHOLDER: &str = "[truncated inline data removed]";
 /// Shortest line accepted as the continuation of a line-wrapped payload.
 const WRAPPED_PAYLOAD_MIN_LINE: usize = 40;
 
+/// Newest turns whose tool context stays stored for transcript readers.
+pub(crate) const STORED_TOOL_CONTEXT_TURNS: usize = 50;
+
 /// How much tool context an agent's session keeps, resolved from its runtime
 /// profile at the moment it is used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ToolContextLimits {
     /// Characters kept of each stored text field of tool context.
     pub max_chars: usize,
-    /// Newest turns whose tool context is stored and seeded
-    /// (`keep_tool_context_turns`). `0` keeps none.
+    /// Newest turns whose tool context is seeded
+    /// (`keep_tool_context_turns`). `0` stores and seeds none.
     pub keep_turns: usize,
 }
 
@@ -46,6 +49,45 @@ impl ToolContextLimits {
             keep_turns: config.effective_keep_tool_context_turns(agent_alias),
         }
     }
+
+    /// Newest turns whose tool context stays stored: at least the seeded turns.
+    pub(crate) fn stored_turns(self) -> usize {
+        match self.keep_turns {
+            0 => 0,
+            seeded => seeded.max(STORED_TOOL_CONTEXT_TURNS),
+        }
+    }
+}
+
+/// True for the display-only note carrying a final answer's thinking.
+fn is_reasoning_note(message: &ConversationMessage) -> bool {
+    matches!(message, ConversationMessage::AssistantToolCalls { tool_calls, .. } if tool_calls.is_empty())
+}
+
+/// `turn` with the thinking behind its final answer stored just before that answer, as a call-less note.
+pub(crate) fn with_final_reasoning(
+    mut turn: Vec<ConversationMessage>,
+    reasoning: &str,
+    limits: ToolContextLimits,
+) -> Vec<ConversationMessage> {
+    let reasoning = reasoning.trim();
+    if limits.keep_turns == 0 || reasoning.is_empty() {
+        return turn;
+    }
+    let answer = turn
+        .iter()
+        .rposition(|message| matches!(message, ConversationMessage::Chat(chat) if chat.role == "assistant"));
+    if let Some(index) = answer {
+        turn.insert(
+            index,
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: Vec::new(),
+                reasoning_content: Some(bounded(reasoning, limits.max_chars)),
+            },
+        );
+    }
+    turn
 }
 
 /// A finished (or interrupted) turn as it is stored: its chat messages other
@@ -150,7 +192,8 @@ pub(crate) fn retain_recent_tool_context(
         .into_iter()
         .enumerate()
         .filter(|(index, message)| {
-            *index >= first_kept || matches!(message, ConversationMessage::Chat(_))
+            (*index >= first_kept && !is_reasoning_note(message))
+                || matches!(message, ConversationMessage::Chat(_))
         })
         .map(|(_, message)| message)
         .collect()
@@ -448,6 +491,44 @@ mod tests {
         let none = retain_recent_tool_context(history, 0);
         assert!(tool_ids(&none).is_empty());
         assert_eq!(none.len(), 6);
+    }
+
+    #[test]
+    fn final_reasoning_is_stored_before_the_answer_and_never_seeded() {
+        let limits = ToolContextLimits {
+            max_chars: 16_000,
+            keep_turns: 2,
+        };
+        let stored = with_final_reasoning(turn(1), "  sum it up  ", limits);
+        assert_eq!(stored.len(), 5);
+        assert!(matches!(
+            &stored[3],
+            ConversationMessage::AssistantToolCalls { tool_calls, reasoning_content, .. }
+                if tool_calls.is_empty() && reasoning_content.as_deref() == Some("sum it up")
+        ));
+        assert!(matches!(&stored[4], ConversationMessage::Chat(chat) if chat.role == "assistant"));
+
+        let seeded = retain_recent_tool_context(stored, 2);
+        assert_eq!(seeded.len(), 4);
+        assert!(!seeded.iter().any(is_reasoning_note));
+
+        assert_eq!(with_final_reasoning(turn(1), "   ", limits).len(), 4);
+        let off = ToolContextLimits {
+            max_chars: 16_000,
+            keep_turns: 0,
+        };
+        assert_eq!(with_final_reasoning(turn(1), "thinking", off).len(), 4);
+    }
+
+    #[test]
+    fn stored_turns_outlast_the_seeded_ones() {
+        let limits = |keep_turns| ToolContextLimits {
+            max_chars: 16_000,
+            keep_turns,
+        };
+        assert_eq!(limits(2).stored_turns(), STORED_TOOL_CONTEXT_TURNS);
+        assert_eq!(limits(80).stored_turns(), 80);
+        assert_eq!(limits(0).stored_turns(), 0);
     }
 
     #[test]

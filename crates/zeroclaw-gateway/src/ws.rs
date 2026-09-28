@@ -1076,6 +1076,17 @@ fn persist_conversation_messages(
     messages: &[zeroclaw_providers::ConversationMessage],
     limits: crate::session_tool_context::ToolContextLimits,
 ) {
+    persist_turn(backend, session_key, messages, "", limits);
+}
+
+/// [`persist_conversation_messages`] that also stores the thinking streamed after the turn's last tool call.
+fn persist_turn(
+    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    session_key: &str,
+    messages: &[zeroclaw_providers::ConversationMessage],
+    final_reasoning: &str,
+    limits: crate::session_tool_context::ToolContextLimits,
+) {
     // if the user deleted the session between the turn starting and
     // the post-turn persistence, don't resurrect it. The `aborted` / `done`
     // / `error` frames are still sent to the client; we just refuse to
@@ -1086,8 +1097,9 @@ fn persist_conversation_messages(
         return;
     }
     let turn = crate::session_tool_context::storable_turn(messages, limits);
+    let turn = crate::session_tool_context::with_final_reasoning(turn, final_reasoning, limits);
     let _ = backend.append_turn(session_key, &turn);
-    let _ = backend.retain_tool_context_turns(session_key, limits.keep_turns);
+    let _ = backend.retain_tool_context_turns(session_key, limits.stored_turns());
 }
 
 /// Seed a socket's agent from the session store: every chat row, plus the tool
@@ -1585,6 +1597,8 @@ async fn process_chat_message(
     // and we relay them over WebSocket. Track streamed chunks so we
     // can reconstruct partial content on cancellation.
     let mut accumulated_text = String::new();
+    // Thinking streamed since the turn's last tool call.
+    let mut final_thinking = String::new();
 
     // Aggregate token usage across all LLM calls in this turn.
     // The agent emits TurnEvent::Usage once per LLM call when the provider
@@ -1671,9 +1685,11 @@ async fn process_chat_message(
                             serde_json::json!({ "type": "chunk", "content": delta })
                         }
                         TurnEvent::Thinking { delta } => {
+                            final_thinking.push_str(&delta);
                             serde_json::json!({ "type": "thinking", "content": delta })
                         }
                         TurnEvent::ToolCall { id, name, args } => {
+                            final_thinking.clear();
                             serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args })
                         }
                         TurnEvent::ToolResult {
@@ -1945,10 +1961,11 @@ async fn process_chat_message(
             )
             .await;
             if let Some(ref backend) = state.session_backend {
-                persist_conversation_messages(
+                persist_turn(
                     backend.as_ref(),
                     session_key,
                     &outcome.new_messages,
+                    &final_thinking,
                     tool_context_limits(),
                 );
             }
@@ -3906,6 +3923,7 @@ data: {\"type\":\"message_stop\"}\n\n",
             axum::extract::State(state.clone()),
             HeaderMap::new(),
             axum::extract::Path(id.to_string()),
+            axum::extract::Query(crate::api::SessionMessagesQuery::default()),
         )
         .await
         .into_response();
@@ -4243,5 +4261,33 @@ data: {\"type\":\"message_stop\"}\n\n",
 
         assert!(!backend.session_exists("gw_deleted"), "not resurrected");
         assert!(backend.load_conversation("gw_deleted").is_empty());
+    }
+
+    #[test]
+    fn transcript_readers_see_tool_context_and_final_thinking_in_order() {
+        use zeroclaw_infra::session_backend::SessionBackend as _;
+        let tmp = tempfile::tempdir().expect("temporary store root");
+        let backend = zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path())
+            .expect("session store");
+        backend
+            .set_session_agent_alias("gw_shown", "web")
+            .expect("alias");
+        persist_turn(&backend, "gw_shown", &stored_tool_turn(1), "wrap up", STORE_ALL);
+
+        let rows: Vec<serde_json::Value> = backend
+            .load_conversation_with_timestamps("gw_shown")
+            .into_iter()
+            .flat_map(crate::api::transcript_rows)
+            .collect();
+        let field = |i: usize, key: &str| rows[i][key].as_str().unwrap_or_default().to_string();
+        let envelope = |i: usize| serde_json::from_str::<serde_json::Value>(&field(i, "content")).expect("envelope");
+        assert_eq!(rows.len(), 5);
+        assert_eq!((field(0, "role"), field(0, "content")), ("user".into(), "ask 1".into()));
+        assert_eq!(envelope(1)["tool_calls"][0]["name"], "file_read");
+        assert_eq!((field(2, "role"), envelope(2)["content"].clone()), ("tool".into(), "result 1".into()));
+        assert_eq!(envelope(3)["reasoning_content"], "wrap up");
+        assert_eq!((field(4, "role"), field(4, "content")), ("assistant".into(), "reply 1".into()));
+        assert!(rows.iter().all(|row| row["created_at"].is_string()));
+        assert_eq!(backend.load("gw_shown").len(), 2, "the plain transcript is unchanged");
     }
 }

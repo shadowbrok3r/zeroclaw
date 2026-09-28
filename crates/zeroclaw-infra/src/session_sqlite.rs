@@ -2,6 +2,7 @@
 
 use crate::session_backend::{
     SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState,
+    TimestampedConversationMessage,
 };
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
@@ -917,10 +918,26 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn load_conversation(&self, session_key: &str) -> Vec<ConversationMessage> {
+        self.load_conversation_with_timestamps(session_key)
+            .into_iter()
+            .map(|entry| entry.message)
+            .collect()
+    }
+
+    fn load_conversation_with_timestamps(
+        &self,
+        session_key: &str,
+    ) -> Vec<TimestampedConversationMessage> {
+        let stamp = |raw: Option<String>| {
+            raw.as_deref()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc))
+        };
         let conn = self.conn.lock();
-        let chat: Vec<(i64, ChatMessage)> = {
+        let chat: Vec<(i64, ChatMessage, Option<String>)> = {
             let Ok(mut stmt) = conn.prepare(
-                "SELECT id, role, content FROM sessions WHERE session_key = ?1 ORDER BY id ASC",
+                "SELECT id, role, content, created_at FROM sessions \
+                 WHERE session_key = ?1 ORDER BY id ASC",
             ) else {
                 return Vec::new();
             };
@@ -931,6 +948,7 @@ impl SessionBackend for SqliteSessionBackend {
                         role: row.get(1)?,
                         content: row.get(2)?,
                     },
+                    row.get::<_, Option<String>>(3)?,
                 ))
             }) else {
                 return Vec::new();
@@ -938,15 +956,19 @@ impl SessionBackend for SqliteSessionBackend {
             rows.filter_map(Result::ok).collect()
         };
 
-        let mut tool_context: std::collections::HashMap<i64, Vec<ConversationMessage>> =
+        let mut tool_context: std::collections::HashMap<i64, Vec<TimestampedConversationMessage>> =
             std::collections::HashMap::new();
         if let Ok(mut stmt) = conn.prepare(
-            "SELECT after_id, message FROM session_tool_context \
+            "SELECT after_id, message, created_at FROM session_tool_context \
              WHERE session_key = ?1 ORDER BY id ASC",
         ) && let Ok(rows) = stmt.query_map(params![session_key], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
         }) {
-            for (after_id, serialized) in rows.filter_map(Result::ok) {
+            for (after_id, serialized, created_at) in rows.filter_map(Result::ok) {
                 // A row this build cannot read is skipped, never guessed at:
                 // the turn then seeds as chat text, as it did before.
                 if let Ok(
@@ -954,14 +976,23 @@ impl SessionBackend for SqliteSessionBackend {
                     | ConversationMessage::ToolResults(_)),
                 ) = serde_json::from_str::<ConversationMessage>(&serialized)
                 {
-                    tool_context.entry(after_id).or_default().push(message);
+                    tool_context
+                        .entry(after_id)
+                        .or_default()
+                        .push(TimestampedConversationMessage {
+                            message,
+                            created_at: stamp(created_at),
+                        });
                 }
             }
         }
 
         let mut conversation = Vec::with_capacity(chat.len());
-        for (id, message) in chat {
-            conversation.push(ConversationMessage::Chat(message));
+        for (id, message, created_at) in chat {
+            conversation.push(TimestampedConversationMessage {
+                message: ConversationMessage::Chat(message),
+                created_at: stamp(created_at),
+            });
             // Context whose chat row is gone (`remove_last`) is not placed.
             if let Some(entries) = tool_context.remove(&id) {
                 conversation.extend(entries);
@@ -3634,6 +3665,29 @@ mod tests {
                 .is_empty(),
             "tool results are not searchable transcript"
         );
+    }
+
+    #[test]
+    fn the_timestamped_conversation_stamps_every_row_in_order() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.set_session_agent_alias("gw_t", "comfy").unwrap();
+        backend
+            .append_turn("gw_t", &tool_turn("ask", "call-1", "out", "reply"))
+            .unwrap();
+
+        let entries = backend.load_conversation_with_timestamps("gw_t");
+        let messages: Vec<ConversationMessage> =
+            entries.iter().map(|entry| entry.message.clone()).collect();
+        assert_eq!(
+            conversation_tags(&messages),
+            conversation_tags(&backend.load_conversation("gw_t"))
+        );
+        let stamps: Vec<_> = entries
+            .iter()
+            .map(|entry| entry.created_at.expect("every row is stamped"))
+            .collect();
+        assert!(stamps.windows(2).all(|pair| pair[0] <= pair[1]));
     }
 
     #[test]

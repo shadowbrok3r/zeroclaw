@@ -83,6 +83,13 @@ pub struct TimestampedMessage {
     pub created_at: Option<DateTime<Utc>>,
 }
 
+/// One entry of [`SessionBackend::load_conversation`] with the `created_at` the backend stamped on it.
+#[derive(Debug, Clone)]
+pub struct TimestampedConversationMessage {
+    pub message: ConversationMessage,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
 /// Trait for session persistence backends.
 /// Implementations must be `Send + Sync` for sharing across async tasks.
 pub trait SessionBackend: Send + Sync {
@@ -138,6 +145,17 @@ pub trait SessionBackend: Send + Sync {
         self.load(session_key)
             .into_iter()
             .map(ConversationMessage::Chat)
+            .collect()
+    }
+
+    /// [`load_conversation`](Self::load_conversation) with each entry's `created_at`, for readers that show tool context.
+    fn load_conversation_with_timestamps(&self, session_key: &str) -> Vec<TimestampedConversationMessage> {
+        self.load_with_timestamps(session_key)
+            .into_iter()
+            .map(|m| TimestampedConversationMessage {
+                message: ConversationMessage::Chat(m.message),
+                created_at: m.created_at,
+            })
             .collect()
     }
 

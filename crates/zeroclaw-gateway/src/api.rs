@@ -1779,11 +1779,61 @@ fn gateway_display_session_id(session_key: &str) -> &str {
     session_key.strip_prefix("gw_").unwrap_or(session_key)
 }
 
+/// Query for `GET /api/sessions/{id}/messages`.
+#[derive(Debug, Default, Deserialize)]
+pub struct SessionMessagesQuery {
+    /// Interleave the session's stored tool context with its chat rows.
+    #[serde(default)]
+    pub tool_context: bool,
+}
+
+/// Transcript rows for one stored entry: chat as stored, tool context in the envelope form the runtime's history uses.
+pub(crate) fn transcript_rows(
+    entry: zeroclaw_infra::session_backend::TimestampedConversationMessage,
+) -> Vec<serde_json::Value> {
+    use zeroclaw_api::model_provider::ConversationMessage;
+    let created_at = entry.created_at.map(|dt| dt.to_rfc3339());
+    let row = |role: &str, content: String| {
+        serde_json::json!({ "role": role, "content": content, "created_at": created_at })
+    };
+    match entry.message {
+        ConversationMessage::Chat(chat) => vec![row(&chat.role, chat.content)],
+        ConversationMessage::AssistantToolCalls {
+            text,
+            tool_calls,
+            reasoning_content,
+        } => {
+            let calls: Vec<serde_json::Value> = tool_calls
+                .iter()
+                .map(|call| serde_json::json!({ "id": call.id, "name": call.name, "arguments": call.arguments }))
+                .collect();
+            let mut envelope = serde_json::json!({ "content": text, "tool_calls": calls });
+            if let Some(reasoning) = reasoning_content {
+                envelope["reasoning_content"] = serde_json::Value::String(reasoning);
+            }
+            vec![row("assistant", envelope.to_string())]
+        }
+        ConversationMessage::ToolResults(results) => results
+            .into_iter()
+            .map(|result| {
+                let mut envelope = serde_json::json!({ "tool_call_id": result.tool_call_id, "content": result.content });
+                if !result.tool_name.is_empty() {
+                    envelope["tool_name"] = serde_json::Value::String(result.tool_name);
+                }
+                row("tool", envelope.to_string())
+            })
+            .collect(),
+    }
+}
+
 /// GET /api/sessions/{id}/messages — load persisted gateway WebSocket chat transcript
+///
+/// `?tool_context=true` interleaves the stored tool calls, results and thinking.
 pub async fn handle_api_session_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Query(query): Query<SessionMessagesQuery>,
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
@@ -1809,17 +1859,25 @@ pub async fn handle_api_session_messages(
     if session_hidden_from_device(&state, &headers, &session_key) {
         return session_not_found_response();
     }
-    let msgs = backend.load_with_timestamps(&session_key);
-    let messages: Vec<serde_json::Value> = msgs
-        .into_iter()
-        .map(|m| {
-            serde_json::json!({
-                "role": m.message.role,
-                "content": m.message.content,
-                "created_at": m.created_at.map(|dt| dt.to_rfc3339()),
+    let messages: Vec<serde_json::Value> = if query.tool_context {
+        backend
+            .load_conversation_with_timestamps(&session_key)
+            .into_iter()
+            .flat_map(transcript_rows)
+            .collect()
+    } else {
+        backend
+            .load_with_timestamps(&session_key)
+            .into_iter()
+            .map(|m| {
+                serde_json::json!({
+                    "role": m.message.role,
+                    "content": m.message.content,
+                    "created_at": m.created_at.map(|dt| dt.to_rfc3339()),
+                })
             })
-        })
-        .collect();
+            .collect()
+    };
 
     Json(serde_json::json!({
         "session_id": id,
