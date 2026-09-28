@@ -12483,7 +12483,7 @@ pub struct ObservabilityConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub otel_headers: Option<std::collections::HashMap<String, String>>,
 
-    /// Log persistence mode: "none" | "rolling" | "full".
+    /// Log persistence mode: "none" | "rolling" | "full" | "rotating".
     /// Controls whether every event passing through `zeroclaw_log::record!`
     /// is appended to the on-disk JSONL log.
     #[serde(
@@ -12497,7 +12497,7 @@ pub struct ObservabilityConfig {
     #[serde(default = "default_log_persistence_path", alias = "runtime_trace_path")]
     pub log_persistence_path: String,
 
-    /// Maximum entries retained when `log_persistence = "rolling"`.
+    /// Entries kept when `log_persistence = "rolling"`; the file is trimmed back to this count once it holds a quarter more.
     #[serde(
         default = "default_log_persistence_max_entries",
         alias = "runtime_trace_max_entries"
@@ -12929,27 +12929,11 @@ pub struct RiskProfileConfig {
     /// `ToolAccessPolicy`, which honors `Some(vec![])` as deny-all) or
     /// via `excluded_tools` covering the specific tools you want blocked.
     ///
-    /// MCP exception: when the list is non-empty, runtime-discovered MCP
-    /// tools (any name containing `__`, which is the `<server>__<tool>`
-    /// convention used by the MCP wrapper) are auto-admitted into the
-    /// effective allow-list without needing to be listed here individually.
-    /// This keeps the post-change eager-MCP default usable for agents with an
-    /// explicit allow-list. Block individual MCP tools via `excluded_tools`.
-    ///
-    /// Scope of the exception: the `__` auto-admit applies only to this
-    /// risk-profile allow-list, **not** to caller-supplied per-run
-    /// `allowed_tools` (cron job `allowed_tools`, narrowed delegate
-    /// invocations, etc.). Per-run lists are still strict explicit-list
-    /// intersections, so a job that narrows `allowed_tools = ["cron_add"]`
-    /// will not see runtime-discovered MCP tools unless it names them.
-    ///
+    /// A non-empty list admits only the names it contains, MCP tools by their prefixed `<server>__<tool>` name.
     pub allowed_tools: Vec<String>,
     /// Tools excluded from non-CLI channels under this profile.
     ///
-    /// Also subtracts from the agentic-delegate allow-list resolved at
-    /// runtime, which is the only way to block individual
-    /// `<server>__<tool>` MCP names that would otherwise be auto-admitted
-    /// by the `allowed_tools` MCP exception described above.
+    /// Also subtracts from `allowed_tools`, MCP tools included, and from the agentic-delegate allow-list.
     pub excluded_tools: Vec<String>,
     // ── Sandbox (from security.sandbox) ─────────────────────────────
     /// Whether the sandbox is enabled for this profile. `None` inherits global.
@@ -13864,7 +13848,7 @@ impl Default for CronScheduleDecl {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "cron_delivery"]
 pub struct DeliveryConfigDecl {
-    /// Delivery mode: `"none"` or `"announce"`.
+    /// Delivery mode: `"none"`, `"announce"` (every run) or `"on_failure"` (failed runs only).
     #[serde(default = "default_delivery_mode")]
     pub mode: String,
     /// Channel to deliver to, as `<type>.<alias>` (e.g.

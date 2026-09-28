@@ -12,7 +12,8 @@ use std::sync::atomic::Ordering;
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 use tokio::sync::{Mutex, RwLock};
-use tokio::time::{Duration, Instant, timeout, timeout_at};
+use tokio::time::error::Elapsed;
+use tokio::time::{Duration, timeout};
 
 use crate::mcp_prompt::{McpGetPromptResult, McpPromptsListResult};
 use crate::mcp_protocol::{JsonRpcRequest, MCP_PROTOCOL_VERSION, McpToolDef, McpToolsListResult};
@@ -280,8 +281,7 @@ pub struct McpServer {
     inner: Arc<Mutex<McpServerInner>>,
     transport: Arc<dyn SharedMcpTransportConn>,
     epoch_gate: Arc<RwLock<u64>>,
-    /// Preserves the existing single-request behavior for HTTP/SSE while
-    /// allowing stdio requests to multiplex by response id.
+    /// Serializes legacy SSE requests; stdio and streamable HTTP requests multiplex by JSON-RPC id.
     serial_gate: Option<Arc<Mutex<()>>>,
     /// Synchronously-published gate that holds back new writes until an
     /// outcome-unknown request has been recovered (or fails them closed after a
@@ -333,8 +333,7 @@ impl McpServer {
                 )
             })?);
         let epoch_gate = Arc::new(RwLock::new(0));
-        let serial_gate =
-            (config.transport != McpTransport::Stdio).then(|| Arc::new(Mutex::new(())));
+        let serial_gate = (config.transport == McpTransport::Sse).then(|| Arc::new(Mutex::new(())));
 
         // Initialize handshake (initialize + initialized notification)
         let capabilities = handshake(transport.as_ref(), &config.name, 0).await?;
@@ -441,23 +440,27 @@ impl McpServer {
         std::sync::Arc::ptr_eq(&self.inner, &other.inner)
     }
 
+    /// Sends one request; `call_timeout` runs only while the transport handles it.
     async fn send_request(
         &self,
         request: &JsonRpcRequest,
         lifecycle: &McpRequestLifecycle,
-    ) -> Result<crate::mcp_protocol::JsonRpcResponse> {
+        call_timeout: Duration,
+    ) -> std::result::Result<Result<crate::mcp_protocol::JsonRpcResponse>, Elapsed> {
         loop {
             // Fail closed / wait for recovery before touching the write path. A
             // request whose outcome became unknown publishes the recovery-needed
             // state synchronously, so any writer that reaches here after that point
             // must not POST/write on the ambiguous session until reset +
             // re-handshake succeed.
-            self.wait_recovery_ready().await?;
+            if let Err(error) = self.wait_recovery_ready().await {
+                return Ok(Err(error));
+            }
             let serial_guard = match &self.serial_gate {
                 Some(gate) => Some(gate.lock().await),
                 None => None,
             };
-            // Re-check under the serial gate. A concurrent HTTP/SSE writer may have
+            // Re-check under the serial gate. A concurrent SSE writer may have
             // been queued on this gate when the outcome-unknown state was armed;
             // acquiring the gate serializes us behind it, so this second check
             // guarantees we never write on a session that still needs recovery.
@@ -474,14 +477,19 @@ impl McpServer {
                 recovery: &self.recovery,
                 lifecycle,
             };
-            let result = self.transport.send_and_recv(request, lifecycle).await;
+            let result = timeout(
+                call_timeout,
+                self.transport.send_and_recv(request, lifecycle),
+            )
+            .await;
             drop(barrier_arm);
             drop(serial_guard);
 
             if matches!(
                 result
                     .as_ref()
-                    .err()
+                    .ok()
+                    .and_then(|sent| sent.as_ref().err())
                     .and_then(|error| error.downcast_ref::<McpTransportError>()),
                 Some(McpTransportError::RecoveryPending)
             ) {
@@ -555,7 +563,7 @@ impl McpServer {
     }
 
     async fn reestablish(&self, observed_epoch: u64) -> Result<()> {
-        // Keep HTTP/SSE reset ordering consistent with ordinary calls:
+        // Keep SSE reset ordering consistent with ordinary calls:
         // serial gate first, then the epoch write gate.
         let serial_guard = match &self.serial_gate {
             Some(gate) => Some(gate.lock().await),
@@ -623,7 +631,7 @@ impl McpServer {
         timeout_secs: u64,
         operation: &str,
     ) -> Result<crate::mcp_protocol::JsonRpcResponse> {
-        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let call_timeout = Duration::from_secs(timeout_secs);
         let mut pre_write_retries = 0;
 
         loop {
@@ -646,7 +654,7 @@ impl McpServer {
                 operation.to_string(),
             );
 
-            let send_result = timeout_at(deadline, self.send_request(&request, &lifecycle)).await;
+            let send_result = self.send_request(&request, &lifecycle, call_timeout).await;
             match send_result {
                 Err(_) => {
                     let unknown_epoch = lifecycle.outcome_unknown_epoch();
@@ -697,7 +705,7 @@ impl McpServer {
                         pre_write_retries += 1;
                         let observed_epoch = lifecycle.pre_write_epoch().unwrap_or(0);
                         let recovery = self.start_recovery(observed_epoch, operation.to_string());
-                        match timeout_at(deadline, recovery).await {
+                        match timeout(call_timeout, recovery).await {
                             Ok(Ok(result)) => result?,
                             Ok(Err(join_error)) => {
                                 return Err(anyhow::Error::new(join_error)).with_context(|| {
@@ -2220,6 +2228,200 @@ mod tests {
         );
         // Only the first (cancelled) call ever wrote a tool request.
         assert_eq!(tool_writes.load(Ordering::SeqCst), 1);
+    }
+
+    /// `hang` writes and never answers; `probe` answers after `probe_delay`.
+    struct HangThenSlowTransport {
+        hang_entered: Arc<tokio::sync::Notify>,
+        probe_delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl SharedMcpTransportConn for HangThenSlowTransport {
+        async fn send_and_recv(
+            &self,
+            request: &JsonRpcRequest,
+            lifecycle: &McpRequestLifecycle,
+        ) -> Result<crate::mcp_protocol::JsonRpcResponse> {
+            let tool = request
+                .params
+                .as_ref()
+                .and_then(|params| params.get("name"))
+                .and_then(serde_json::Value::as_str);
+            let result = match request.method.as_str() {
+                "tools/call" if tool == Some("hang") => {
+                    lifecycle.mark_outcome_unknown(0);
+                    self.hang_entered.notify_one();
+                    std::future::pending::<()>().await;
+                    unreachable!("cancelled before resuming");
+                }
+                "tools/call" => {
+                    tokio::time::sleep(self.probe_delay).await;
+                    Some(json!({"ok": true}))
+                }
+                "initialize" => Some(json!({
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "hang-then-slow", "version": "1"}
+                })),
+                "notifications/initialized" => None,
+                other => panic!("unexpected method {other}"),
+            };
+            Ok(crate::mcp_protocol::JsonRpcResponse {
+                jsonrpc: "2.0".into(),
+                id: request.id.clone(),
+                result,
+                error: None,
+            })
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A call queued behind one that hangs keeps its whole budget for its own round trip.
+    #[tokio::test(start_paused = true)]
+    async fn queued_call_timeout_excludes_time_spent_waiting_for_the_gate() {
+        let hang_entered = Arc::new(tokio::sync::Notify::new());
+        let transport: Arc<dyn SharedMcpTransportConn> = Arc::new(HangThenSlowTransport {
+            hang_entered: Arc::clone(&hang_entered),
+            probe_delay: Duration::from_secs(6),
+        });
+        let server = server_with_serialized_transport("queued-budget", transport, 10);
+
+        let hang_server = server.clone();
+        let hang =
+            zeroclaw_spawn::spawn!(async move { hang_server.call_tool("hang", json!({})).await });
+        hang_entered.notified().await;
+
+        let queued_at = tokio::time::Instant::now();
+        let probe = server
+            .call_tool("probe", json!({}))
+            .await
+            .expect("a queued call must not time out on time spent queued");
+        assert_eq!(probe, json!({"ok": true}));
+        assert!(
+            queued_at.elapsed() >= Duration::from_secs(16),
+            "probe must have waited for the hung call's 10s timeout, then run for 6s"
+        );
+
+        let hang_error = hang
+            .await
+            .expect("hang task joins")
+            .expect_err("the hung call itself must time out");
+        assert!(
+            hang_error.to_string().contains("timed out after 10s"),
+            "got: {hang_error:#}"
+        );
+    }
+
+    /// Answers a JSON-RPC request with its own id and `result`.
+    fn echo_rpc(
+        request: &wiremock::Request,
+        result: serde_json::Value,
+    ) -> wiremock::ResponseTemplate {
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("request body is JSON");
+        wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": body["id"],
+            "result": result,
+        }))
+    }
+
+    #[tokio::test]
+    async fn http_tool_calls_to_one_server_run_concurrently() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Mcp-Session-Id", "sess-1")
+                    .set_body_json(json!({"jsonrpc": "2.0", "id": 1, "result": {}})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/list"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"tools": [
+                    {"name": "slow", "description": "d", "inputSchema": {"type": "object"}},
+                    {"name": "fast", "description": "d", "inputSchema": {"type": "object"}}
+                ]}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "tools/call", "params": {"name": "slow"}}),
+            ))
+            .respond_with(|request: &Request| {
+                echo_rpc(request, json!({"ok": "slow"})).set_delay(Duration::from_secs(3))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "tools/call", "params": {"name": "fast"}}),
+            ))
+            .respond_with(|request: &Request| echo_rpc(request, json!({"ok": "fast"})))
+            .mount(&server)
+            .await;
+
+        let srv = McpServer::connect(http_server_config(server.uri()))
+            .await
+            .expect("connect");
+        assert!(
+            srv.serial_gate.is_none(),
+            "HTTP requests must not be serialized"
+        );
+
+        let slow_srv = srv.clone();
+        let slow =
+            zeroclaw_spawn::spawn!(async move { slow_srv.call_tool("slow", json!({})).await });
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let slow_seen = server
+                    .received_requests()
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+                    .any(|body| body["params"]["name"] == "slow");
+                if slow_seen {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the slow call must reach the server");
+
+        let fast = timeout(Duration::from_secs(1), srv.call_tool("fast", json!({})))
+            .await
+            .expect("a second call must not wait for the first one's response")
+            .expect("fast call succeeds");
+        assert_eq!(fast, json!({"ok": "fast"}));
+        assert!(!slow.is_finished(), "the slow call must still be in flight");
+
+        let slow = slow
+            .await
+            .expect("slow task joins")
+            .expect("slow call succeeds");
+        assert_eq!(slow, json!({"ok": "slow"}));
     }
 
     /// Build an `McpServer` whose transport yields `result` on every call.

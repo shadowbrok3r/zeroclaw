@@ -19910,7 +19910,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         assert!(
             registered_allowed,
-            "a non-denied MCP tool must still be registered (allowlist auto-admit)"
+            "a non-denied MCP tool must still be registered when no allowlist is set"
         );
         let names: Vec<&str> = built_tools.iter().map(|t| t.name()).collect();
         assert!(

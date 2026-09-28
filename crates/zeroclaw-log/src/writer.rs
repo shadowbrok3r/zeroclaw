@@ -80,6 +80,9 @@ const IDLE_TICK: Duration = Duration::from_millis(50);
 /// path: reload continues waiting to preserve exclusive ownership.
 const SHUTDOWN_WARN_AFTER: Duration = Duration::from_millis(500);
 
+/// Rolling-trim temp files untouched for this long are removed at writer init.
+const STALE_TRIM_TEMP_AGE: Duration = Duration::from_secs(10 * 60);
+
 /// A unit of work sent from the async runtime to the disk-persistence
 /// worker. The `Value` payload is unavoidable because we serialize once
 /// on the producer side to keep the queue small.
@@ -180,6 +183,9 @@ fn init_from_config_with_migration_and_shutdown_warning<F>(
             path = %policy.path.display(),
             "log: legacy JSONL migration failed; daemon continuing with mixed-shape file"
         );
+    }
+    if policy.storage.is_enabled() {
+        remove_stale_trim_temps(&policy.path, STALE_TRIM_TEMP_AGE);
     }
     let (tx, rx) = sync_channel::<WriterJob>(QUEUE_CAPACITY);
     let worker_dead: WorkerDead = Arc::new(AtomicBool::new(false));
@@ -296,6 +302,7 @@ fn worker_main(rx: Receiver<WriterJob>, state: Arc<WorkerState>) {
     let mut writes_since_sync: u64 = 0;
     let mut last_sync = Instant::now();
     let mut shutdown_ack = None;
+    let mut rolling_lines: Option<usize> = None;
 
     loop {
         let job = match rx.recv_timeout(IDLE_TICK) {
@@ -307,7 +314,7 @@ fn worker_main(rx: Receiver<WriterJob>, state: Arc<WorkerState>) {
         if let Some(job) = job {
             match job {
                 WriterJob::Write(value) => {
-                    if let Err(err) = write_one(&state, &value) {
+                    if let Err(err) = write_one(&state, &value, &mut rolling_lines) {
                         tracing::warn!(
                             target: "zeroclaw_log_internal",
                             error = ?err,
@@ -371,7 +378,11 @@ fn worker_main(rx: Receiver<WriterJob>, state: Arc<WorkerState>) {
 /// rotation hooks inline (so they can rename the file out from under
 /// the next write), and drops the handle on return. No `sync_data` —
 /// durability is the worker's periodic `sync_all`.
-fn write_one(state: &Arc<WorkerState>, value: &Value) -> Result<()> {
+fn write_one(
+    state: &Arc<WorkerState>,
+    value: &Value,
+    rolling_lines: &mut Option<usize>,
+) -> Result<()> {
     // Date-boundary rotation runs *before* the append so a new day's
     // first event lands in a fresh file. Idempotent when no rotation
     // is needed.
@@ -385,10 +396,29 @@ fn write_one(state: &Arc<WorkerState>, value: &Value) -> Result<()> {
         writer.flush()?;
     }
     match state.policy.storage {
-        StoragePolicy::Rolling => trim_to_last_entries(state)?,
+        StoragePolicy::Rolling => trim_rolling_window(state, rolling_lines)?,
         StoragePolicy::Rotating => maybe_rotate_for_size(state)?,
         StoragePolicy::None | StoragePolicy::Full => {}
     }
+    Ok(())
+}
+
+/// Lines a rolling file may hold before a trim cuts it back to `max_entries`.
+fn rolling_high_water(max_entries: usize) -> usize {
+    max_entries.saturating_add(max_entries / 4)
+}
+
+/// Count the append in `lines` and trim once the file passes `rolling_high_water`.
+fn trim_rolling_window(state: &Arc<WorkerState>, lines: &mut Option<usize>) -> Result<()> {
+    let count = match lines.take() {
+        Some(count) => count.saturating_add(1),
+        None => count_nonempty_lines(&state.policy.path)?,
+    };
+    if count <= rolling_high_water(state.policy.max_entries) {
+        *lines = Some(count);
+        return Ok(());
+    }
+    *lines = Some(trim_to_last_entries(state)?);
     Ok(())
 }
 
@@ -643,72 +673,134 @@ fn write_jsonl_line<W: Write + ?Sized>(writer: &mut W, value: &Value) -> Result<
 
 /// Rolling trim. Streams the file line-by-line into a temp file, keeping
 /// the last `max_entries` lines, then atomically renames. Never loads the
-/// whole file into memory.
-fn trim_to_last_entries(state: &Arc<WorkerState>) -> Result<()> {
+/// whole file into memory. Returns the number of lines the file holds after.
+fn trim_to_last_entries(state: &Arc<WorkerState>) -> Result<usize> {
     // Count lines first (cheap pass).
     let total = count_nonempty_lines(&state.policy.path)?;
     if total <= state.policy.max_entries {
-        return Ok(());
+        return Ok(total);
     }
     let skip = total - state.policy.max_entries;
 
-    let tmp = state.policy.path.with_extension(format!(
+    let tmp = trim_temp_path(&state.policy.path);
+    let mut opts = OpenOptions::new();
+    opts.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let out_file = opts
+        .open(&tmp)
+        .with_context(|| format!("creating trim temp file {}", tmp.display()))?;
+    if let Err(err) = copy_tail_and_replace(out_file, &tmp, &state.policy.path, skip) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    Ok(state.policy.max_entries)
+}
+
+/// Temp file a rolling trim writes before renaming it over `path`.
+fn trim_temp_path(path: &Path) -> PathBuf {
+    path.with_extension(format!(
         "tmp.{}.{}",
         std::process::id(),
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
-    ));
+    ))
+}
 
-    {
-        let mut opts = OpenOptions::new();
-        opts.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+/// Copy the non-empty lines of `path` after the first `skip` into `out_file`, then rename it over `path`.
+fn copy_tail_and_replace(out_file: File, tmp: &Path, path: &Path, skip: usize) -> Result<()> {
+    let mut out = BufWriter::new(out_file);
+    let in_file = fs::File::open(path)
+        .with_context(|| format!("opening log for trim: {}", path.display()))?;
+    let reader = BufReader::new(in_file);
+
+    let mut index: usize = 0;
+    for line in reader.lines() {
+        let line = line.context("reading log line during trim")?;
+        if line.trim().is_empty() {
+            continue;
         }
-        let out_file = opts
-            .open(&tmp)
-            .with_context(|| format!("creating trim temp file {}", tmp.display()))?;
-        let mut out = BufWriter::new(out_file);
-
-        let in_file = fs::File::open(&state.policy.path)
-            .with_context(|| format!("opening log for trim: {}", state.policy.path.display()))?;
-        let reader = BufReader::new(in_file);
-
-        let mut index: usize = 0;
-        for line in reader.lines() {
-            let line = line.context("reading log line during trim")?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            if index >= skip {
-                out.write_all(line.as_bytes())
-                    .context("writing trim line")?;
-                out.write_all(b"\n").context("writing trim newline")?;
-            }
-            index += 1;
+        if index >= skip {
+            out.write_all(line.as_bytes())
+                .context("writing trim line")?;
+            out.write_all(b"\n").context("writing trim newline")?;
         }
-        out.flush().context("flushing trim file")?;
-        out.into_inner()
-            .context("taking trim file out of buf writer")?
-            .sync_data()
-            .context("fsync trim file")?;
+        index += 1;
     }
+    out.flush().context("flushing trim file")?;
+    out.into_inner()
+        .context("taking trim file out of buf writer")?
+        .sync_data()
+        .context("fsync trim file")?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+        let _ = fs::set_permissions(tmp, fs::Permissions::from_mode(0o600));
     }
-    fs::rename(&tmp, &state.policy.path).with_context(|| {
-        format!(
-            "renaming trim temp {} → {}",
-            tmp.display(),
-            state.policy.path.display()
-        )
-    })?;
+    fs::rename(tmp, path)
+        .with_context(|| format!("renaming trim temp {} → {}", tmp.display(), path.display()))
+}
 
-    Ok(())
+/// Remove rolling-trim temp files next to `active` that were last written at least `min_age` ago.
+fn remove_stale_trim_temps(active: &Path, min_age: Duration) {
+    let dir = active.parent().unwrap_or_else(|| Path::new("."));
+    let Some(stem) = active.file_stem().and_then(|s| s.to_str()) else {
+        return;
+    };
+    let prefix = format!("{stem}.tmp.");
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(suffix) = file_name
+            .to_str()
+            .and_then(|name| name.strip_prefix(&prefix))
+        else {
+            continue;
+        };
+        if !is_trim_temp_suffix(suffix) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let age = meta
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .unwrap_or_default();
+        if !meta.is_file() || age < min_age {
+            continue;
+        }
+        let path = entry.path();
+        match fs::remove_file(&path) {
+            Ok(()) => tracing::info!(
+                target: "zeroclaw_log",
+                path = %path.display(),
+                bytes = meta.len(),
+                "log: removed stale rolling-trim temp file"
+            ),
+            Err(err) => tracing::warn!(
+                target: "zeroclaw_log",
+                error = ?err,
+                path = %path.display(),
+                "log: removing stale rolling-trim temp file failed"
+            ),
+        }
+    }
+}
+
+/// True for the `<pid>.<nanos>` suffix `trim_temp_path` gives a temp file.
+fn is_trim_temp_suffix(suffix: &str) -> bool {
+    let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    suffix
+        .split_once('.')
+        .is_some_and(|(pid, nanos)| all_digits(pid) && all_digits(nanos))
 }
 
 fn count_nonempty_lines(path: &Path) -> Result<usize> {
@@ -1113,6 +1205,122 @@ mod tests {
             let v: Value = serde_json::from_str(line).unwrap();
             assert_eq!(v["message"].as_str().unwrap(), format!("event-{}", idx + 7));
         }
+    }
+
+    fn record_messages(range: std::ops::Range<usize>) {
+        for i in range {
+            let mut ev = LogEvent::new(Severity::Info, "test", EventCategory::Agent);
+            ev.message = Some(format!("event-{i}"));
+            record_event(ev);
+        }
+        flush_for_test().unwrap();
+    }
+
+    fn persisted_messages(path: &Path) -> Vec<String> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|line| {
+                let v: Value = serde_json::from_str(line).unwrap();
+                v["message"].as_str().unwrap().to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rolling_trims_only_after_a_quarter_window_past_max_entries() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 8);
+        let path = runtime_trace_path().unwrap();
+
+        record_messages(0..10);
+        assert_eq!(
+            persisted_messages(&path).len(),
+            10,
+            "no trim until the file passes max_entries + max_entries / 4"
+        );
+
+        record_messages(10..11);
+        let kept = persisted_messages(&path);
+        assert_eq!(kept.len(), 8);
+        assert_eq!(kept.first().map(String::as_str), Some("event-3"));
+        assert_eq!(kept.last().map(String::as_str), Some("event-10"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rolling_appends_below_the_high_water_mark_keep_the_same_file() {
+        use std::os::unix::fs::MetadataExt;
+
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 8);
+        let path = runtime_trace_path().unwrap();
+
+        record_messages(0..1);
+        let inode = fs::metadata(&path).unwrap().ino();
+        record_messages(1..10);
+        assert_eq!(
+            fs::metadata(&path).unwrap().ino(),
+            inode,
+            "appends below the high-water mark must not rewrite the file"
+        );
+
+        record_messages(10..11);
+        assert_ne!(
+            fs::metadata(&path).unwrap().ino(),
+            inode,
+            "passing the high-water mark must trim through a rewrite"
+        );
+    }
+
+    #[test]
+    fn rolling_counts_lines_already_in_the_file_at_startup() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 8);
+        let path = runtime_trace_path().unwrap();
+        record_messages(0..10);
+
+        install_writer(tmp.path(), 8);
+        record_messages(10..11);
+        assert_eq!(persisted_messages(&path).len(), 8);
+    }
+
+    #[test]
+    fn init_removes_stale_rolling_trim_temp_files() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let stale = state_dir.join("runtime-trace.tmp.1363503.1788895974986429801");
+        let fresh = state_dir.join("runtime-trace.tmp.99.1");
+        let archive = state_dir.join("runtime-trace.20260801-000000.jsonl");
+        let unrelated = state_dir.join("runtime-trace.tmp.notes");
+        for path in [&stale, &fresh, &archive, &unrelated] {
+            fs::write(path, "{}\n").unwrap();
+        }
+        let an_hour_ago = SystemTime::now() - Duration::from_secs(3600);
+        for path in [&stale, &unrelated] {
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(an_hour_ago)
+                .unwrap();
+        }
+
+        install_writer(tmp.path(), 10);
+
+        assert!(!stale.exists(), "a stale trim temp must be removed");
+        assert!(fresh.exists(), "a recently written trim temp must be kept");
+        assert!(archive.exists(), "rotation archives must be kept");
+        assert!(
+            unrelated.exists(),
+            "names that are not trim temps must be kept"
+        );
     }
 
     #[test]

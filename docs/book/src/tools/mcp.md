@@ -115,15 +115,13 @@ Keep the three MCP tool controls on their own axes:
 | `auto_approve` / `always_ask` | Approval policy | Decide whether a selected MCP tool call requires operator approval. |
 | `allowed_tools` / `excluded_tools` | Capability policy | Decide which prefixed tool names the risk profile may use at all. |
 
-For runtime-discovered MCP tools the capability contract has an MCP-specific exception:
+MCP tools follow the same capability contract as built-ins, matched by their prefixed `<server>__<tool>` name:
 
 - If the risk profile's `allowed_tools` is empty or omitted, no authorization constraint applies; every discovered tool (MCP or built-in) is reachable. The TOML config does not distinguish an omitted field from `allowed_tools = []`; both deserialize to the same "no authorization constraint" state at the risk-profile level. If you need an explicit deny-all gate, do it on the caller-supplied per-run `allowed_tools` (cron jobs and other narrowers pass that list in directly) or via `excluded_tools` covering the specific tools you want blocked.
-- If `allowed_tools` is non-empty, any MCP tool whose name contains `__` (the `<server>__<tool>` convention) is auto-admitted into the effective allow-list without being listed there individually. Non-MCP built-ins still need an exact entry.
-- `excluded_tools` always subtracts, including from the auto-admitted MCP set. To block a single MCP tool like `filesystem__write_file` while keeping the rest of the `filesystem` server reachable, put it in `excluded_tools`.
-
-The rationale: before this exception, every agent that pinned an `allowed_tools` list to lock down its built-in surface would silently lose every MCP tool, even ones the operator explicitly configured. The cost is that the deny-list is now the operator's primary lever for blocking destructive MCP capabilities under an allow-list-pinned profile.
-
-If you want the strict pattern from before this change, where you only admit MCP tools you list explicitly with no `__` auto-admit, combine an explicit `allowed_tools` entry with an `excluded_tools` entry per destructive sibling you need blocked:
+- If `allowed_tools` is non-empty, only the names it lists are reachable. An MCP tool that is not listed is neither offered to the model (eagerly or through `tool_search`) nor executable.
+- `excluded_tools` always subtracts. To block a single MCP tool like `filesystem__write_file` while keeping the rest of the `filesystem` server reachable, leave `allowed_tools` empty and put it in `excluded_tools`.
+- Caller-supplied per-run allow-lists, like a cron job `allowed_tools`, intersect with the risk profile's list: a tool must be admitted by both.
+- Pinned MCP resources are gated by the same lists under their prefixed `<server>__<uri>` name.
 
 ```toml
 [risk_profiles.assistant]
@@ -131,17 +129,12 @@ allowed_tools = [
   "file_read",
   "filesystem__read_file",
 ]
-# Block the destructive sibling that would otherwise be auto-admitted via
-# the `__` exception above.
-excluded_tools = [
-  "filesystem__write_file",
-]
 auto_approve = [
   "filesystem__read_file",
 ]
 ```
 
-The MCP `__` auto-admit exception is scoped to the **risk profile**'s `allowed_tools` only. Caller-supplied per-run allow-lists, like a cron job `allowed_tools` or any other narrowed invocation that passes an explicit list into the runtime, are still treated as strict explicit-list intersections, with no `__` auto-admit on top. A cron job that narrows itself to `allowed_tools = ["cron_add"]` will not surface `filesystem__write_file` to the model even when the agent's risk profile would otherwise auto-admit it via the `__` convention; the per-run narrowing remains a reliable capability boundary regardless of how many MCP servers are configured.
+Here `filesystem__write_file` and every other `filesystem` tool are unreachable because the list does not name them.
 
 `auto_approve` alone does not hide a tool from the model; it only answers the approval question after the model selects that tool. Use `tool_filter_groups` to reduce prompt noise and `allowed_tools` / `excluded_tools` to enforce a capability boundary.
 

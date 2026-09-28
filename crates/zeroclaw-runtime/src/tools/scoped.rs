@@ -1835,4 +1835,239 @@ mod tests {
             );
         }
     }
+
+    /// Config granting agent `sweeper` the `mastertech` MCP server at `server_uri`.
+    fn config_with_mastertech_mcp(server_uri: String, deferred_loading: bool) -> Config {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, McpBundleConfig, McpServerConfig, McpTransport, RiskProfileConfig,
+        };
+
+        let mut config = Config::default();
+        config.mcp.enabled = true;
+        config.mcp.deferred_loading = deferred_loading;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "mastertech".into(),
+            transport: McpTransport::Http,
+            url: Some(server_uri),
+            ..Default::default()
+        }];
+        config.mcp_bundles.insert(
+            "mastertech".into(),
+            McpBundleConfig {
+                servers: vec!["mastertech".into()],
+                exclude: Vec::new(),
+            },
+        );
+        config
+            .risk_profiles
+            .insert("sweeper".into(), RiskProfileConfig::default());
+        config.agents.insert(
+            "sweeper".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.test-provider".into(),
+                risk_profile: "sweeper".into(),
+                mcp_bundles: vec!["mastertech".into()],
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    async fn mastertech_mock_server() -> wiremock::MockServer {
+        mock_mcp_http_server_with_tools(&[
+            ("query_surrealdb", "Read the database"),
+            ("remote_exec_start", "Run a command on a client"),
+            ("plugin_deploy_remote", "Deploy a plugin to a client"),
+        ])
+        .await
+    }
+
+    async fn assemble_sweeper(
+        config: &Config,
+        security: SecurityPolicy,
+        caller_allowed: Option<&[String]>,
+    ) -> ScopedAssembled {
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..security
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ScopedToolRegistry::assemble(ScopedAssembly {
+                config,
+                agent_alias: "sweeper",
+                security: &security,
+                built: built_with(Vec::new()),
+                skills: &[],
+                runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                caller_allowed,
+                connect_mcp: true,
+                connect_peripherals: false,
+                exclude_memory: false,
+                acp_delivery: false,
+                list_deferred_mcp_specs: false,
+                emit_assembly_logs: false,
+                mcp_registry: None,
+            }),
+        )
+        .await
+        .expect("assemble must not hang")
+    }
+
+    #[tokio::test]
+    async fn risk_profile_allowed_tools_registers_only_the_listed_mcp_tools() {
+        let server = mastertech_mock_server().await;
+        let config = config_with_mastertech_mcp(server.uri(), false);
+        let out = assemble_sweeper(
+            &config,
+            SecurityPolicy {
+                allowed_tools: Some(vec![
+                    "tool_search".into(),
+                    "mastertech__query_surrealdb".into(),
+                ]),
+                ..SecurityPolicy::default()
+            },
+            None,
+        )
+        .await;
+
+        let names: Vec<&str> = out.registry.iter().map(|t| t.name()).collect();
+        assert!(
+            names.contains(&"mastertech__query_surrealdb"),
+            "a listed MCP tool must be registered: {names:?}"
+        );
+        assert!(
+            !names.contains(&"mastertech__remote_exec_start")
+                && !names.contains(&"mastertech__plugin_deploy_remote"),
+            "MCP tools missing from allowed_tools must not be registered: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn risk_profile_allowed_tools_keeps_unlisted_mcp_tools_out_of_tool_search() {
+        let server = mastertech_mock_server().await;
+        let config = config_with_mastertech_mcp(server.uri(), true);
+        let out = assemble_sweeper(
+            &config,
+            SecurityPolicy {
+                allowed_tools: Some(vec![
+                    "tool_search".into(),
+                    "mastertech__query_surrealdb".into(),
+                ]),
+                ..SecurityPolicy::default()
+            },
+            None,
+        )
+        .await;
+
+        let section = out.deferred_section().to_string();
+        assert!(section.contains("mastertech__query_surrealdb"), "{section}");
+        assert!(
+            !section.contains("mastertech__remote_exec_start"),
+            "{section}"
+        );
+
+        let activated_handle = out.activated_handle.clone();
+        let tools = out.registry.into_inner();
+        let tool_search = tools
+            .iter()
+            .find(|t| t.name() == "tool_search")
+            .expect("deferred mode with an admitted stub must assemble tool_search");
+        let select = tool_search
+            .execute(serde_json::json!({"query": "select:mastertech__remote_exec_start"}))
+            .await
+            .expect("tool_search must execute");
+        assert!(
+            select
+                .output
+                .contains("Not found: mastertech__remote_exec_start"),
+            "an unlisted MCP tool must not be selectable: {}",
+            select.output
+        );
+        let activated = activated_handle.expect("tool_search registers the activation handle");
+        assert!(
+            !activated
+                .lock()
+                .unwrap()
+                .is_activated("mastertech__remote_exec_start"),
+            "an unlisted MCP tool must never be activated"
+        );
+    }
+
+    #[tokio::test]
+    async fn excluded_tools_subtract_a_listed_mcp_tool_and_leave_others() {
+        let server = mastertech_mock_server().await;
+        let config = config_with_mastertech_mcp(server.uri(), false);
+
+        let listed = assemble_sweeper(
+            &config,
+            SecurityPolicy {
+                allowed_tools: Some(vec![
+                    "mastertech__query_surrealdb".into(),
+                    "mastertech__remote_exec_start".into(),
+                ]),
+                excluded_tools: Some(vec!["mastertech__remote_exec_start".into()]),
+                ..SecurityPolicy::default()
+            },
+            None,
+        )
+        .await;
+        let names: Vec<&str> = listed.registry.iter().map(|t| t.name()).collect();
+        assert_eq!(names, vec!["mastertech__query_surrealdb"], "{names:?}");
+
+        let unrestricted = assemble_sweeper(
+            &config,
+            SecurityPolicy {
+                excluded_tools: Some(vec!["mastertech__remote_exec_start".into()]),
+                ..SecurityPolicy::default()
+            },
+            None,
+        )
+        .await;
+        let mut names: Vec<&str> = unrestricted
+            .registry
+            .iter()
+            .map(|t| t.name())
+            .filter(|name| name.starts_with("mastertech__"))
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "mastertech__plugin_deploy_remote",
+                "mastertech__query_surrealdb"
+            ],
+            "excluded_tools without allowed_tools must subtract only the excluded tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_allowed_tools_intersects_with_the_risk_profile_list() {
+        let server = mastertech_mock_server().await;
+        let config = config_with_mastertech_mcp(server.uri(), false);
+        let cron_allowed = vec![
+            "mastertech__query_surrealdb".to_string(),
+            "mastertech__remote_exec_start".to_string(),
+        ];
+        let out = assemble_sweeper(
+            &config,
+            SecurityPolicy {
+                allowed_tools: Some(vec![
+                    "mastertech__query_surrealdb".into(),
+                    "mastertech__plugin_deploy_remote".into(),
+                ]),
+                ..SecurityPolicy::default()
+            },
+            Some(&cron_allowed),
+        )
+        .await;
+
+        let names: Vec<&str> = out.registry.iter().map(|t| t.name()).collect();
+        assert_eq!(
+            names,
+            vec!["mastertech__query_surrealdb"],
+            "only a tool both lists name may be registered: {names:?}"
+        );
+    }
 }

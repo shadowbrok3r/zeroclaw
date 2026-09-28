@@ -163,7 +163,9 @@ pub fn validate_delivery_config(delivery: Option<&DeliveryConfig>) -> Result<()>
     if delivery.mode.eq_ignore_ascii_case("none") {
         return Ok(());
     }
-    if !delivery.mode.eq_ignore_ascii_case("announce") {
+    if !delivery.mode.eq_ignore_ascii_case("announce")
+        && !delivery.mode.eq_ignore_ascii_case("on_failure")
+    {
         bail!("unsupported delivery mode: {}", delivery.mode);
     }
     // `app` alone names no agent, and the session it would write to is listed

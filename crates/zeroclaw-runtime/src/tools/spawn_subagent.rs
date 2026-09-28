@@ -189,6 +189,7 @@ impl Tool for SpawnSubagentTool {
             // the correct choice. The daemon heartbeat worker is the
             // only `mcp_registry` supplier.
             mcp_registry: None,
+            max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::default(),
         };
         let parent_alias = subagent_ctx.parent_alias.clone();
 

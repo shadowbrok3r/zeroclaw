@@ -14,6 +14,14 @@ install produces a 200-event rolling JSONL at
 `~/.zeroclaw/data/state/runtime-trace.jsonl`, and the dashboard's Logs page
 works without further configuration.
 
+`rolling` appends each event and trims the file back to the newest
+`log_persistence_max_entries` events once it holds a quarter more, so the file
+carries between 200 and 250 events by default and is rewritten once per 50
+appends rather than on every append. A trim writes a
+`runtime-trace.tmp.<pid>.<nanos>` file and renames it into place; the writer
+removes such files left by a process that died mid-trim when it next starts.
+For a large window, prefer `rotating`, which never rewrites the active file.
+
 `log_persistence = "none"` disables persistence entirely but does not gate the broadcast stream used by dashboard SSE. The optional typed `Observer` bridge is also independent of persistence, but it receives canonical log events only when explicitly bound; the current production bootstrap does not install that binding.
 
 Persistence is best-effort rather than a transactional audit guarantee. The Observer bridge, when bound, and broadcast delivery happen before the event is offered to a bounded background-writer queue. A full queue or worker write failure can leave an event out of JSONL. Periodic sync covers the current active file; daily rotation before a new UTC day's first append and size rotation after a threshold-crossing append can rename the active file without first syncing it, so the cadence does not bound durability for a just-rotated archive. See [Logging architecture](../architecture/logging.md#delivery-surfaces-have-different-guarantees) for the separate delivery contracts.

@@ -30,6 +30,8 @@ const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
     "cron_run",
     "schedule",
 ];
+/// Output prefix of an agent run the tool loop stopped before it finished.
+const AGENT_JOB_STOPPED_PREFIX: &str = "agent job stopped:";
 
 /// Type alias for the optional broadcast sender used to push cron results
 /// to connected dashboard/SSE clients.
@@ -744,6 +746,13 @@ async fn execute_job_with_retry(
             return (false, last_output);
         }
 
+        // Runs the tool loop stopped are not retried.
+        if matches!(job.job_type, JobType::Agent)
+            && last_output.starts_with(AGENT_JOB_STOPPED_PREFIX)
+        {
+            return (false, last_output);
+        }
+
         if attempt < retries {
             let jitter_ms = u64::from(Utc::now().timestamp_subsec_millis() % 250);
             time::sleep(Duration::from_millis(backoff_ms + jitter_ms)).await;
@@ -988,6 +997,7 @@ async fn run_agent_job(
         // `agent::run` is the correct choice. The daemon heartbeat
         // worker is the only `mcp_registry` supplier.
         mcp_registry: None,
+        max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::SummaryThenStop,
     };
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
@@ -1041,8 +1051,22 @@ async fn run_agent_job(
                     let _ = mem.purge_session(&mem_session_key).await;
                 }
             }
-            (false, format!("agent job failed: {e}"))
+            match crate::agent::turn::tool_loop_stopped(&e) {
+                Some(stopped) => (false, stopped_run_output(stopped)),
+                None => (false, format!("agent job failed: {e}")),
+            }
         }
+    }
+}
+
+/// Run output for an agent run the tool loop stopped: the reason, then what it produced.
+fn stopped_run_output(stopped: &crate::agent::turn::ToolLoopStopped) -> String {
+    let head = format!("{AGENT_JOB_STOPPED_PREFIX} {}", stopped.stop.reason());
+    let partial = stopped.partial_output.trim();
+    if partial.is_empty() {
+        head
+    } else {
+        format!("{head}\n\n{partial}")
     }
 }
 
@@ -1223,7 +1247,9 @@ async fn deliver_if_configured(
     output: &str,
 ) -> Result<()> {
     let delivery: &DeliveryConfig = &job.delivery;
-    if !delivery.mode.eq_ignore_ascii_case("announce") {
+    let every_run = delivery.mode.eq_ignore_ascii_case("announce");
+    let failed_run = delivery.mode.eq_ignore_ascii_case("on_failure") && !success;
+    if !every_run && !failed_run {
         return Ok(());
     }
 
@@ -2525,6 +2551,261 @@ mod tests {
         server.abort();
     }
 
+    type RequestLog = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+
+    /// OpenAI-compatible provider that answers each chat request with `respond(body)`.
+    async fn scripted_provider(
+        respond: impl Fn(&serde_json::Value) -> serde_json::Value + Clone + Send + Sync + 'static,
+    ) -> (
+        std::net::SocketAddr,
+        RequestLog,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{Json, Router, routing::post};
+
+        let requests: RequestLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&requests);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                log.lock().unwrap().push(body.clone());
+                let reply = respond(&body);
+                async move { Json(reply) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address, requests, server)
+    }
+
+    /// Test config whose agent runs on the scripted provider at `address`, with shell allowed.
+    async fn scripted_agent_config(tmp: &TempDir, address: std::net::SocketAddr) -> Config {
+        use zeroclaw_config::schema::{ModelProviderConfig, OllamaModelProviderConfig};
+
+        let mut config = test_config(tmp).await;
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.reliability.scheduler_retries = 2;
+        config.reliability.provider_backoff_ms = 1;
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("cron-status-test-model".to_string()),
+                    timeout_secs: Some(5),
+                    uri: Some(format!("http://{address}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.get_mut(TEST_AGENT).unwrap().model_provider = "ollama.default".into();
+        config.risk_profiles.get_mut(TEST_AGENT).unwrap().level =
+            crate::security::AutonomyLevel::Full;
+        config
+    }
+
+    fn shell_call_reply(call_id: &str, command: &str) -> serde_json::Value {
+        serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "shell",
+                            "arguments": serde_json::json!({"command": command}).to_string()
+                        }
+                    }]
+                }
+            }]
+        })
+    }
+
+    fn tool_rounds(body: &serde_json::Value) -> usize {
+        body["messages"].as_array().map_or(0, |messages| {
+            messages
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .count()
+        })
+    }
+
+    fn scheduled_agent_job(config: &Config, prompt: &str) -> CronJob {
+        cron::add_agent_job(
+            config,
+            TEST_AGENT,
+            Some("status test".into()),
+            crate::cron::Schedule::Cron {
+                expr: "0 * * * *".into(),
+                tz: None,
+            },
+            prompt,
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            Some(vec!["shell".into()]),
+            false,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn agent_run_that_hits_max_tool_iterations_is_recorded_as_error_once() {
+        let (address, requests, server) = scripted_provider(|body| {
+            if body.get("tools").is_none_or(serde_json::Value::is_null) {
+                return serde_json::json!({
+                    "choices": [{"message": {"content": "Swept two clients; one is left."}}]
+                });
+            }
+            let round = tool_rounds(body);
+            shell_call_reply(&format!("call-{round}"), &format!("echo round-{round}"))
+        })
+        .await;
+        let tmp = TempDir::new().unwrap();
+        let mut config = scripted_agent_config(&tmp, address).await;
+        config
+            .runtime_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .max_tool_iterations = 2;
+        let security = test_security(&config);
+        let job = scheduled_agent_job(&config, "Sweep every client");
+
+        let report = Box::pin(execute_and_persist_job(
+            &config,
+            &security,
+            TEST_AGENT,
+            &job,
+            &unique_component("cron-status"),
+        ))
+        .await;
+
+        assert!(!report.success, "a capped run must not succeed");
+        assert_eq!(report.status, "error");
+        assert!(
+            report
+                .output
+                .starts_with("agent job stopped: reached maximum tool iterations (2)"),
+            "got: {}",
+            report.output
+        );
+        assert!(
+            report.output.contains("Swept two clients; one is left."),
+            "the final summary must be kept in the output: {}",
+            report.output
+        );
+        let summary_requests = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|body| body.get("tools").is_none_or(serde_json::Value::is_null))
+            .count();
+        assert_eq!(summary_requests, 1, "a capped run must not be retried");
+
+        let stored = cron::get_job(&config, &job.id).unwrap();
+        assert_eq!(stored.last_status.as_deref(), Some("error"));
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "error");
+        assert!(
+            runs[0]
+                .output
+                .as_deref()
+                .is_some_and(|output| output.contains("reached maximum tool iterations (2)")),
+            "run history must carry the reason: {:?}",
+            runs[0].output
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn agent_run_stopped_by_the_loop_detector_is_recorded_as_error_once() {
+        let (address, requests, server) = scripted_provider(|body| {
+            shell_call_reply(&format!("call-{}", tool_rounds(body)), "echo same")
+        })
+        .await;
+        let tmp = TempDir::new().unwrap();
+        let mut config = scripted_agent_config(&tmp, address).await;
+        config
+            .runtime_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .max_tool_iterations = 20;
+        let security = test_security(&config);
+        let job = scheduled_agent_job(&config, "Check the queue");
+
+        let report = Box::pin(execute_and_persist_job(
+            &config,
+            &security,
+            TEST_AGENT,
+            &job,
+            &unique_component("cron-status"),
+        ))
+        .await;
+
+        assert!(!report.success);
+        assert_eq!(report.status, "error");
+        assert!(
+            report
+                .output
+                .starts_with("agent job stopped: loop detector: Circuit breaker"),
+            "got: {}",
+            report.output
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            5,
+            "the breaker fires on the fifth identical call and the run is not retried"
+        );
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "error");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn agent_run_that_finishes_within_the_cap_is_still_ok() {
+        let (address, _requests, server) = scripted_provider(|body| {
+            if tool_rounds(body) > 0 {
+                return serde_json::json!({"choices": [{"message": {"content": "sweep clean"}}]});
+            }
+            shell_call_reply("call-0", "echo checked")
+        })
+        .await;
+        let tmp = TempDir::new().unwrap();
+        let mut config = scripted_agent_config(&tmp, address).await;
+        config
+            .runtime_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .max_tool_iterations = 2;
+        let security = test_security(&config);
+        let job = scheduled_agent_job(&config, "Sweep every client");
+
+        let report = Box::pin(execute_and_persist_job(
+            &config,
+            &security,
+            TEST_AGENT,
+            &job,
+            &unique_component("cron-status"),
+        ))
+        .await;
+
+        assert!(report.success, "got: {}", report.output);
+        assert_eq!(report.status, "ok");
+        assert_eq!(report.output, "sweep clean");
+
+        server.abort();
+    }
+
     #[tokio::test]
     async fn run_agent_job_blocks_readonly_mode() {
         let tmp = TempDir::new().unwrap();
@@ -3060,6 +3341,12 @@ mod tests {
     /// Channel name the recorder counts. Used only by the suppression test.
     const COUNT_CHANNEL: &str = "count-delivery";
 
+    static ON_FAILURE_DELIVERED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// Channel name the recorder counts for the `on_failure` tests.
+    const ON_FAILURE_CHANNEL: &str = "on-failure-count-delivery";
+
     fn register_recording_delivery_fn() {
         // Idempotent: register_delivery_fn is a no-op once the OnceLock is set,
         // so repeated calls across tests are safe and the first writer wins. The
@@ -3073,9 +3360,75 @@ mod tests {
                 if channel == COUNT_CHANNEL {
                     DELIVERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
+                if channel == ON_FAILURE_CHANNEL {
+                    ON_FAILURE_DELIVERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 Ok(())
             })
         }));
+    }
+
+    #[tokio::test]
+    async fn on_failure_delivery_sends_failed_runs_only() {
+        register_recording_delivery_fn();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = test_job("echo ok");
+        job.delivery = DeliveryConfig {
+            mode: "on_failure".to_string(),
+            channel: Some(ON_FAILURE_CHANNEL.to_string()),
+            to: Some("chat-id".to_string()),
+            thread_id: None,
+            best_effort: true,
+        };
+        crate::cron::validate_delivery_config(Some(&job.delivery))
+            .expect("on_failure validates like announce");
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let before = ON_FAILURE_DELIVERED.load(SeqCst);
+        deliver_if_configured(&config, &job, true, "sweep clean")
+            .await
+            .unwrap();
+        assert_eq!(
+            ON_FAILURE_DELIVERED.load(SeqCst),
+            before,
+            "a successful run must not be delivered"
+        );
+
+        deliver_if_configured(
+            &config,
+            &job,
+            false,
+            "agent job stopped: reached maximum tool iterations (30)",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ON_FAILURE_DELIVERED.load(SeqCst),
+            before + 1,
+            "a failed run must be delivered"
+        );
+    }
+
+    #[test]
+    fn on_failure_delivery_requires_a_channel_and_target() {
+        let missing_channel = DeliveryConfig {
+            mode: "on_failure".to_string(),
+            channel: None,
+            to: Some("chat-id".to_string()),
+            thread_id: None,
+            best_effort: true,
+        };
+        assert!(crate::cron::validate_delivery_config(Some(&missing_channel)).is_err());
+
+        let missing_target = DeliveryConfig {
+            mode: "on_failure".to_string(),
+            channel: Some(ON_FAILURE_CHANNEL.to_string()),
+            to: None,
+            thread_id: None,
+            best_effort: true,
+        };
+        assert!(crate::cron::validate_delivery_config(Some(&missing_target)).is_err());
     }
 
     fn announce_job() -> CronJob {

@@ -239,7 +239,7 @@ The primary pagination cursor is `next_cursor_line_offset`, the byte offset imme
 
 The offset is not a durable event identity or cross-file checkpoint. It becomes stale whenever the active file's bytes are replaced or its path changes:
 
-- `rolling` trim streams the retained tail to a temporary file and renames it over the active path.
+- `rolling` trim, once per quarter-window of appends, streams the retained tail to a temporary file and renames it over the active path.
 - `rotating` renames the active file to an archive; the next append creates a new active file.
 - schema migration rewrites the active file through a temporary file and atomic rename.
 - a daemon config reload can install a new persistence path.
@@ -253,7 +253,7 @@ After one of those boundaries, restart pagination from the newest page. Reusing 
 | Policy | Active-file behavior | Retention owner |
 |---|---|---|
 | `none` | No new JSONL writes. | None. |
-| `rolling` | After an append exceeds `max_entries`, stream only the newest non-empty lines to a temporary file and rename it over the active file. | The writer keeps the configured active-window size. It creates no archives and leaves archives from an earlier `rotating` configuration unmanaged. |
+| `rolling` | Append, counting lines in the worker. Once the file holds more than `max_entries + max_entries / 4` lines, stream the newest `max_entries` non-empty lines to a temporary file and rename it over the active file. | The writer keeps between `max_entries` and a quarter more. It creates no archives and leaves archives from an earlier `rotating` configuration unmanaged. At writer initialization it removes `<stem>.tmp.<pid>.<nanos>` trim temporaries not written for ten minutes, which a process that died mid-trim leaves behind. |
 | `full` | Append without writer-managed trim or rotation. | The operator owns file growth and any external rotation. |
 | `rotating` | Before a new UTC day's first append, or after an append reaches the byte threshold, rename the active file to a timestamped archive. | After each successful rotation, the writer prunes matching archives by age and then count. Removal is best-effort and never fails the enclosing append. |
 
