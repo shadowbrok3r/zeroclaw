@@ -589,6 +589,22 @@ died mid-trim left its temp file behind (3.1 GB of `runtime-trace.tmp.*`).
 | `crates/zeroclaw-log/src/writer.rs` | The worker counts appends and trims back to `max_entries` only once the file holds `max_entries + max_entries / 4` lines, counting the file once at startup. A failed trim removes its temp file, and writer init removes `<stem>.tmp.<pid>.<nanos>` files not written for ten minutes. Tests: `rolling_trims_only_after_a_quarter_window_past_max_entries`, `rolling_appends_below_the_high_water_mark_keep_the_same_file`, `rolling_counts_lines_already_in_the_file_at_startup`, `init_removes_stale_rolling_trim_temp_files`. |
 | `crates/zeroclaw-config/src/schema.rs`, `docs/book/src/ops/observability.md`, `docs/book/src/architecture/logging.md` | The window and cleanup contract; `rotating` added to the mode list. |
 
+### Per-session routing headers: `{session_hash}` in `extra_headers` (providers)
+
+A LiteLLM pool keeps a conversation on one backend (and its prompt cache) only when
+every call carries the same session id. Upstream sends `extra_headers` verbatim, so
+one config value pinned every conversation of an agent together. Ours replaces
+`{session_hash}` in a header value with the SHA-256 hex digest of the active
+`TOOL_LOOP_SESSION_KEY`, per call; the raw session or channel id never leaves the
+box. A call with no active session omits a templated header; literal headers are
+unchanged. `~/.zeroclaw/config.toml` relies on it (`zc-comfy`, `zc-curator`,
+`zc-director-{session_hash}`).
+
+| File | Why |
+|---|---|
+| `crates/zeroclaw-providers/src/compatible.rs` | `resolved_extra_headers()` resolves the template; `http_client()` and `streaming_http_client()` use it. The three streaming entry points take `for_current_session()`, a clone with the headers resolved before the spawned stream task leaves the turn's task-local scope. Test: `session_headers_isolate_conversations_and_survive_streaming_tasks` (two sessions differ, one session keeps its id across a compacted streaming call, an unscoped call omits the header, literal headers pass through, the configured template is not mutated). |
+| `docs/book/src/providers/configuration.md` | The `{session_hash}` contract and an `x-litellm-session-id` example. |
+
 ### Documentation
 
 | File | Why |
@@ -785,4 +801,14 @@ Re-check these after every upstream merge; they are easy to silently lose:
   whenever the hub's finished-turn count moved. A merge that drops
   `resync_history`, or moves the hub lookup after the connect-time load, reopens
   the gap with no compile error; `a_socket_that_resumed_mid_turn_answers_with_that_turn_in_its_history`
+  fails when it does.
+
+- **`{session_hash}` in `extra_headers` is resolved per call.** Upstream sends
+  header values verbatim, so `zc-director-{session_hash}` would reach LiteLLM as
+  that literal string and every conversation would share one session id (one
+  backend, one prompt cache). A merge that takes upstream's `http_client()` /
+  `streaming_http_client()` header loop over `&self.extra_headers`, or restores
+  `let provider = self.clone();` in the streaming entry points (the spawned task
+  then runs outside `TOOL_LOOP_SESSION_KEY` and drops the header), loses it with
+  no compile error; `session_headers_isolate_conversations_and_survive_streaming_tasks`
   fails when it does.

@@ -26,6 +26,14 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 
 Family-specific entries add their own typed fields on top of these shared fields.
 
+OpenAI-compatible adapters support `{session_hash}` inside `extra_headers` values.
+For example, `extra_headers = { "x-litellm-session-id" = "zc-chat-{session_hash}" }`
+gives a gateway a stable SHA-256 digest of the canonical active session key, without
+sending the raw channel or session identifier. The value is resolved for every call,
+including streaming, so retries and compacted histories retain the same identity.
+Calls without an active session omit templated headers; literal headers are unchanged.
+This is opt-in and does not change the gateway's load-balancing policy.
+
 ## Field resolution order
 
 For most families, the URL is resolved in this order:

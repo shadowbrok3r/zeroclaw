@@ -808,6 +808,40 @@ impl OpenAiCompatibleModelProvider {
         result
     }
 
+    /// Resolve opt-in routing headers from the canonical active session at call time.
+    /// A missing scope omits templated headers instead of pinning unrelated calls together.
+    fn resolved_extra_headers(&self) -> std::collections::HashMap<String, String> {
+        use sha2::{Digest, Sha256};
+
+        let session_hash = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .try_with(|key| {
+                key.as_ref()
+                    .filter(|key| !key.is_empty())
+                    .map(|key| hex::encode(Sha256::digest(key.as_bytes())))
+            })
+            .ok()
+            .flatten();
+        self.extra_headers
+            .iter()
+            .filter_map(|(name, value)| {
+                if value.contains("{session_hash}") {
+                    session_hash
+                        .as_ref()
+                        .map(|hash| (name.clone(), value.replace("{session_hash}", hash)))
+                } else {
+                    Some((name.clone(), value.clone()))
+                }
+            })
+            .collect()
+    }
+
+    /// Streaming HTTP runs in a spawned task, so resolve its headers before leaving the turn scope.
+    fn for_current_session(&self) -> Self {
+        let mut provider = self.clone();
+        provider.extra_headers = self.resolved_extra_headers();
+        provider
+    }
+
     fn http_client(&self) -> Client {
         let timeout = self.timeout_secs;
         let has_user_agent = self.user_agent.is_some();
@@ -821,10 +855,10 @@ impl OpenAiCompatibleModelProvider {
             {
                 headers.insert(USER_AGENT, value);
             }
-            for (key, value) in &self.extra_headers {
+            for (key, value) in self.resolved_extra_headers() {
                 match (
                     reqwest::header::HeaderName::from_bytes(key.as_bytes()),
-                    HeaderValue::from_str(value),
+                    HeaderValue::from_str(&value),
                 ) {
                     (Ok(name), Ok(val)) => {
                         headers.insert(name, val);
@@ -891,10 +925,10 @@ impl OpenAiCompatibleModelProvider {
             {
                 headers.insert(USER_AGENT, value);
             }
-            for (key, value) in &self.extra_headers {
+            for (key, value) in self.resolved_extra_headers() {
                 match (
                     reqwest::header::HeaderName::from_bytes(key.as_bytes()),
-                    HeaderValue::from_str(value),
+                    HeaderValue::from_str(&value),
                 ) {
                     (Ok(name), Ok(val)) => {
                         headers.insert(name, val);
@@ -3610,7 +3644,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             return stream::once(async { Ok(StreamEvent::Final) }).boxed();
         }
 
-        let provider = self.clone();
+        let provider = self.for_current_session();
         let messages_owned: Vec<ChatMessage> = request.messages.to_vec();
         let tools_owned: Option<Vec<zeroclaw_api::tool::ToolSpec>> =
             request.tools.map(<[zeroclaw_api::tool::ToolSpec]>::to_vec);
@@ -3811,7 +3845,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        let provider = self.clone();
+        let provider = self.for_current_session();
         let system_prompt_owned: Option<String> = system_prompt.map(str::to_string);
         let message_owned = message.to_string();
         let model = model.to_string();
@@ -3951,7 +3985,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        let provider = self.clone();
+        let provider = self.for_current_session();
         let messages_owned: Vec<ChatMessage> = messages.to_vec();
         let model = model.to_string();
         let count_tokens = options.count_tokens;
@@ -8882,6 +8916,100 @@ mod tests {
             .build();
         // Should not panic
         let _client = p.http_client();
+    }
+
+    #[tokio::test]
+    async fn session_headers_isolate_conversations_and_survive_streaming_tasks() {
+        use axum::response::IntoResponse;
+        use axum::{Json, Router, routing::post};
+        use futures_util::StreamExt as _;
+
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|headers: axum::http::HeaderMap, Json(body): Json<serde_json::Value>| async move {
+                assert_eq!(headers.get("x-test-static").unwrap(), "unchanged");
+                let session = headers
+                    .get("x-litellm-session-id")
+                    .map_or("missing", |value| value.to_str().unwrap());
+                if body["stream"] == true {
+                    let delta = serde_json::json!({"choices":[{"delta":{"content":session}}]});
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        format!("data: {delta}\n\ndata: [DONE]\n\n"),
+                    ).into_response()
+                } else {
+                    Json(serde_json::json!({"choices":[{"message":{"role":"assistant","content":session}}]}))
+                        .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut provider = make_model_provider("test", &format!("http://{address}"), Some("key"));
+        provider.extra_headers.insert(
+            "x-litellm-session-id".into(),
+            "zc-chat-{session_hash}".into(),
+        );
+        provider
+            .extra_headers
+            .insert("x-test-static".into(), "unchanged".into());
+        let call = |key: Option<&str>, streaming: bool, message: &'static str| {
+            let provider = &provider;
+            let key = key.map(str::to_string);
+            async move {
+                zeroclaw_api::TOOL_LOOP_SESSION_KEY
+                    .scope(key, async {
+                        if streaming {
+                            let messages = [ChatMessage::user(message)];
+                            let mut stream = provider.stream_chat(
+                                ProviderChatRequest {
+                                    messages: &messages,
+                                    tools: None,
+                                    thinking: None,
+                                },
+                                "test-model",
+                                None,
+                                StreamOptions {
+                                    enabled: true,
+                                    count_tokens: false,
+                                },
+                            );
+                            let mut answer = String::new();
+                            while let Some(event) = stream.next().await {
+                                if let StreamEvent::TextDelta(text) = event.unwrap() {
+                                    answer.push_str(&text.delta);
+                                }
+                            }
+                            answer
+                        } else {
+                            provider
+                                .chat_with_system(None, message, "test-model", None)
+                                .await
+                                .unwrap()
+                        }
+                    })
+                    .await
+            }
+        };
+        let (first, other) = tokio::join!(
+            call(Some("session-one"), false, "Identical opener"),
+            call(Some("session-two"), true, "Identical opener"),
+        );
+        let compacted = call(Some("session-one"), true, "A compacted history").await;
+        let unscoped = call(None, false, "Identical opener").await;
+        assert_eq!(first, compacted);
+        assert_ne!(first, other);
+        assert!(first.starts_with("zc-chat-") && first.len() == 72);
+        assert!(!first.contains("session-one"));
+        assert_eq!(unscoped, "missing");
+        assert_eq!(
+            provider.extra_headers["x-litellm-session-id"],
+            "zc-chat-{session_hash}"
+        );
+        server.abort();
     }
 
     #[test]
