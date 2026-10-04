@@ -140,6 +140,25 @@ Replies contain `success`, `output`, `error`, `agent`, `tool`, and `truncated`.
 Check `success` as well as the HTTP status. Output is limited to 32,000 characters;
 truncated content includes a notice. Disable `web_tools_enabled` to revoke bridge access.
 
+## One-shot completion
+
+`POST /api/complete` makes a single model call through a `[[model_routes]]`
+hint. It runs no agent loop or tools, opens no session, and skips the memory
+autosave that `/webhook` performs. It suits callers that need a quick answer
+from the local pools, such as command autocomplete. It requires the
+pairing-derived bearer token.
+
+```json
+{ "hint": "quick", "system": "optional system prompt", "prompt": "...", "temperature": 0.2 }
+```
+
+`hint` defaults to `quick`. Only a hint with a configured `[[model_routes]]`
+entry resolves, so a token holder cannot name an arbitrary provider. Up to
+64 KiB of system and prompt text is accepted, and `temperature` must be
+between 0.0 and 2.0. The reply is `{ "response": "...", "model": "...", "hint": "..." }`.
+An unknown hint or a malformed body returns 400, and a provider failure
+returns 502 with a sanitized error.
+
 ## Session endpoints
 
 The gateway exposes the unified session store (see
