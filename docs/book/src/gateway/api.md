@@ -122,6 +122,25 @@ the page degrades gracefully and points you at the raw spec at
 `/api/openapi.json` so you can use any compatible viewer
 (Insomnia, Postman, Swagger UI, etc.).
 
+## One-shot completion
+
+`POST /api/complete` makes a single model call through a `[[model_routes]]`
+hint. It runs no agent loop or tools, opens no session, and skips the memory
+autosave that `/webhook` performs. It suits callers that need a quick answer
+from the local pools, such as command autocomplete. It requires the
+pairing-derived bearer token.
+
+```json
+{ "hint": "quick", "system": "optional system prompt", "prompt": "...", "temperature": 0.2 }
+```
+
+`hint` defaults to `quick`. Only a hint with a configured `[[model_routes]]`
+entry resolves, so a token holder cannot name an arbitrary provider. Up to
+64 KiB of system and prompt text is accepted, and `temperature` must be
+between 0.0 and 2.0. The reply is `{ "response": "...", "model": "...", "hint": "..." }`.
+An unknown hint or a malformed body returns 400, and a provider failure
+returns 502 with a sanitized error.
+
 ## Session endpoints
 
 The gateway exposes the unified session store (see
