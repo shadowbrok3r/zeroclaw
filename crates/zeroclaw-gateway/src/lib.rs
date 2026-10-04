@@ -52,6 +52,7 @@ pub mod tls;
 pub mod version;
 #[cfg(feature = "gateway-voice-duplex")]
 pub mod voice_duplex;
+mod web_tools;
 #[cfg(any(
     feature = "channel-linq",
     feature = "channel-nextcloud",
@@ -318,6 +319,8 @@ impl SlidingWindowRateLimiter {
 pub struct GatewayRateLimiter {
     pair: SlidingWindowRateLimiter,
     webhook: SlidingWindowRateLimiter,
+    /// Counters for bridge calls; current agent policy supplies the limits at use time.
+    web_tools: zeroclaw_config::policy::PerSenderTracker,
 }
 
 impl GatewayRateLimiter {
@@ -326,6 +329,7 @@ impl GatewayRateLimiter {
         Self {
             pair: SlidingWindowRateLimiter::new(pair_per_minute, window, max_keys),
             webhook: SlidingWindowRateLimiter::new(webhook_per_minute, window, max_keys),
+            web_tools: zeroclaw_config::policy::PerSenderTracker::new(),
         }
     }
 
@@ -1910,6 +1914,7 @@ pub async fn run_gateway(
         .route("/api/openapi.json", get(openapi::handle_openapi_json))
         .route("/api/docs", get(openapi::handle_docs))
         .route("/api/tools", get(api::handle_api_tools))
+        .merge(web_tools::routes())
         .route("/api/cron", get(api::handle_api_cron_list))
         .route("/api/cron", post(api::handle_api_cron_add))
         .route(
@@ -4440,7 +4445,7 @@ mod tests {
     /// Build an AppState wired with a real pairing guard, on-disk config path,
     /// and an optional device registry so the admin paircode handler's
     /// revoke + persist paths can be exercised end to end.
-    fn admin_paircode_state(
+    pub(super) fn admin_paircode_state(
         tmp: &tempfile::TempDir,
         require_pairing: bool,
         with_registry: bool,

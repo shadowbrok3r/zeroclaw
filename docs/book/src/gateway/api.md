@@ -122,6 +122,24 @@ the page degrades gracefully and points you at the raw spec at
 `/api/openapi.json` so you can use any compatible viewer
 (Insomnia, Postman, Swagger UI, etc.).
 
+## Scoped web tools
+
+With `[gateway] web_tools_enabled = true`, paired clients can reuse an enabled agent's
+existing web tools through `GET /api/agents/{agent}/web-tools` and
+`POST /api/agents/{agent}/web-tools/{tool}`. The POST body is the tool's argument object.
+Only `web_search_tool` and `web_fetch` are supported. The catalog returns their ordinary
+tool schemas so clients can advertise them without hosted search or namespace support.
+
+The bridge is disabled by default and requires pairing even when other gateway routes
+allow anonymous requests. Every call resolves current agent policy; disabled, excluded,
+read-only, and prompt-required tools cannot execute. Existing provider configuration,
+fetch restrictions, hooks, execution telemetry and action limits apply. The bridge
+never exposes general tool execution or provider credentials.
+
+Replies contain `success`, `output`, `error`, `agent`, `tool`, and `truncated`.
+Check `success` as well as the HTTP status. Output is limited to 32,000 characters;
+truncated content includes a notice. Disable `web_tools_enabled` to revoke bridge access.
+
 ## One-shot completion
 
 `POST /api/complete` makes a single model call through a `[[model_routes]]`

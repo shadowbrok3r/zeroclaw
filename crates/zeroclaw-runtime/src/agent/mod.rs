@@ -22,6 +22,7 @@ pub mod thinking;
 pub(crate) mod tool_call_format;
 pub mod tool_execution;
 pub mod tool_receipts;
+pub mod web_tools;
 pub(crate) mod turn;
 
 pub use turn::context::TurnMeta;
