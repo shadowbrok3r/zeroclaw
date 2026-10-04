@@ -7043,6 +7043,10 @@ pub struct GatewayConfig {
     /// (default: false)
     #[serde(default)]
     pub allow_remote_admin: bool,
+    /// Allow paired clients to call an agent's approved web search/fetch tools.
+    /// Disabled by default; does not expose arbitrary tool execution.
+    #[serde(default)]
+    pub web_tools_enabled: bool,
     /// Paired bearer tokens (managed automatically, not user-edited)
     #[serde(default)]
     #[secret]
@@ -7231,6 +7235,7 @@ impl Default for GatewayConfig {
             require_pairing: true,
             allow_public_bind: false,
             allow_remote_admin: false,
+            web_tools_enabled: false,
             paired_tokens: Vec::new(),
             pair_rate_limit_per_minute: default_pair_rate_limit(),
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),

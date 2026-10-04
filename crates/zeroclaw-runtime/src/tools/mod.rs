@@ -512,6 +512,65 @@ pub const BUILTIN_TOOL_INTEGRATIONS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Canonical constructors for the two web tools shared by agents and the gateway bridge.
+/// Callers must still apply the scoped registry and approval policy before executing.
+pub fn web_tools_with_security(
+    security: Arc<SecurityPolicy>,
+    web_fetch_config: &zeroclaw_config::schema::WebFetchConfig,
+    root_config: &Config,
+) -> Vec<Arc<dyn Tool>> {
+    let mut tool_arcs: Vec<Arc<dyn Tool>> = Vec::new();
+    if web_fetch_config.enabled {
+        match WebFetchTool::new(
+            security.clone(),
+            web_fetch_config.allowed_domains.clone(),
+            web_fetch_config.blocked_domains.clone(),
+            web_fetch_config.max_response_size,
+            web_fetch_config.timeout_secs,
+            web_fetch_config.firecrawl.clone(),
+            web_fetch_config.allowed_private_hosts.clone(),
+            root_config.security.nat64_prefixes.clone(),
+        ) {
+            Ok(tool) => {
+                tool_arcs.push(Arc::new(RateLimitedTool::new(tool, security.clone())));
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "web_fetch: failed to construct tool, skipping registration"
+                );
+            }
+        }
+    }
+
+    // Web search tool (enabled by default for GLM and other models)
+    if root_config.web_search.enabled {
+        // Rate-limited like the other outbound-network tools: without the wrapper an agent loop could
+        // issue unbounded searches against the configured provider — and
+        // against the default DuckDuckGo scrape path, which gets the machine
+        // blocked.
+        tool_arcs.push(Arc::new(RateLimitedTool::new(
+            WebSearchTool::new_with_config(
+                root_config.web_search.search_provider.clone(),
+                root_config.web_search.brave_api_key.clone(),
+                root_config.web_search.tavily_api_key.clone(),
+                root_config.web_search.jina_api_key.clone(),
+                root_config.web_search.searxng_instance_url.clone(),
+                root_config.web_search.max_results,
+                root_config.web_search.timeout_secs,
+                root_config.config_path.clone(),
+                root_config.secrets.encrypt,
+            ),
+            security.clone(),
+        )));
+    }
+
+    tool_arcs
+}
+
 /// Bundled return values from tool registry construction.
 /// Named struct to avoid an ever-growing positional tuple that's painful
 /// to destructure across many callers.
@@ -1155,31 +1214,11 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    if web_fetch_config.enabled {
-        match WebFetchTool::new(
-            security.clone(),
-            web_fetch_config.allowed_domains.clone(),
-            web_fetch_config.blocked_domains.clone(),
-            web_fetch_config.max_response_size,
-            web_fetch_config.timeout_secs,
-            web_fetch_config.firecrawl.clone(),
-            web_fetch_config.allowed_private_hosts.clone(),
-            root_config.security.nat64_prefixes.clone(),
-        ) {
-            Ok(tool) => {
-                tool_arcs.push(Arc::new(RateLimitedTool::new(tool, security.clone())));
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "web_fetch: failed to construct tool, skipping registration"
-                );
-            }
-        }
-    }
+    tool_arcs.extend(web_tools_with_security(
+        security.clone(),
+        web_fetch_config,
+        root_config,
+    ));
 
     // Text browser tool (headless text-based browser rendering)
     if root_config.text_browser.enabled {
@@ -1203,29 +1242,6 @@ pub fn all_tools_with_runtime(
                 );
             }
         }
-    }
-
-    // Web search tool (enabled by default for GLM and other models)
-    if root_config.web_search.enabled {
-        // Rate-limited like every other outbound-network tool (see web_fetch
-        // and http_request above): without the wrapper an agent loop could
-        // issue unbounded searches against the configured provider — and
-        // against the default DuckDuckGo scrape path, which gets the machine
-        // blocked.
-        tool_arcs.push(Arc::new(RateLimitedTool::new(
-            WebSearchTool::new_with_config(
-                root_config.web_search.search_provider.clone(),
-                root_config.web_search.brave_api_key.clone(),
-                root_config.web_search.tavily_api_key.clone(),
-                root_config.web_search.jina_api_key.clone(),
-                root_config.web_search.searxng_instance_url.clone(),
-                root_config.web_search.max_results,
-                root_config.web_search.timeout_secs,
-                root_config.config_path.clone(),
-                root_config.secrets.encrypt,
-            ),
-            security.clone(),
-        )));
     }
 
     // Notion API tool (conditionally registered)
