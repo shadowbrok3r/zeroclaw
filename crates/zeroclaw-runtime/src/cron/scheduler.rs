@@ -897,7 +897,11 @@ fn job_gate<'a>(config: &'a Config, job: &CronJob) -> Option<(&'a str, u32)> {
         return None;
     }
     let decl = config.cron.get(&job.id)?;
-    let gate = decl.gate.as_deref().map(str::trim).filter(|g| !g.is_empty())?;
+    let gate = decl
+        .gate
+        .as_deref()
+        .map(str::trim)
+        .filter(|g| !g.is_empty())?;
     Some((gate, decl.gate_wait_minutes))
 }
 
@@ -913,8 +917,15 @@ async fn check_gate(config: &Config, gate: &str) -> std::result::Result<(), Stri
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let child = command.spawn().map_err(|e| format!("gate spawn error: {e}"))?;
-    match time::timeout(Duration::from_secs(GATE_TIMEOUT_SECS), child.wait_with_output()).await {
+    let child = command
+        .spawn()
+        .map_err(|e| format!("gate spawn error: {e}"))?;
+    match time::timeout(
+        Duration::from_secs(GATE_TIMEOUT_SECS),
+        child.wait_with_output(),
+    )
+    .await
+    {
         Ok(Ok(output)) if output.status.success() => Ok(()),
         Ok(Ok(output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -934,7 +945,11 @@ async fn check_gate(config: &Config, gate: &str) -> std::result::Result<(), Stri
 }
 
 /// Next gate check for a held cron run, or `None` once no occurrence lies within the wait window.
-fn gate_retry_at(schedule: &Schedule, wait_minutes: u32, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+fn gate_retry_at(
+    schedule: &Schedule,
+    wait_minutes: u32,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
     if wait_minutes == 0 || !matches!(schedule, Schedule::Cron { .. }) {
         return None;
     }
@@ -987,7 +1002,12 @@ fn hold_gated_job(config: &Config, job: &CronJob, at: DateTime<Utc>, reason: &st
 }
 
 /// Records a run its gate held past the wait window as `skipped`, with no delivery.
-fn skip_gated_job(config: &Config, job: &CronJob, agent_alias: &str, reason: &str) -> ScheduledRunReport {
+fn skip_gated_job(
+    config: &Config,
+    job: &CronJob,
+    agent_alias: &str,
+    reason: &str,
+) -> ScheduledRunReport {
     let now = Utc::now();
     let output = format!("skipped: {reason}");
     let action = if matches!(job.schedule, Schedule::At { .. }) {
@@ -995,7 +1015,17 @@ fn skip_gated_job(config: &Config, job: &CronJob, agent_alias: &str, reason: &st
     } else {
         RunCompletionAction::Reschedule
     };
-    let run_id = match persist_run_result(config, job, now, now, now, "skipped", Some(&output), 0, action) {
+    let run_id = match persist_run_result(
+        config,
+        job,
+        now,
+        now,
+        now,
+        "skipped",
+        Some(&output),
+        0,
+        action,
+    ) {
         Ok(id) => Some(id),
         Err(e) => {
             ::zeroclaw_log::record!(
@@ -1005,7 +1035,8 @@ fn skip_gated_job(config: &Config, job: &CronJob, agent_alias: &str, reason: &st
                     .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
                 "Cron job: failed to record a gate skip"
             );
-            let _ = persist_run_completion_state(config, job, now, "skipped", Some(&output), action);
+            let _ =
+                persist_run_completion_state(config, job, now, "skipped", Some(&output), action);
             None
         }
     };
@@ -4147,13 +4178,22 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (config, job) = gated_job(&tmp, "echo fleet busy; exit 1", 0).await;
 
-        process_due_jobs(&config, vec![job.clone()], &unique_component("gate-skip"), &None).await;
+        process_due_jobs(
+            &config,
+            vec![job.clone()],
+            &unique_component("gate-skip"),
+            &None,
+        )
+        .await;
 
         let runs = cron::list_runs(&config, &job.id, 5).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "skipped");
         let output = runs[0].output.clone().unwrap_or_default();
-        assert!(output.contains("fleet busy") && !output.contains("gated-run"), "{output}");
+        assert!(
+            output.contains("fleet busy") && !output.contains("gated-run"),
+            "{output}"
+        );
         assert!(cron::get_job(&config, &job.id).unwrap().next_run > Utc::now());
         assert!(cron::claim_job(&config, &job.id, Utc::now()).unwrap());
     }
@@ -4164,12 +4204,21 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (config, job) = gated_job(&tmp, "echo fleet busy >&2; exit 1", 30).await;
 
-        process_due_jobs(&config, vec![job.clone()], &unique_component("gate-hold"), &None).await;
+        process_due_jobs(
+            &config,
+            vec![job.clone()],
+            &unique_component("gate-hold"),
+            &None,
+        )
+        .await;
 
         assert!(cron::list_runs(&config, &job.id, 5).unwrap().is_empty());
         let next_run = cron::get_job(&config, &job.id).unwrap().next_run;
         let now = Utc::now();
-        assert!(next_run > now + ChronoDuration::seconds(GATE_RETRY_SECS - 10) && next_run <= now + ChronoDuration::seconds(GATE_RETRY_SECS));
+        assert!(
+            next_run > now + ChronoDuration::seconds(GATE_RETRY_SECS - 10)
+                && next_run <= now + ChronoDuration::seconds(GATE_RETRY_SECS)
+        );
         assert!(cron::claim_job(&config, &job.id, Utc::now()).unwrap());
     }
 
@@ -4179,12 +4228,24 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (config, job) = gated_job(&tmp, "true", 30).await;
 
-        process_due_jobs(&config, vec![job.clone()], &unique_component("gate-open"), &None).await;
+        process_due_jobs(
+            &config,
+            vec![job.clone()],
+            &unique_component("gate-open"),
+            &None,
+        )
+        .await;
 
         let runs = cron::list_runs(&config, &job.id, 5).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "ok");
-        assert!(runs[0].output.clone().unwrap_or_default().contains("gated-run"));
+        assert!(
+            runs[0]
+                .output
+                .clone()
+                .unwrap_or_default()
+                .contains("gated-run")
+        );
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -4192,7 +4253,9 @@ mod tests {
     async fn the_gate_reason_falls_back_to_stderr() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
-        let held = check_gate(&config, "echo no node free >&2; exit 3").await.unwrap_err();
+        let held = check_gate(&config, "echo no node free >&2; exit 3")
+            .await
+            .unwrap_err();
         assert!(held.contains("no node free"), "{held}");
         assert!(check_gate(&config, "true").await.is_ok());
     }
@@ -4230,7 +4293,10 @@ mod tests {
         };
         assert!(job_gate(&config, &declarative).is_none());
         config.cron.get_mut(&job.id).unwrap().gate = Some("fleet-gate zc-heavy".into());
-        assert_eq!(job_gate(&config, &declarative), Some(("fleet-gate zc-heavy", 0)));
+        assert_eq!(
+            job_gate(&config, &declarative),
+            Some(("fleet-gate zc-heavy", 0))
+        );
         assert!(job_gate(&config, &job).is_none());
     }
 
