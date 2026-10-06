@@ -15,7 +15,7 @@ pub use schedule::{
 };
 #[allow(unused_imports)]
 pub use store::{
-    add_agent_job, all_overdue_jobs, claim_job, clear_stale_locks, due_jobs, get_job,
+    add_agent_job, all_overdue_jobs, claim_job, clear_stale_locks, defer_job, due_jobs, get_job,
     get_job_for_agent, list_jobs, list_jobs_by_agent, list_runs, record_last_run,
     record_last_run_with_status, record_run, release_job, remove_job, remove_job_for_agent,
     remove_jobs_by_agent, rename_jobs_by_agent, reschedule_after_run,

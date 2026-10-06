@@ -4,7 +4,7 @@ use crate::cron::store::{
 };
 use crate::cron::{
     CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs, claim_job,
-    clear_stale_locks, due_jobs, next_run_for_schedule, release_job, skip_missed_run,
+    clear_stale_locks, defer_job, due_jobs, next_run_for_schedule, release_job, skip_missed_run,
     sync_declarative_jobs,
 };
 use crate::security::SecurityPolicy;
@@ -22,6 +22,10 @@ use zeroclaw_log::Instrument;
 
 const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
+/// Upper bound on one gate command.
+const GATE_TIMEOUT_SECS: u64 = 30;
+/// Delay between gate checks while a run is held.
+const GATE_RETRY_SECS: i64 = 120;
 const SCHEDULER_COMPONENT: &str = "scheduler";
 const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
     "cron_add",
@@ -405,6 +409,8 @@ pub async fn run(
             session_target: None,
             delivery: None,
             shell_output_format: CronShellOutputFormat::default(),
+            gate: None,
+            gate_wait_minutes: 0,
         };
         ::zeroclaw_log::record!(
             DEBUG,
@@ -820,19 +826,31 @@ async fn process_due_jobs(
         let config = config.clone();
         let component = component.to_owned();
         Some(async move {
-            Box::pin(execute_and_persist_job(
-                &config,
-                security.as_ref(),
-                &agent_alias,
-                &job,
-                &component,
-            ))
-            .await
+            match gate_decision(&config, &job, Utc::now()).await {
+                GateDecision::Run => Some(
+                    Box::pin(execute_and_persist_job(
+                        &config,
+                        security.as_ref(),
+                        &agent_alias,
+                        &job,
+                        &component,
+                    ))
+                    .await,
+                ),
+                GateDecision::Retry(at, reason) => {
+                    hold_gated_job(&config, &job, at, &reason);
+                    None
+                }
+                GateDecision::Skip(reason) => Some(skip_gated_job(&config, &job, &agent_alias, &reason)),
+            }
         })
     }))
     .buffer_unordered(max_concurrent);
 
     while let Some(report) = in_flight.next().await {
+        let Some(report) = report else {
+            continue;
+        };
         if !report.success {
             ::zeroclaw_log::record!(
                 WARN,
@@ -862,6 +880,160 @@ async fn process_due_jobs(
                 .into_value(),
             );
         }
+    }
+}
+
+/// What a declarative job's gate decided for a due run.
+#[derive(Debug, PartialEq)]
+enum GateDecision {
+    Run,
+    Retry(DateTime<Utc>, String),
+    Skip(String),
+}
+
+/// The gate command and wait window of a declarative job.
+fn job_gate<'a>(config: &'a Config, job: &CronJob) -> Option<(&'a str, u32)> {
+    if job.source != "declarative" {
+        return None;
+    }
+    let decl = config.cron.get(&job.id)?;
+    let gate = decl.gate.as_deref().map(str::trim).filter(|g| !g.is_empty())?;
+    Some((gate, decl.gate_wait_minutes))
+}
+
+/// Runs a gate command; `Err` carries the reason the run is held.
+async fn check_gate(config: &Config, gate: &str) -> std::result::Result<(), String> {
+    let runtime = crate::platform::create_runtime(&config.runtime)
+        .map_err(|e| format!("gate setup error: {e}"))?;
+    let mut command = runtime
+        .build_shell_command(gate, &config.data_dir)
+        .map_err(|e| format!("gate setup error: {e}"))?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let child = command.spawn().map_err(|e| format!("gate spawn error: {e}"))?;
+    match time::timeout(Duration::from_secs(GATE_TIMEOUT_SECS), child.wait_with_output()).await {
+        Ok(Ok(output)) if output.status.success() => Ok(()),
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let reason = stdout
+                .lines()
+                .chain(stderr.lines())
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or("no reason given")
+                .to_string();
+            Err(format!("gate held the run ({}): {reason}", output.status))
+        }
+        Ok(Err(e)) => Err(format!("gate error: {e}")),
+        Err(_) => Err(format!("gate timed out after {GATE_TIMEOUT_SECS}s")),
+    }
+}
+
+/// Next gate check for a held cron run, or `None` once no occurrence lies within the wait window.
+fn gate_retry_at(schedule: &Schedule, wait_minutes: u32, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    if wait_minutes == 0 || !matches!(schedule, Schedule::Cron { .. }) {
+        return None;
+    }
+    let window = chrono::Duration::minutes(i64::from(wait_minutes));
+    let latest_due = next_run_for_schedule(schedule, now - window).ok()?;
+    (latest_due <= now).then(|| now + chrono::Duration::seconds(GATE_RETRY_SECS))
+}
+
+async fn gate_decision(config: &Config, job: &CronJob, now: DateTime<Utc>) -> GateDecision {
+    let Some((gate, wait_minutes)) = job_gate(config, job) else {
+        return GateDecision::Run;
+    };
+    let reason = match check_gate(config, gate).await {
+        Ok(()) => return GateDecision::Run,
+        Err(reason) => reason,
+    };
+    match gate_retry_at(&job.schedule, wait_minutes, now) {
+        Some(at) => GateDecision::Retry(at, reason),
+        None => GateDecision::Skip(reason),
+    }
+}
+
+/// Moves a held run's next check to `at` and releases its lock.
+fn hold_gated_job(config: &Config, job: &CronJob, at: DateTime<Utc>, reason: &str) {
+    if let Err(e) = defer_job(config, &job.id, at) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
+            "Cron job: failed to defer a run its gate held"
+        );
+    }
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({"job_id": job.id, "retry_at": at.to_rfc3339(), "reason": reason})
+        ),
+        "Cron job held by its gate"
+    );
+    if let Err(e) = release_job(config, &job.id) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
+            "Cron job: failed to release in-flight lock after a gate hold"
+        );
+    }
+}
+
+/// Records a run its gate held past the wait window as `skipped`, with no delivery.
+fn skip_gated_job(config: &Config, job: &CronJob, agent_alias: &str, reason: &str) -> ScheduledRunReport {
+    let now = Utc::now();
+    let output = format!("skipped: {reason}");
+    let action = if matches!(job.schedule, Schedule::At { .. }) {
+        RunCompletionAction::Disable
+    } else {
+        RunCompletionAction::Reschedule
+    };
+    let run_id = match persist_run_result(config, job, now, now, now, "skipped", Some(&output), 0, action) {
+        Ok(id) => Some(id),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
+                "Cron job: failed to record a gate skip"
+            );
+            let _ = persist_run_completion_state(config, job, now, "skipped", Some(&output), action);
+            None
+        }
+    };
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_attrs(::serde_json::json!({"job_id": job.id, "reason": reason})),
+        "Cron job skipped by its gate"
+    );
+    if let Err(e) = release_job(config, &job.id) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
+            "Cron job: failed to release in-flight lock after a gate skip"
+        );
+    }
+    ScheduledRunReport {
+        job_id: job.id.clone(),
+        name: job.name.clone(),
+        agent_alias: agent_alias.to_string(),
+        run_id,
+        success: true,
+        status: "skipped".to_string(),
+        output,
+        duration_ms: 0,
+        finished_at: now,
     }
 }
 
@@ -3947,6 +4119,119 @@ mod tests {
             cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
             "a skipped orphan job's in-flight lock must be released, not leaked"
         );
+    }
+
+    /// A real job row viewed as a declarative job with `gate` and `gate_wait_minutes`.
+    async fn gated_job(tmp: &TempDir, gate: &str, wait_minutes: u32) -> (Config, CronJob) {
+        let mut config = test_config(tmp).await;
+        let job = cron::add_job(&config, TEST_AGENT, "* * * * *", "echo gated-run").unwrap();
+        config.cron.insert(
+            job.id.clone(),
+            CronJobDecl {
+                gate: Some(gate.to_string()),
+                gate_wait_minutes: wait_minutes,
+                ..CronJobDecl::default()
+            },
+        );
+        assert!(cron::claim_job(&config, &job.id, Utc::now()).unwrap());
+        let job = CronJob {
+            source: "declarative".into(),
+            ..job
+        };
+        (config, job)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn a_closed_gate_with_no_wait_skips_the_run() {
+        let tmp = TempDir::new().unwrap();
+        let (config, job) = gated_job(&tmp, "echo fleet busy; exit 1", 0).await;
+
+        process_due_jobs(&config, vec![job.clone()], &unique_component("gate-skip"), &None).await;
+
+        let runs = cron::list_runs(&config, &job.id, 5).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "skipped");
+        let output = runs[0].output.clone().unwrap_or_default();
+        assert!(output.contains("fleet busy") && !output.contains("gated-run"), "{output}");
+        assert!(cron::get_job(&config, &job.id).unwrap().next_run > Utc::now());
+        assert!(cron::claim_job(&config, &job.id, Utc::now()).unwrap());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn a_closed_gate_inside_its_wait_window_retries_without_a_run() {
+        let tmp = TempDir::new().unwrap();
+        let (config, job) = gated_job(&tmp, "echo fleet busy >&2; exit 1", 30).await;
+
+        process_due_jobs(&config, vec![job.clone()], &unique_component("gate-hold"), &None).await;
+
+        assert!(cron::list_runs(&config, &job.id, 5).unwrap().is_empty());
+        let next_run = cron::get_job(&config, &job.id).unwrap().next_run;
+        let now = Utc::now();
+        assert!(next_run > now + ChronoDuration::seconds(GATE_RETRY_SECS - 10) && next_run <= now + ChronoDuration::seconds(GATE_RETRY_SECS));
+        assert!(cron::claim_job(&config, &job.id, Utc::now()).unwrap());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn an_open_gate_runs_the_job() {
+        let tmp = TempDir::new().unwrap();
+        let (config, job) = gated_job(&tmp, "true", 30).await;
+
+        process_due_jobs(&config, vec![job.clone()], &unique_component("gate-open"), &None).await;
+
+        let runs = cron::list_runs(&config, &job.id, 5).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "ok");
+        assert!(runs[0].output.clone().unwrap_or_default().contains("gated-run"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn the_gate_reason_falls_back_to_stderr() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let held = check_gate(&config, "echo no node free >&2; exit 3").await.unwrap_err();
+        assert!(held.contains("no node free"), "{held}");
+        assert!(check_gate(&config, "true").await.is_ok());
+    }
+
+    #[test]
+    fn a_held_run_retries_only_inside_its_wait_window() {
+        use chrono::TimeZone;
+        let hourly = crate::cron::Schedule::Cron {
+            expr: "0 * * * *".into(),
+            tz: Some("UTC".into()),
+        };
+        let at = |h, m| Utc.with_ymd_and_hms(2026, 10, 6, h, m, 0).unwrap();
+        assert_eq!(gate_retry_at(&hourly, 40, at(10, 5)), Some(at(10, 7)));
+        assert_eq!(gate_retry_at(&hourly, 40, at(10, 40)), None);
+        assert_eq!(gate_retry_at(&hourly, 0, at(10, 5)), None);
+        let every = crate::cron::Schedule::Every { every_ms: 60_000 };
+        assert_eq!(gate_retry_at(&every, 40, at(10, 5)), None);
+    }
+
+    #[test]
+    fn only_declarative_jobs_with_a_gate_are_gated() {
+        let mut config = Config::default();
+        let job = test_job("echo x");
+        config.cron.insert(
+            job.id.clone(),
+            CronJobDecl {
+                gate: Some("  ".into()),
+                ..CronJobDecl::default()
+            },
+        );
+        assert!(job_gate(&config, &job).is_none());
+        let declarative = CronJob {
+            source: "declarative".into(),
+            ..job.clone()
+        };
+        assert!(job_gate(&config, &declarative).is_none());
+        config.cron.get_mut(&job.id).unwrap().gate = Some("fleet-gate zc-heavy".into());
+        assert_eq!(job_gate(&config, &declarative), Some(("fleet-gate zc-heavy", 0)));
+        assert!(job_gate(&config, &job).is_none());
     }
 
     #[tokio::test]
