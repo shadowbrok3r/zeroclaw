@@ -13784,6 +13784,12 @@ pub struct CronJobDecl {
     ///   timeout — return a plain error string in either format.
     #[serde(default)]
     pub shell_output_format: CronShellOutputFormat,
+    /// Shell command run before each scheduled run; a non-zero exit holds the run.
+    #[serde(default)]
+    pub gate: Option<String>,
+    /// Minutes a held run re-checks its gate before it is skipped; 0 skips at once.
+    #[serde(default)]
+    pub gate_wait_minutes: u32,
 }
 
 impl Default for CronJobDecl {
@@ -13801,6 +13807,8 @@ impl Default for CronJobDecl {
             session_target: None,
             delivery: None,
             shell_output_format: CronShellOutputFormat::default(),
+            gate: None,
+            gate_wait_minutes: 0,
         }
     }
 }

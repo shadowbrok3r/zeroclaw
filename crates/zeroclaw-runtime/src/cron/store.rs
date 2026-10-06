@@ -833,6 +833,18 @@ pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
     })
 }
 
+/// Moves a job's next run without recording a run.
+pub fn defer_job(config: &Config, job_id: &str, next_run: DateTime<Utc>) -> Result<()> {
+    with_initialized_connection(config, |conn| {
+        conn.execute(
+            "UPDATE cron_jobs SET next_run = ?1 WHERE id = ?2",
+            params![next_run.to_rfc3339(), job_id],
+        )
+        .context("Failed to defer cron job")?;
+        Ok(())
+    })
+}
+
 pub fn clear_stale_locks(config: &Config) -> Result<usize> {
     let cleared = with_read_connection(config, |conn| {
         conn.execute(
@@ -2884,6 +2896,8 @@ mod tests {
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            gate: None,
+            gate_wait_minutes: 0,
         };
         config.cron.insert("raw-shadow".to_string(), decl);
 
@@ -3016,6 +3030,8 @@ mod tests {
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            gate: None,
+            gate_wait_minutes: 0,
         };
         config.cron.insert("blob-shadow".to_string(), decl);
 
@@ -3223,6 +3239,8 @@ mod tests {
                 session_target: None,
                 delivery: None,
                 shell_output_format: Default::default(),
+                gate: None,
+                gate_wait_minutes: 0,
             },
         )
     }
@@ -3250,6 +3268,8 @@ mod tests {
                 session_target: None,
                 delivery: None,
                 shell_output_format: Default::default(),
+                gate: None,
+                gate_wait_minutes: 0,
             },
         )
     }
@@ -3531,6 +3551,8 @@ mod tests {
             session_target: None,
             delivery: None,
             shell_output_format: Default::default(),
+            gate: None,
+            gate_wait_minutes: 0,
         };
 
         let mut decls = std::collections::HashMap::new();
@@ -3876,6 +3898,8 @@ schedule = { kind = "every", every_ms = 300000 }
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            gate: None,
+            gate_wait_minutes: 0,
         };
         let decls = decls_map(vec![("raw-decl".to_string(), decl.clone())]);
         // Populate config.cron so resolution finds the canonical source.
@@ -3930,6 +3954,8 @@ schedule = { kind = "every", every_ms = 300000 }
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            gate: None,
+            gate_wait_minutes: 0,
         };
         let decls = decls_map(vec![("raw-decl".to_string(), decl.clone())]);
         config.cron.insert("raw-decl".to_string(), decl.clone());
@@ -4058,6 +4084,8 @@ schedule = { kind = "every", every_ms = 300000 }
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+            gate: None,
+            gate_wait_minutes: 0,
         };
         let decls = decls_map(vec![("decl-job".to_string(), decl.clone())]);
         config.cron.insert("decl-job".to_string(), decl);
@@ -4106,6 +4134,8 @@ schedule = { kind = "every", every_ms = 300000 }
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+            gate: None,
+            gate_wait_minutes: 0,
         };
         let decls = decls_map(vec![("decl-job".to_string(), decl.clone())]);
         config.cron.insert("decl-job".to_string(), decl);
@@ -4214,6 +4244,8 @@ schedule = { kind = "every", every_ms = 300000 }
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+            gate: None,
+            gate_wait_minutes: 0,
         };
         let decls = decls_map(vec![("orphan-decl".to_string(), decl.clone())]);
         config.cron.insert("orphan-decl".to_string(), decl.clone());

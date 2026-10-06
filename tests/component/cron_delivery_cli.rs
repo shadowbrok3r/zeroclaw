@@ -359,6 +359,8 @@ fn seed_declarative_job(config_dir: &Path) {
             best_effort: true,
         }),
         shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+        gate: None,
+        gate_wait_minutes: 0,
     };
 
     let mut decls = std::collections::HashMap::new();

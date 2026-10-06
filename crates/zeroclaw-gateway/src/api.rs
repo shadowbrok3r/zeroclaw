@@ -6749,6 +6749,8 @@ pub(crate) mod tests {
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+            gate: None,
+            gate_wait_minutes: 0,
         };
         let mut decls = std::collections::HashMap::new();
         decls.insert("decl-job".to_string(), decl.clone());
