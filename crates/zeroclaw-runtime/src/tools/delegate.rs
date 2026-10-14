@@ -2773,6 +2773,11 @@ impl DelegateTool {
             })
         });
 
+        let sub_hooks = self
+            .root_config
+            .as_deref()
+            .and_then(|c| crate::hooks::HookRunner::agent_scoped(&c.hooks, agent_name));
+
         // Build enriched system prompt with tools, skills, workspace, datetime context.
         // Independent delegation builds it from the TARGET's workspace (`sub_workspace`), so
         // the skill prompt content matches the target's skill tools; bounded delegation
@@ -2851,7 +2856,9 @@ impl DelegateTool {
                         // exactly as the parent turn does. `None` only on the
                         // configless test builder (`root_config` unset).
                         config: self.root_config.as_deref(),
-                        hooks: None,
+                        // Agent-scoped hooks only (the critic): a delegated sub-agent runs
+                        // no global hooks, but a critic watching that agent still sees it.
+                        hooks: sub_hooks.as_ref(),
                         // Thread the target's deferred-MCP activated set so `tool_search`
                         // can activate the target's deferred tools mid-turn (Some only for
                         // an independent target with granted deferred-MCP bundles).

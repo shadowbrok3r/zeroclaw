@@ -63,10 +63,26 @@ impl HookRunner {
         agent: &str,
     ) -> Self {
         let mut runner = Self::from_config(hooks);
+        runner.register_agent_scoped(hooks, agent);
+        runner
+    }
+
+    /// Only the hooks scoped to `agent` (the critic), or None when there are none. For
+    /// paths that run no global hooks, such as delegated sub-agent loops.
+    pub fn agent_scoped(hooks: &zeroclaw_config::schema::HooksConfig, agent: &str) -> Option<Self> {
+        if !hooks.enabled {
+            return None;
+        }
+        let mut runner = Self::new();
+        runner.register_agent_scoped(hooks, agent);
+        (!runner.is_empty()).then_some(runner)
+    }
+
+    fn register_agent_scoped(&mut self, hooks: &zeroclaw_config::schema::HooksConfig, agent: &str) {
         let critic = &hooks.builtin.critic;
         if super::builtin::CriticHook::applies(critic, agent) {
             match super::builtin::CriticHook::new(critic, agent) {
-                Ok(hook) => runner.register(Box::new(hook)),
+                Ok(hook) => self.register(Box::new(hook)),
                 Err(error) => {
                     ::zeroclaw_log::record!(
                         ERROR,
@@ -78,7 +94,6 @@ impl HookRunner {
                 }
             }
         }
-        runner
     }
 
     /// Register a handler and re-sort by descending priority.
@@ -968,6 +983,8 @@ mod tests {
         assert_eq!(names("reverse"), vec!["critic".to_string()]);
         assert!(names("coder").is_empty());
         assert!(HookRunner::from_config(&config).handlers.is_empty());
+        assert!(HookRunner::agent_scoped(&config, "reverse").is_some());
+        assert!(HookRunner::agent_scoped(&config, "coder").is_none());
     }
 
     #[test]
