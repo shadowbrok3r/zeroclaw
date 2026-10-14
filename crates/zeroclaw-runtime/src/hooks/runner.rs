@@ -57,6 +57,30 @@ impl HookRunner {
         runner
     }
 
+    /// [`Self::from_config`] plus the hooks scoped to one agent (the critic).
+    pub fn from_config_for_agent(
+        hooks: &zeroclaw_config::schema::HooksConfig,
+        agent: &str,
+    ) -> Self {
+        let mut runner = Self::from_config(hooks);
+        let critic = &hooks.builtin.critic;
+        if super::builtin::CriticHook::applies(critic, agent) {
+            match super::builtin::CriticHook::new(critic, agent) {
+                Ok(hook) => runner.register(Box::new(hook)),
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"hook": "critic", "error": error})),
+                        "critic hook configuration is invalid; hook disabled"
+                    );
+                }
+            }
+        }
+        runner
+    }
+
     /// Register a handler and re-sort by descending priority.
     pub fn register(&mut self, handler: Box<dyn HookHandler>) {
         self.handlers.push(handler);
@@ -911,6 +935,7 @@ mod tests {
             builtin: zeroclaw_config::schema::BuiltinHooksConfig {
                 command_logger: false,
                 webhook_audit: zeroclaw_config::schema::WebhookAuditConfig::default(),
+                ..Default::default()
             },
         };
         let runner = HookRunner::from_config(&config);
@@ -921,12 +946,38 @@ mod tests {
     }
 
     #[test]
+    fn critic_registers_only_for_listed_agents() {
+        let config = zeroclaw_config::schema::HooksConfig {
+            enabled: true,
+            builtin: zeroclaw_config::schema::BuiltinHooksConfig {
+                critic: zeroclaw_config::schema::CriticHookConfig {
+                    enabled: true,
+                    agents: vec!["reverse".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+        let names = |agent: &str| -> Vec<String> {
+            HookRunner::from_config_for_agent(&config, agent)
+                .handlers
+                .iter()
+                .map(|h| h.name().to_string())
+                .collect()
+        };
+        assert_eq!(names("reverse"), vec!["critic".to_string()]);
+        assert!(names("coder").is_empty());
+        assert!(HookRunner::from_config(&config).handlers.is_empty());
+    }
+
+    #[test]
     fn from_config_registers_command_logger_when_enabled() {
         let config = zeroclaw_config::schema::HooksConfig {
             enabled: true,
             builtin: zeroclaw_config::schema::BuiltinHooksConfig {
                 command_logger: true,
                 webhook_audit: zeroclaw_config::schema::WebhookAuditConfig::default(),
+                ..Default::default()
             },
         };
         let runner = HookRunner::from_config(&config);
@@ -948,6 +999,7 @@ mod tests {
                     url: "http://example.com/audit".to_string(),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         };
 

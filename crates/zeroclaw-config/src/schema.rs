@@ -12729,6 +12729,54 @@ pub struct BuiltinHooksConfig {
     #[serde(default)]
     #[nested]
     pub webhook_audit: WebhookAuditConfig,
+    /// Configuration for the critic hook.
+    #[serde(default)]
+    #[nested]
+    pub critic: CriticHookConfig,
+}
+
+/// Configuration for the critic builtin hook.
+///
+/// Before each model call of a listed agent, POSTs the turn's non-system
+/// messages to an external critic service (`{agent, messages}`). When the
+/// reply carries a `note`, it is appended to that one request as a user
+/// message; history is not changed. Any failure or timeout leaves the call
+/// untouched.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "hooks.builtin.critic"]
+pub struct CriticHookConfig {
+    /// Enable the critic hook. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Critic endpoint. Default: `http://127.0.0.1:8797/review`.
+    #[serde(default = "default_critic_url")]
+    pub url: String,
+    /// Agent aliases whose turns are reviewed. Empty means none.
+    #[serde(default)]
+    pub agents: Vec<String>,
+    /// Longest wait for a review before the call proceeds without one. Default: `20`.
+    #[serde(default = "default_critic_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_critic_url() -> String {
+    "http://127.0.0.1:8797/review".into()
+}
+
+fn default_critic_timeout_secs() -> u64 {
+    20
+}
+
+impl Default for CriticHookConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: default_critic_url(),
+            agents: Vec::new(),
+            timeout_secs: default_critic_timeout_secs(),
+        }
+    }
 }
 
 /// Configuration for the webhook-audit builtin hook.

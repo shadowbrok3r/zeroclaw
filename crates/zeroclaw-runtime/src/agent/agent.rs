@@ -1874,8 +1874,9 @@ impl Agent {
             .mcp_deferred_section(Some(deferred_section))
             .mcp_pinned_section(Some(pinned_section))
             .hook_runner(if config.hooks.enabled {
-                Some(Arc::new(crate::hooks::HookRunner::from_config(
+                Some(Arc::new(crate::hooks::HookRunner::from_config_for_agent(
                     &config.hooks,
+                    agent_alias,
                 )))
             } else {
                 None
