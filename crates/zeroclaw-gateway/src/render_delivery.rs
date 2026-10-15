@@ -14,12 +14,21 @@
 //! With no render this turn the model is still not trusted blindly: a marker
 //! whose path is not an existing regular file is dropped (it could never have
 //! been served), one that is stays.
+//!
+//! Which renders: when the reply names renders of this turn (by label, file
+//! name or path, with or without the `cg_` prefix) only those are delivered.
+//! Otherwise the newest [`MAX_FORCED`] are, with a line saying how many more
+//! the turn made. A turn that re-rolled one frame thirty times used to attach
+//! all thirty-six images (2026-10-15).
 
 use zeroclaw_providers::ConversationMessage;
 
 use crate::session_jobs;
 
 const IMAGE_OPEN: &str = "[IMAGE:";
+
+/// Renders attached when the reply names none of this turn's renders.
+pub(crate) const MAX_FORCED: usize = 4;
 
 /// What the rewrite did, for the log line and the tests.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -45,6 +54,119 @@ fn is_marker_payload(payload: &str) -> bool {
         || [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"]
             .iter()
             .any(|ext| lower.ends_with(ext))
+        || is_bare_label(payload)
+}
+
+/// A render label the model wrote without a path or extension
+/// (`cg_beach_frame1ac`): identifier characters only, and a `_`, `-` or digit,
+/// so a lone prose word (`[IMAGE:path]`) is not mistaken for one.
+fn is_bare_label(payload: &str) -> bool {
+    payload.len() >= 3
+        && payload
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        && payload
+            .chars()
+            .any(|c| c == '_' || c == '-' || c.is_ascii_digit())
+}
+
+/// A render reference reduced for matching: file name only, lowercase, no image
+/// extension, no `cg_` / `cg-` prefix.
+fn norm_ref(s: &str) -> String {
+    let base = s
+        .rsplit('/')
+        .next()
+        .unwrap_or(s)
+        .trim()
+        .to_ascii_lowercase();
+    let base = [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"]
+        .iter()
+        .find_map(|ext| base.strip_suffix(ext))
+        .unwrap_or(&base)
+        .to_string();
+    base.strip_prefix("cg_")
+        .or_else(|| base.strip_prefix("cg-"))
+        .map(str::to_string)
+        .unwrap_or(base)
+}
+
+/// One render of the turn: its `--out` label and the file to deliver.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Render {
+    pub label: String,
+    pub path: String,
+}
+
+/// The renders to attach, newest first as given, and how many were left out.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Selection {
+    pub paths: Vec<String>,
+    pub omitted: usize,
+}
+
+/// Does the model's marker payload name exactly this render (path, label or file name)?
+fn names_exactly(payload: &str, render: &Render) -> bool {
+    if payload == render.path {
+        return true;
+    }
+    let want = norm_ref(payload);
+    !want.is_empty() && (want == norm_ref(&render.label) || want == norm_ref(&render.path))
+}
+
+/// Does the payload name this render by its gallery file name,
+/// `cg_<label>_<backend>_<epoch>_00001_`?
+fn names_by_gallery_name(payload: &str, render: &Render) -> bool {
+    let label = norm_ref(&render.label);
+    !label.is_empty() && norm_ref(payload).starts_with(&format!("{label}_"))
+}
+
+/// Pick what to attach: the renders the reply names, in the reply's order;
+/// otherwise the newest [`MAX_FORCED`].
+pub(crate) fn select(renders: &[Render], model_payloads: &[&str]) -> Selection {
+    let mut named: Vec<String> = Vec::new();
+    for payload in model_payloads {
+        let exact: Vec<&Render> = renders
+            .iter()
+            .filter(|r| names_exactly(payload, r))
+            .collect();
+        let hits = if exact.is_empty() {
+            renders
+                .iter()
+                .filter(|r| names_by_gallery_name(payload, r))
+                .collect()
+        } else {
+            exact
+        };
+        for render in hits {
+            if !named.contains(&render.path) {
+                named.push(render.path.clone());
+            }
+        }
+    }
+    if !named.is_empty() {
+        return Selection {
+            paths: named,
+            omitted: 0,
+        };
+    }
+    let mut unique: Vec<String> = Vec::new();
+    for render in renders {
+        if !unique.contains(&render.path) {
+            unique.push(render.path.clone());
+        }
+    }
+    let omitted = unique.len().saturating_sub(MAX_FORCED);
+    unique.truncate(MAX_FORCED);
+    Selection {
+        paths: unique,
+        omitted,
+    }
+}
+
+/// The line that says how many renders were not attached.
+fn omitted_line(omitted: usize) -> String {
+    let noun = if omitted == 1 { "render" } else { "renders" };
+    format!("(+{omitted} more {noun} from this turn not attached)")
 }
 
 /// Case-insensitive `[IMAGE:payload]` spans: `(start, end_exclusive, payload)`.
@@ -186,11 +308,14 @@ pub(crate) async fn reconcile(
         return;
     }
     let since = turn_started_unix.saturating_sub(1);
-    let authoritative: Vec<String> = match session_jobs::deliverables(session_key, since).await {
+    let renders: Vec<Render> = match session_jobs::deliverables(session_key, since).await {
         Ok(list) => list
             .into_iter()
             .filter(|d| d.kind == "image")
-            .map(|d| d.path)
+            .map(|d| Render {
+                label: d.label,
+                path: d.path,
+            })
             .collect(),
         Err(message) => {
             ::zeroclaw_log::record!(
@@ -208,7 +333,20 @@ pub(crate) async fn reconcile(
         }
     };
 
-    let result = rewrite(response, &authoritative);
+    let payloads: Vec<&str> = image_markers(response)
+        .into_iter()
+        .map(|(_, _, p)| p)
+        .collect();
+    let selection = select(&renders, &payloads);
+    let authoritative = selection.paths.clone();
+    let mut result = rewrite(response, &authoritative);
+    if selection.omitted > 0 {
+        result.text = format!(
+            "{}\n\n{}",
+            result.text.trim_end(),
+            omitted_line(selection.omitted)
+        );
+    }
     let unchanged = result.added.is_empty() && result.dropped.is_empty();
     if !unchanged {
         *response = result.text.clone();
@@ -225,7 +363,16 @@ pub(crate) async fn reconcile(
         if chat.role != "assistant" {
             continue;
         }
-        let r = rewrite_with(&chat.content, &authoritative, Some(index) == last_assistant);
+        let is_last = Some(index) == last_assistant;
+        let mut r = rewrite_with(&chat.content, &authoritative, is_last);
+        if is_last && selection.omitted > 0 {
+            // `added` is non-empty here (the newest renders were prepended), so the row is rewritten.
+            r.text = format!(
+                "{}\n\n{}",
+                r.text.trim_end(),
+                omitted_line(selection.omitted)
+            );
+        }
         if !(r.added.is_empty() && r.dropped.is_empty()) {
             chat.content = r.text;
         }
@@ -240,6 +387,7 @@ pub(crate) async fn reconcile(
                 "session_key": session_key,
                 "since": since,
                 "added": result.added,
+                "omitted": selection.omitted,
                 "kept": result.kept,
                 "dropped": result.dropped,
             })
@@ -353,6 +501,94 @@ mod tests {
         // A bare file name or a relative path is still a (bad) reference, not prose.
         let r = rewrite("[IMAGE:cg_x.png] and [image:renders/cg_y.jpeg]", &[]);
         assert_eq!(r.dropped, vec!["cg_x.png", "renders/cg_y.jpeg"]);
+    }
+
+    fn render(label: &str, path: &str) -> Render {
+        Render {
+            label: label.into(),
+            path: path.into(),
+        }
+    }
+
+    #[test]
+    fn the_render_the_reply_names_by_label_is_the_only_one_attached() {
+        // 2026-10-15: 33 re-rolls and edits; the reply named only the final edit.
+        let mut renders: Vec<Render> = (0..33)
+            .map(|i| render(&format!("beach_frame1{i}"), &format!("/r/cg-{i}-0.png")))
+            .collect();
+        renders.insert(
+            0,
+            render("beach_missionary_pov_frame1ac", "/r/cg-final-0.png"),
+        );
+        let s = select(&renders, &["cg_beach_missionary_pov_frame1ac"]);
+        assert_eq!(
+            s,
+            Selection {
+                paths: vec!["/r/cg-final-0.png".into()],
+                omitted: 0
+            }
+        );
+        // By gallery file name or delivered path, too.
+        let s = select(
+            &renders,
+            &["/g/cg_beach_missionary_pov_frame1ac_nvidia_1792_00001_.png"],
+        );
+        assert_eq!(s.paths, vec!["/r/cg-final-0.png".to_string()]);
+        let s = select(&renders, &["/r/cg-final-0.png"]);
+        assert_eq!(s.paths, vec!["/r/cg-final-0.png".to_string()]);
+    }
+
+    #[test]
+    fn an_exact_label_wins_over_a_longer_label_that_shares_its_prefix() {
+        let renders = [render("frame1_b", "/r/b.png"), render("frame1", "/r/a.png")];
+        assert_eq!(
+            select(&renders, &["cg_frame1"]).paths,
+            vec!["/r/a.png".to_string()]
+        );
+    }
+
+    #[test]
+    fn with_no_named_render_only_the_newest_four_are_attached_and_the_rest_counted() {
+        let renders: Vec<Render> = (0..36)
+            .map(|i| render(&format!("l{i}"), &format!("/r/{i}.png")))
+            .collect();
+        let s = select(&renders, &[]);
+        assert_eq!(
+            s.paths,
+            vec!["/r/0.png", "/r/1.png", "/r/2.png", "/r/3.png"]
+        );
+        assert_eq!(s.omitted, 32);
+        assert_eq!(
+            omitted_line(32),
+            "(+32 more renders from this turn not attached)"
+        );
+        // A marker naming nothing of this turn changes nothing about the fallback.
+        assert_eq!(select(&renders, &["cg_something_else"]).omitted, 32);
+        // Few renders: all of them, nothing omitted.
+        let two = [render("a1", "/r/a.png"), render("b1", "/r/b.png")];
+        assert_eq!(
+            select(&two, &[]),
+            Selection {
+                paths: vec!["/r/a.png".into(), "/r/b.png".into()],
+                omitted: 0
+            }
+        );
+    }
+
+    #[test]
+    fn a_bare_label_is_a_marker_but_a_lone_prose_word_is_not() {
+        assert!(is_marker_payload("cg_beach_missionary_pov_frame1ac"));
+        assert!(!is_marker_payload("path"));
+        assert!(!is_marker_payload("<path>"));
+        assert!(!is_marker_payload("…"));
+        // The label marker the model wrote is replaced by the delivered file.
+        let tmp = tempfile::tempdir().unwrap();
+        let real = temp_png(tmp.path(), "cg-final-0.png");
+        let r = rewrite(
+            "[IMAGE:cg_beach_frame1ac]\n\nThat's frame 1.",
+            std::slice::from_ref(&real),
+        );
+        assert_eq!(r.text, format!("[IMAGE:{real}]\n\nThat's frame 1."));
     }
 
     #[test]
