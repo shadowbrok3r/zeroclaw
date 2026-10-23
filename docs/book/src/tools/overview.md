@@ -11,11 +11,126 @@ observer event, and history entry, see
 
 Before adding a built-in tool or replacing one with an external integration,
 use the [Built-In Tool Inventory](../developing/tool-inventory.md)
-to choose the smallest durable home.
+to choose the smallest durable home. Working built-in integrations stay
+available until a replacement is real, documented, and independently reviewed;
+that replacement-first rule is the accepted
+[RFC #6165](https://github.com/zeroclaw-labs/zeroclaw/issues/6165) policy,
+recorded in the inventory's
+[Replacement-First Policy](../developing/tool-inventory.md#replacement-first-policy)
+section.
+
+## Minimal and full tools
+
+Configurations use **full** unless they select minimal: every built-in carried
+by this binary and allowed by its existing configuration, prerequisites and
+permission rules. Setup and config generation write `optional = ["*"]`. A file
+without `[tools]`, or a `[tools]` section without `optional`, also loads full,
+so upgrading to v0.8.6 keeps existing tool availability. Existing explicit
+selections are preserved.
+
+```toml
+[tools]
+optional = ["*"] # full; the default
+```
+
+**Minimal** is opt-in: eleven built-ins in Chat, or eight in Code/ACP, which
+retains its exclusion of persistent-memory tools. Chat's eleven are `shell`,
+`file_read`, `file_write`, `file_edit`, `glob_search`, `content_search`,
+`memory_recall`, `memory_store`, `memory_forget`, `web_fetch`, and
+`git_operations`. Existing policy can narrow either catalog.
+
+```toml
+[tools]
+optional = [] # minimal
+```
+
+For minimal plus selected extras, use their callable names:
+
+```toml
+[tools]
+optional = ["calculator", "cron_list", "sessions_history"]
+```
+
+The wildcard is a union with named entries: `["*", "calculator"]` has the same
+selection as `["*"]`, with no duplicate tool. Full is not a fixed tool count;
+configured integrations, runtime capabilities and policy determine the effective
+catalog. It does not enable every integration. Selecting a tool does not install
+a browser or vendor CLI, supply credentials, enable a disabled integration or
+grant permission. Full also preserves Code/ACP's existing memory exclusion.
+
+Selection happens before constructors run. An unselected tool contributes no
+schema or tool-catalog prompt text. Risk profiles, caller narrowing, approval,
+path/network policy and receipts still apply. Explicit MCP servers, skills,
+plugins and peripherals retain their existing activation and authority paths.
+Progressive schema disclosure is a separate feature, not part of these settings.
+
+To select minimal, set `optional = []` in `[tools]`, or run:
+
+```sh
+zeroclaw config set tools.optional '[]' --no-interactive
+```
+
+Reload the daemon after changing selection. Config schema stays version 3.
+`zeroclaw config migrate` records `optional = ["*"]` for an existing file
+without `[tools]`; ordinary saves also retain selector intent.
+
+### Builds and upgrade path
+
+| Channel | Compiled capability | Runtime selection |
+| --- | --- | --- |
+| Release archive | Standard `dist` includes the native `tools-compat` adapters | Full by default; minimal and named extras work without another download |
+| Desktop sidecar | The same target-resolved `dist` CLI, plus requested desktop features | The same minimal/full settings and prerequisites |
+| Homebrew source build | Depends on the formula's feature selection; a Cargo-default build omits native adapters | Full includes only the adapters the formula carries; use the standard source build below when it omits them |
+| Docker `dist` image | Standard `dist`, including native adapters | Baked configs omit `[tools]` and load full, the default; set `optional = []` for minimal |
+
+One release matrix has ten target legs, with unchanged archive names. Android is
+experimental and allowed to fail; publication requires the other nine targets.
+There is no second compatibility archive matrix or dedicated `compat-tools`
+image. The historical `all-features` Docker image remains broader than `dist`,
+including additional channels and hardware features.
+
+`dist` includes `tools-compat` (`tools-saas`, `tools-coding-cli`, `tools-external`).
+`dist-compat` is a compatibility alias for the same build. Plain Cargo defaults
+remain smaller: custom source builds can omit adapters. A compiled-out external
+adapter named in `optional` gets a clear diagnostic; full selects only the
+adapters this binary carries and reports nothing for the rest. Enabled
+vendor/CLI sections retain their existing missing-feature diagnostic. Runtime
+configuration cannot add compiled-out code. Build the standard selection to
+recover it:
+
+```sh
+# From a source checkout; use the target you intend to run.
+TARGET=x86_64-unknown-linux-gnu
+FEATURES="$(cargo run --quiet --locked -p xtask --bin generate -- features --selection dist --target "$TARGET")"
+cargo build --release --locked --bin zeroclaw --target "$TARGET" --no-default-features --features "$FEATURES"
+# For a local Linux image, resolve features for its build target.
+docker build -t zeroclaw-dist-local .
+```
+
+For a Homebrew installation whose formula omits adapters, run the standard
+source-built binary alongside the package-managed binary and use its own
+config, data and service paths. A config setting cannot change a bottle's
+compiled features. Source users can also select individual existing `tool-*`
+features or `tools-compat`; they still need the runtime selection.
+
+Standard `dist` includes the plugin host and `plugins-wasm-cranelift` on the seven supported native
+64-bit targets: GNU and musl Linux on x86_64 and aarch64, both macOS architectures,
+and x86_64 Windows MSVC. ARMv6/ARMv7 omit Cranelift and Prometheus; experimental
+Android omits Cranelift and WhatsApp Web. Cargo defaults do not include a plugin
+host. Compiling the host leaves `plugins.enabled` and `plugins.auto_discover`
+false; consent, trust, grants and configured activation still apply. Runtime-only
+precompiled `.cwasm` support and Pulley do not replace portable registry `.wasm`
+compilation. Target policy comes from `package.metadata.zeroclaw` in `Cargo.toml`.
+
+Minimal is a runtime catalog selection. Standard `dist` still carries the
+compiled native adapters, so minimal alone is not binary-size evidence for
+[the tool extraction work](https://github.com/zeroclaw-labs/zeroclaw/issues/10998).
+Container, Kubernetes and Nix defaults omit `[tools]` and load full like any
+other configuration; set `optional = []` in them for minimal.
 
 ## Built-in tools
 
-A minimal build ships with:
+The following built-in capabilities are available when compiled and selected, which full does for all of them; the eleven-tool minimal set is listed above. This list is not the core set; see [Tiers and the retained core set](../developing/tool-inventory.md#tiers-and-the-retained-core-set) for the core set and the tier of each tool the runtime registry builds.
 
 | Tool | What it does |
 |---|---|
@@ -26,24 +141,42 @@ A minimal build ships with:
 | `glob_search` | List files matching a glob pattern within the workspace |
 | `content_search` | Search file contents by regex within the workspace (ripgrep with grep fallback) |
 | `http_request` | HTTP GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS to allowlisted domains |
-| `web_search_tool` | Web search. Provider is configurable: DuckDuckGo (default, no key), Brave, Tavily, SearXNG, Jina, or Bocha |
+| `web_search_tool` | Web search. Provider is configurable: DuckDuckGo (default, no key), Brave, Tavily, SearXNG, Jina, Bocha, AnySearch, Serply, or Keenable (no key required; optional key lifts rate limits) |
 | `web_fetch` | Fetch a page and return clean plain text |
-| `browser` | Headless-browser automation. See [Browser automation](./browser.md) |
+| `browser` | Headless-browser automation. Opt-in: requires `[browser] automation_enabled = true`. See [Browser automation](./browser.md) |
 | `memory_recall` | Search long-term memory for relevant facts, preferences, or context |
 | `memory_store` | Store a fact, preference, or note in long-term memory |
 | `ask_user` | Send a question to the active channel and wait for a reply. Supports optional `choices` for structured responses (inline keyboard on Telegram, numbered list on CLI). On ACP, `choices` are required: free-form ask awaits the ACP elicitation RFD. Parameters: `question` (required), `choices` (optional list), `timeout_secs` (default 600). |
 | `escalate_to_human` | Send a structured escalation message with urgency routing. `high` / `critical` urgency additionally notifies any channels listed in `[escalation] alert_channels`. Parameters: `summary` (required), `context` (optional), `urgency` (`low`/`medium`/`high`/`critical`, default `medium`), `wait_for_response` (bool, default false), `timeout_secs` (default 600). On ACP, `wait_for_response: true` fails immediately if the channel cannot receive free-form replies (awaits ACP elicitation RFD). |
 
-Always registered alongside the built-ins:
+### AnySearch provider
+
+AnySearch is an explicit, opt-in backend for `web_search_tool`:
+
+```toml
+[web_search]
+search_provider = "anysearch"
+# Optional; omit to use AnySearch's lower, rate-limited anonymous quota.
+anysearch_api_key = "..."
+```
+
+Search queries and the configured result limit are sent to
+`https://api.anysearch.com/v1/search`. When `anysearch_api_key` is configured,
+ZeroClaw sends it only as a Bearer authorization header; without a key, no
+`Authorization` header is sent. Selecting this provider therefore sends search
+queries to a third-party service even in anonymous mode. It does not change the
+default provider and is not used as an automatic fallback.
+
+Additional first-party built-ins, included in full but not in minimal:
 
 | Tool | Notes |
 |---|---|
 | `cron_*` | Manage scheduled jobs: `cron_add`, `cron_list`, `cron_remove`, `cron_update`, `cron_run`, `cron_runs` |
 | `schedule` | Shell-only one-shot/recurring scheduling |
-| `memory_forget`, `memory_export`, `memory_purge` | Long-term memory management |
+| `memory_export`, `memory_purge` | Long-term memory management |
 | `spawn_subagent`, `delegate` | Run a subtask in a child agent |
 
-Conditionally registered:
+Selected tools also retain these prerequisites:
 
 | Tool | Enabled by |
 |---|---|
@@ -51,6 +184,14 @@ Conditionally registered:
 | Hardware probes | `--features hardware`: GPIO reads/writes, device discovery, firmware flashing |
 | `sop_*` tools | Registered when the SOP runtime is enabled (`sop.sops_dir` set to a non-empty value; unset by default, which disables it; the documented value is `shared/sops`): run and inspect SOPs |
 | `discord_search` | Registered when a Discord alias has `archive` enabled |
+
+## Built-in schema discovery
+
+Enable `deferred_builtin_tools` on the agent's runtime profile through the ZeroCode Config editor to reduce the built-in tool catalog sent to the model. It defaults to `false`, which preserves eager schema loading. The setting is independent of MCP's `deferred_loading` option.
+
+When enabled, permitted `shell`, `file_read`, `file_write`, `file_edit`, `memory_recall`, and `memory_store` schemas remain visible. Other enabled built-ins appear in a compact discovery list. The model uses `tool_search` with keywords or `select:<tool_name>` to retrieve full definitions. Selected schemas appear in subsequent native-tool requests; text providers receive the definition in the search result.
+
+Discovery never grants permission or changes tool approval. Agent policy, principal restrictions, and caller allowlists still apply, including after a session narrows its tools. Built-in executables stay in the existing scoped registry, so memory routing does not retain a separate stale tool instance. If policy does not admit `tool_search`, remaining built-in schemas stay eager. Tool-listing endpoints still list the complete admitted registry.
 
 ## Extension protocols
 
@@ -99,10 +240,10 @@ When receipts are enabled, successful executions receive a [tool receipt](../sec
 The schema has no per-channel `tools_allow` / `tools_deny` field. Tool gating lives on the agent's risk profile (`[risk_profiles.<alias>]`):
 
 - `excluded_tools` removes the listed tools from every non-CLI channel (Discord, Telegram, Bluesky, Matrix, Slack, etc.) while leaving the local CLI untouched. The granularity is binary (CLI vs non-CLI), not per-channel. It also subtracts from MCP tools and from the agentic-delegate allow-list resolved at runtime.
-- `allowed_tools` is the inverse: an allowlist of tools the agent may call in agentic mode (empty or omitted means no authorization constraint; the TOML config does not distinguish the two). A non-empty list admits only what it names, MCP tools included under their prefixed `<server>__<tool>` name.
+- `allowed_tools` is the inverse: an allowlist of tools the agent may call in agentic mode. Omitted and an explicit empty list (`allowed_tools = []`) mean the same legacy state: no authorization constraint. A non-empty list admits only what it names, MCP tools included under their prefixed `<server>__<tool>` name. An empty list does **not** mean deny-all; for that, set the sibling `deny_all_tools = true`, which denies built-ins, MCP tools, and skill-defined tools alike. Setting both `deny_all_tools = true` and a nonempty `allowed_tools` is a configuration error rejected at load.
 - Caller-supplied per-run allow-lists (cron job `allowed_tools`, narrowed delegate invocations, etc.) intersect with the risk profile's list. A job that narrows itself to `allowed_tools = ["cron_add"]` will not surface MCP tools it did not name.
 
-If you need finer-grained gating, drop the profile's `level` to `read_only` or `supervised` and rely on the per-profile `auto_approve` / `always_ask` lists to gate sensitive tools behind operator approval.
+If you need finer-grained gating under Full autonomy, put sensitive tools in the per-profile `always_ask` list: they still prompt (or fail closed) even when `level = "full"`. Dropping the profile to `read_only` or `supervised` is only required when you want the whole risk-tier matrix, not when you need a handful of exceptions.
 
 See [Autonomy levels](../security/autonomy.md) for the full set of per-profile fields.
 

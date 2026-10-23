@@ -68,6 +68,7 @@ mod acp;
 
 use crate::traits::{ChatRequest, ChatResponse, ModelProvider, ProviderCapabilities};
 use async_trait::async_trait;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -110,6 +111,81 @@ const MAX_GROK_CLI_STDERR_BYTES: usize = 65_536;
 
 const GROK_CLI_SUPPORTED_TEMPERATURES: [f64; 2] = [0.7, 1.0];
 const TEMP_EPSILON: f64 = 1e-9;
+
+#[cfg(not(windows))]
+fn executable_candidates(path: &Path, _path_ext_env: Option<&OsStr>) -> Vec<PathBuf> {
+    vec![path.to_path_buf()]
+}
+
+#[cfg(windows)]
+fn executable_candidates(path: &Path, path_ext_env: Option<&OsStr>) -> Vec<PathBuf> {
+    let mut candidates = vec![path.to_path_buf()];
+    if path.extension().is_some() {
+        return candidates;
+    }
+    let Some(path_extensions) = path_ext_env.and_then(OsStr::to_str) else {
+        return candidates;
+    };
+    for extension in path_extensions.split(';').filter(|extension| {
+        extension.starts_with('.')
+            && extension.len() > 1
+            && extension[1..]
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric())
+    }) {
+        let mut candidate = path.as_os_str().to_os_string();
+        candidate.push(extension);
+        candidates.push(PathBuf::from(candidate));
+    }
+    candidates
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    if !path.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return false;
+    }
+    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `path` is a live NUL-terminated CString and `access` does not retain it.
+    unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
+}
+
+#[cfg(windows)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetBinaryTypeW;
+
+    if !path.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return false;
+    }
+    if path
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("bat") || extension.eq_ignore_ascii_case("cmd")
+        })
+    {
+        return true;
+    }
+    let wide_path: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut binary_type = 0_u32;
+    // SAFETY: `wide_path` is NUL-terminated and `binary_type` is valid for this call.
+    unsafe { GetBinaryTypeW(wide_path.as_ptr(), &mut binary_type) != 0 }
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
 
 /// Default OS sandbox profile when the operator does not provide one.
 const DEFAULT_SANDBOX_PROFILE: &str = "strict";
@@ -319,10 +395,6 @@ impl GrokCliBuilder {
     }
 
     pub fn build(self) -> anyhow::Result<GrokCliModelProvider> {
-        let binary_path = self
-            .binary_path
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_GROK_CLI_BINARY));
         let working_directory = GrokCliModelProvider::validate_working_directory(
             self.working_directory.as_deref().unwrap_or_default(),
         )?;
@@ -336,6 +408,13 @@ impl GrokCliBuilder {
             .filter(|seconds| *seconds > 0)
             .map(|seconds| Duration::from_secs(seconds.min(MAX_GROK_CLI_TIMEOUT_SECS)))
             .unwrap_or(DEFAULT_GROK_CLI_TIMEOUT);
+        let path = std::env::var_os("PATH");
+        let path_ext = std::env::var_os("PATHEXT");
+        let binary_path = GrokCliModelProvider::resolve_binary_path(
+            self.binary_path.as_deref(),
+            path.as_deref(),
+            path_ext.as_deref(),
+        )?;
         Ok(GrokCliModelProvider {
             alias: self.alias,
             binary_path,
@@ -479,6 +558,49 @@ impl GrokCliModelProvider {
             timeout_secs: None,
             vision_enabled: false,
         }
+    }
+
+    fn resolve_binary_path(
+        configured: Option<&str>,
+        path_env: Option<&OsStr>,
+        path_ext_env: Option<&OsStr>,
+    ) -> anyhow::Result<PathBuf> {
+        let binary = configured.unwrap_or(DEFAULT_GROK_CLI_BINARY);
+        let path = Path::new(binary);
+        if path.is_absolute() {
+            Self::first_executable_candidate(path, path_ext_env)
+        } else {
+            let mut components = path.components();
+            if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+                || components.next().is_some()
+            {
+                anyhow::bail!(
+                    "grok_cli binary_path must be an absolute path or a bare executable name"
+                );
+            }
+
+            let safe_directories: Vec<PathBuf> = path_env
+                .into_iter()
+                .flat_map(std::env::split_paths)
+                .filter(|directory| directory.is_absolute())
+                .collect();
+            if safe_directories.is_empty() {
+                anyhow::bail!("grok_cli PATH contains no absolute executable directories");
+            }
+            safe_directories.into_iter().find_map(|directory| {
+                Self::first_executable_candidate(&directory.join(path), path_ext_env)
+            })
+        }
+        .ok_or_else(|| anyhow::Error::msg("grok_cli binary was not found or is not executable"))
+    }
+
+    fn first_executable_candidate(path: &Path, path_ext_env: Option<&OsStr>) -> Option<PathBuf> {
+        executable_candidates(path, path_ext_env)
+            .into_iter()
+            .find_map(|candidate| {
+                let canonical = std::fs::canonicalize(candidate).ok()?;
+                is_executable_file(&canonical).then_some(canonical)
+            })
     }
 
     fn validate_working_directory(value: &str) -> anyhow::Result<PathBuf> {
@@ -727,8 +849,13 @@ impl GrokCliModelProvider {
         xai_api_key_available
     }
 
-    async fn invoke_acp(&self, message: &str, model: &str) -> anyhow::Result<String> {
-        let prompt = self.acp_prompt_content(message);
+    async fn invoke_acp(
+        &self,
+        system: Option<&str>,
+        message: &str,
+        model: &str,
+    ) -> anyhow::Result<String> {
+        let prompt = self.acp_prompt_content(system, message);
         let args = Self::build_cli_args(model, &self.extra_args);
         let permission_policy = Self::acp_permission_policy(&self.extra_args);
         let mut cmd = Command::new(&self.binary_path);
@@ -832,9 +959,17 @@ impl GrokCliModelProvider {
         }
     }
 
-    fn acp_prompt_content(&self, message: &str) -> Vec<acp::AcpPromptContent> {
+    fn acp_prompt_content(
+        &self,
+        system: Option<&str>,
+        message: &str,
+    ) -> Vec<acp::AcpPromptContent> {
+        let system_text = system.filter(|system| !system.is_empty());
         if !self.vision_enabled {
-            return vec![acp::AcpPromptContent::Text(message.to_string())];
+            return vec![acp::AcpPromptContent::Text(joined_prompt_text(
+                system_text,
+                message,
+            ))];
         }
 
         // TODO(grok-cli-vision): Grok Build through 0.2.118 still advertises
@@ -844,9 +979,19 @@ impl GrokCliModelProvider {
         // the image content. Keep this path experimental until advertise is
         // true *and* a live recognition smoke passes; then prefer following
         // the advertise bit instead of a local override.
-        let (text, image_refs) = crate::multimodal::parse_image_markers(message);
+        //
+        // The user content is parsed BEFORE the system prompt is prepended: a
+        // prompt-mode carrier is only recognizable while the string still
+        // starts with the carrier prefix. Flattening first destroyed that
+        // prefix and dropped the helper onto its whole-string marker-scan
+        // fallback, which lifted a data URI quoted in a carrier body as an
+        // image block and removed it from the text.
+        let (text, image_refs) = crate::multimodal::parse_user_message_image_refs(message);
         if image_refs.is_empty() {
-            return vec![acp::AcpPromptContent::Text(message.to_string())];
+            return vec![acp::AcpPromptContent::Text(joined_prompt_text(
+                system_text,
+                message,
+            ))];
         }
 
         let Some(images) = image_refs
@@ -857,15 +1002,38 @@ impl GrokCliModelProvider {
             // The runtime normally normalizes all provider-bound images into
             // data URIs. Preserve the original text on atypical direct calls
             // rather than silently dropping an image reference we cannot send.
-            return vec![acp::AcpPromptContent::Text(message.to_string())];
+            return vec![acp::AcpPromptContent::Text(joined_prompt_text(
+                system_text,
+                message,
+            ))];
         };
 
-        let mut prompt = Vec::with_capacity(images.len() + usize::from(!text.is_empty()));
+        let mut text_part = String::new();
+        if let Some(system) = system_text {
+            text_part.push_str(system);
+        }
         if !text.is_empty() {
-            prompt.push(acp::AcpPromptContent::Text(text));
+            if !text_part.is_empty() {
+                text_part.push_str("\n\n");
+            }
+            text_part.push_str(&text);
+        }
+        let mut prompt = Vec::with_capacity(images.len() + usize::from(!text_part.is_empty()));
+        if !text_part.is_empty() {
+            prompt.push(acp::AcpPromptContent::Text(text_part));
         }
         prompt.extend(images);
         prompt
+    }
+}
+
+/// `{system}\n\n{message}`, or `message` alone when there is no system text:
+/// the exact shape the flattened path always sent, kept for the vision-off
+/// and no-image branches so only the carrier path changes behavior.
+fn joined_prompt_text(system: Option<&str>, message: &str) -> String {
+    match system {
+        Some(system) => format!("{system}\n\n{message}"),
+        None => message.to_string(),
     }
 }
 
@@ -994,11 +1162,9 @@ impl ModelProvider for GrokCliModelProvider {
             Self::validate_temperature(temperature)?;
         }
 
-        let full_message = match system_prompt {
-            Some(system) if !system.is_empty() => format!("{system}\n\n{message}"),
-            _ => message.to_string(),
-        };
-        self.invoke_acp(&full_message, model).await
+        // The system prompt rides separately: `acp_prompt_content` must parse
+        // the user content before any prefix flattens it (see its comment).
+        self.invoke_acp(system_prompt, message, model).await
     }
 
     async fn chat(
@@ -1039,15 +1205,29 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn test_executable_path() -> PathBuf {
+        std::fs::canonicalize(std::env::current_exe().expect("current test executable"))
+            .expect("canonical test executable")
+    }
+
+    fn provider_builder(cwd: &Path) -> GrokCliBuilder {
+        let binary = test_executable_path();
+        GrokCliModelProvider::builder("test")
+            .binary_path(Some(binary.to_str().expect("UTF-8 test executable")))
+            .working_directory(cwd.to_str().expect("UTF-8 test path"))
+    }
+
     fn provider(
         binary: Option<&str>,
         cwd: &Path,
         extra: Vec<String>,
         timeout_secs: Option<u64>,
     ) -> GrokCliModelProvider {
-        GrokCliModelProvider::builder("test")
-            .binary_path(binary)
-            .working_directory(cwd.to_str().expect("UTF-8 test path"))
+        let mut builder = provider_builder(cwd);
+        if let Some(binary) = binary {
+            builder = builder.binary_path(Some(binary));
+        }
+        builder
             .extra_args(extra)
             .timeout_secs(timeout_secs)
             .build()
@@ -1080,7 +1260,7 @@ mod tests {
             model_provider.working_directory,
             std::fs::canonicalize(temp.path()).expect("canonical path")
         );
-        assert_eq!(model_provider.binary_path, PathBuf::from("grok"));
+        assert_eq!(model_provider.binary_path, test_executable_path());
         assert!(model_provider.env_passthrough.is_empty());
         assert_eq!(
             model_provider.max_acp_stdout_bytes,
@@ -1091,18 +1271,230 @@ mod tests {
         assert!(!model_provider.capabilities().vision);
     }
 
+    fn copy_test_executable(directory: &Path, name: &str) -> PathBuf {
+        std::fs::create_dir_all(directory).expect("create executable directory");
+        let destination = directory.join(name);
+        std::fs::copy(test_executable_path(), &destination).expect("copy test executable");
+        destination
+    }
+
+    #[test]
+    fn binary_lookup_ignores_relative_path_entries() {
+        const CHILD_ENV: &str = "ZEROCLAW_TEST_GROK_PATH_SHADOW";
+        if let Some(trusted) = std::env::var_os(CHILD_ENV) {
+            let trusted = PathBuf::from(trusted);
+            for relative in ["", ".", "bin"] {
+                let decoy = Path::new(relative).join(DEFAULT_GROK_CLI_BINARY);
+                assert!(
+                    GrokCliModelProvider::first_executable_candidate(&decoy, None).is_some(),
+                    "workspace decoy must be executable: {decoy:?}"
+                );
+                let path = std::env::join_paths([PathBuf::from(relative), trusted.clone()])
+                    .expect("test PATH");
+                let resolved = GrokCliModelProvider::resolve_binary_path(None, Some(&path), None)
+                    .expect("trusted executable");
+                assert_eq!(
+                    resolved,
+                    std::fs::canonicalize(trusted.join(DEFAULT_GROK_CLI_BINARY))
+                        .expect("canonical trusted executable")
+                );
+
+                let unsafe_path =
+                    std::env::join_paths([PathBuf::from(relative)]).expect("relative-only PATH");
+                let error =
+                    GrokCliModelProvider::resolve_binary_path(None, Some(&unsafe_path), None)
+                        .expect_err("workspace decoy must not be selected");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("no absolute executable directories")
+                );
+            }
+            return;
+        }
+
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        copy_test_executable(&workspace, DEFAULT_GROK_CLI_BINARY);
+        copy_test_executable(&workspace.join("bin"), DEFAULT_GROK_CLI_BINARY);
+        let trusted = temp.path().join("trusted");
+        copy_test_executable(&trusted, DEFAULT_GROK_CLI_BINARY);
+
+        // Isolate workspace-relative lookup from other tests' process-wide cwd.
+        let output = std::process::Command::new(test_executable_path())
+            .args([
+                "--exact",
+                "grok_cli::tests::binary_lookup_ignores_relative_path_entries",
+                "--nocapture",
+            ])
+            .current_dir(workspace)
+            .env(CHILD_ENV, trusted)
+            .output()
+            .expect("run isolated PATH lookup test");
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "isolated PATH lookup failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn binary_lookup_fails_when_path_has_no_absolute_directories() {
+        let path = std::env::join_paths([PathBuf::from("."), PathBuf::new()]).expect("test PATH");
+        let error = GrokCliModelProvider::resolve_binary_path(None, Some(&path), None)
+            .expect_err("relative-only PATH must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("no absolute executable directories")
+        );
+    }
+
+    #[test]
+    fn binary_lookup_rejects_relative_configured_paths() {
+        for configured in ["./grok", "../grok", ".", ".."] {
+            let error = GrokCliModelProvider::resolve_binary_path(Some(configured), None, None)
+                .expect_err("relative configured path must fail");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("absolute path or a bare executable name")
+            );
+        }
+    }
+
+    #[test]
+    fn binary_lookup_accepts_explicit_absolute_executable() {
+        let executable = test_executable_path();
+        let resolved = GrokCliModelProvider::resolve_binary_path(
+            Some(executable.to_str().expect("UTF-8 test executable")),
+            None,
+            None,
+        )
+        .expect("absolute executable");
+
+        assert_eq!(resolved, executable);
+    }
+
+    #[test]
+    fn binary_lookup_rejects_explicit_directory() {
+        let temp = TempDir::new().expect("tempdir");
+        let error = GrokCliModelProvider::resolve_binary_path(
+            Some(temp.path().to_str().expect("UTF-8 test path")),
+            None,
+            None,
+        )
+        .expect_err("directory must not be executable selection");
+
+        assert!(error.to_string().contains("not found or is not executable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn binary_lookup_skips_non_executable_unix_decoy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let decoy_dir = temp.path().join("decoy");
+        let trusted_dir = temp.path().join("trusted");
+        let decoy = copy_test_executable(&decoy_dir, DEFAULT_GROK_CLI_BINARY);
+        let mut permissions = decoy.metadata().expect("decoy metadata").permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&decoy, permissions).expect("remove execute permission");
+        let trusted_binary = copy_test_executable(&trusted_dir, DEFAULT_GROK_CLI_BINARY);
+        let path = std::env::join_paths([decoy_dir, trusted_dir]).expect("test PATH");
+
+        let resolved = GrokCliModelProvider::resolve_binary_path(None, Some(&path), None)
+            .expect("later trusted executable");
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(trusted_binary).expect("canonical trusted executable")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn binary_lookup_skips_symlink_to_directory_decoy() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let decoy_dir = temp.path().join("decoy");
+        let trusted_dir = temp.path().join("trusted");
+        std::fs::create_dir_all(&decoy_dir).expect("create decoy directory");
+        let directory_target = temp.path().join("directory-target");
+        std::fs::create_dir_all(&directory_target).expect("create directory target");
+        symlink(&directory_target, decoy_dir.join(DEFAULT_GROK_CLI_BINARY))
+            .expect("create symlink decoy");
+        let trusted_binary = copy_test_executable(&trusted_dir, DEFAULT_GROK_CLI_BINARY);
+        let path = std::env::join_paths([decoy_dir, trusted_dir]).expect("test PATH");
+
+        let resolved = GrokCliModelProvider::resolve_binary_path(None, Some(&path), None)
+            .expect("later trusted executable");
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(trusted_binary).expect("canonical trusted executable")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn binary_lookup_uses_each_pathext_snapshot() {
+        let temp = TempDir::new().expect("tempdir");
+        let trusted = temp.path().join("trusted");
+        let trusted_binary = copy_test_executable(&trusted, "grok.TEST");
+        let path = std::env::join_paths([trusted]).expect("test PATH");
+
+        let resolved =
+            GrokCliModelProvider::resolve_binary_path(None, Some(&path), Some(OsStr::new(".TEST")))
+                .expect("PATHEXT-selected executable");
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(trusted_binary).expect("canonical trusted executable")
+        );
+
+        let error = GrokCliModelProvider::resolve_binary_path(
+            None,
+            Some(&path),
+            Some(OsStr::new(".OTHER")),
+        )
+        .expect_err("different PATHEXT snapshot must not reuse the prior extension");
+        assert!(error.to_string().contains("not found or is not executable"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn binary_lookup_skips_non_executable_windows_decoy() {
+        let temp = TempDir::new().expect("tempdir");
+        let decoy_dir = temp.path().join("decoy");
+        let trusted_dir = temp.path().join("trusted");
+        std::fs::create_dir_all(&decoy_dir).expect("create decoy directory");
+        std::fs::write(decoy_dir.join("grok.TEST"), b"not a Windows binary").expect("write decoy");
+        let trusted_binary = copy_test_executable(&trusted_dir, "grok.TEST");
+        let path = std::env::join_paths([decoy_dir, trusted_dir]).expect("test PATH");
+
+        let resolved =
+            GrokCliModelProvider::resolve_binary_path(None, Some(&path), Some(OsStr::new(".TEST")))
+                .expect("later trusted executable");
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(trusted_binary).expect("canonical trusted executable")
+        );
+    }
+
     #[test]
     fn vision_override_serializes_normalized_images_as_acp_blocks() {
         let temp = TempDir::new().expect("tempdir");
-        let model_provider = GrokCliModelProvider::builder("test")
-            .working_directory(temp.path().to_str().expect("UTF-8 test path"))
+        let model_provider = provider_builder(temp.path())
             .vision_enabled(true)
             .build()
             .expect("vision-enabled provider");
 
         assert!(model_provider.capabilities().vision);
         assert_eq!(
-            model_provider.acp_prompt_content("Describe [IMAGE:data:image/png;base64,cG5n]"),
+            model_provider.acp_prompt_content(None, "Describe [IMAGE:data:image/png;base64,cG5n]"),
             vec![
                 acp::AcpPromptContent::Text("Describe".to_string()),
                 acp::AcpPromptContent::Image {
@@ -1120,7 +1512,7 @@ mod tests {
         let message = "Describe [IMAGE:data:image/png;base64,cG5n]";
 
         assert_eq!(
-            model_provider.acp_prompt_content(message),
+            model_provider.acp_prompt_content(None, message),
             vec![acp::AcpPromptContent::Text(message.to_string())]
         );
     }
@@ -1130,8 +1522,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let cwd = temp.path().to_str().expect("UTF-8 test path");
         let configured = 8 * 1024 * 1024;
-        let model_provider = GrokCliModelProvider::builder("test")
-            .working_directory(cwd)
+        let model_provider = provider_builder(temp.path())
             .max_acp_stdout_bytes(Some(configured))
             .build()
             .expect("configured limit");
@@ -1157,8 +1548,7 @@ mod tests {
     #[test]
     fn builder_validates_and_deduplicates_env_passthrough() {
         let temp = TempDir::new().expect("tempdir");
-        let model_provider = GrokCliModelProvider::builder("test")
-            .working_directory(temp.path().to_str().expect("UTF-8 test path"))
+        let model_provider = provider_builder(temp.path())
             .env_passthrough(vec![
                 " AWS_ACCESS_KEY_ID ".to_string(),
                 "AWS_ACCESS_KEY_ID".to_string(),
@@ -1246,8 +1636,7 @@ mod tests {
         assert!(error.to_string().contains("missing its value"));
 
         assert!(
-            GrokCliModelProvider::builder("test")
-                .working_directory(cwd)
+            provider_builder(temp.path())
                 .extra_args(vec![
                     "--tools".to_string(),
                     "Read,Grep".to_string(),
@@ -1507,16 +1896,20 @@ mod tests {
         assert!(!available, "an empty API key must not select API-key auth");
     }
 
-    #[tokio::test]
-    async fn invoke_missing_binary_returns_stable_error() {
+    #[test]
+    fn builder_missing_binary_returns_stable_error() {
         let temp = TempDir::new().expect("tempdir");
-        let model_provider = provider(Some("/nonexistent/path/to/grok"), temp.path(), vec![], None);
-        let error = model_provider
-            .invoke_acp("hello", "default")
-            .await
-            .expect_err("missing binary must fail");
+        let missing = temp.path().join("missing-grok");
+        let result = GrokCliModelProvider::builder("test")
+            .binary_path(Some(missing.to_str().expect("UTF-8 test path")))
+            .working_directory(temp.path().to_str().expect("UTF-8 test path"))
+            .build();
+        let error = match result {
+            Ok(_) => panic!("missing binary must fail during construction"),
+            Err(error) => error,
+        };
         let message = error.to_string();
-        assert!(message.contains("Failed to spawn Grok Build CLI ACP binary"));
+        assert!(message.contains("binary was not found or is not executable"));
         assert!(!message.contains("prompt-file"));
     }
 
@@ -1593,7 +1986,7 @@ mod tests {
             let temp = TempDir::new().expect("live Grok cwd");
             let model_provider = provider(None, temp.path(), vec![], Some(120));
             let reply = model_provider
-                .invoke_acp(&prompt, DEFAULT_MODEL_MARKER)
+                .invoke_acp(None, &prompt, DEFAULT_MODEL_MARKER)
                 .await
                 .expect("live Grok ACP response");
             eprintln!("{label}: {reply}");
@@ -1632,6 +2025,7 @@ mod tests {
         );
         let reply = model_provider
             .invoke_acp(
+                None,
                 "Use the shell tool to run `printf ACP_TOOL_EXEC_OK`. After the tool succeeds, output the token ACP_TOOL_FINAL_OK.",
                 DEFAULT_MODEL_MARKER,
             )
@@ -1659,6 +2053,7 @@ mod tests {
         );
         let reply = model_provider
             .invoke_acp(
+                None,
                 "Use the shell tool to run exactly this multiline command:\n```\n# OpenClaw style memory in agent home\nprintf ACP_PERMISSION_EXEC_OK > permission-marker\n```\nAfter the marker is written, output the token ACP_PERMISSION_FINAL_OK.",
                 DEFAULT_MODEL_MARKER,
             )
@@ -1688,6 +2083,7 @@ mod tests {
         );
         let error = model_provider
             .invoke_acp(
+                None,
                 "Attempt to use the shell tool to run exactly `printf ACP_DENY_EXEC_BAD > denied-marker`. Whether the tool is denied or succeeds, output the token ACP_DENY_FINAL_OK.",
                 DEFAULT_MODEL_MARKER,
             )
@@ -1854,7 +2250,7 @@ while IFS= read -r line; do :; done
                 let temp = TempDir::new().expect("tempdir");
                 let model_provider = fake_provider(&temp, SUCCESS_BODY, 5);
                 let reply = model_provider
-                    .invoke_acp(&prompt, "default")
+                    .invoke_acp(None, &prompt, "default")
                     .await
                     .expect("fake ACP reply");
                 assert_eq!(reply, "FAKE_ACP_OK");
@@ -1880,7 +2276,11 @@ while IFS= read -r line; do :; done
             let temp = TempDir::new().expect("tempdir");
             let model_provider = fake_provider_with_vision(&temp, SUCCESS_BODY, 5);
             let reply = model_provider
-                .invoke_acp("Describe [IMAGE:data:image/png;base64,cG5n]", "default")
+                .invoke_acp(
+                    None,
+                    "Describe [IMAGE:data:image/png;base64,cG5n]",
+                    "default",
+                )
                 .await
                 .expect("fake ACP reply");
             assert_eq!(reply, "FAKE_ACP_OK");
@@ -1908,11 +2308,70 @@ while IFS= read -r line; do :; done
         }
 
         #[tokio::test]
+        async fn fake_child_chat_parses_carrier_before_system_prefix() {
+            // B3: `chat` -> `chat_with_history` -> `chat_with_system` used to
+            // flatten "{system}\n\n{message}" before ACP prompt assembly, so
+            // a prompt carrier lost its prefix and the carrier-aware helper
+            // fell back to whole-string marker scanning. With vision enabled
+            // and a nonempty system prompt, a count-zero carrier whose body
+            // quotes a structurally valid data URI must be delivered as one
+            // text block, byte for byte, with zero image parts.
+            let temp = TempDir::new().expect("tempdir");
+            let model_provider = fake_provider_with_vision(&temp, SUCCESS_BODY, 5);
+            let marker =
+                zeroclaw_api::tool_carrier::marker_line(&zeroclaw_api::media::RenderedMarker {
+                    target: "data:image/png;base64,QUJD".to_string(),
+                    kind: zeroclaw_api::media::MarkerKind::Image,
+                });
+            let body = format!("source example: {marker} quoted in prose");
+            let carrier = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(&body, &[]);
+            let messages = vec![
+                zeroclaw_api::model_provider::ChatMessage::system("You are terse."),
+                zeroclaw_api::model_provider::ChatMessage::user(carrier.clone()),
+            ];
+            let request = ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            };
+            let reply = model_provider
+                .chat(request, "default", None)
+                .await
+                .expect("fake ACP reply");
+            assert_eq!(reply.text.as_deref(), Some("FAKE_ACP_OK"));
+
+            let requests = std::fs::read_to_string(temp.path().join("requests.ndjson"))
+                .expect("captured requests");
+            let prompt_request: serde_json::Value = serde_json::from_str(
+                requests
+                    .lines()
+                    .nth(3)
+                    .expect("session/prompt request must be captured"),
+            )
+            .expect("session/prompt request is JSON");
+            assert_eq!(prompt_request["method"], "session/prompt");
+            let blocks = prompt_request["params"]["prompt"]
+                .as_array()
+                .expect("session prompt carries blocks");
+            assert_eq!(
+                blocks.len(),
+                1,
+                "zero image parts and one text part: {blocks:?}"
+            );
+            assert_eq!(blocks[0]["type"], "text");
+            assert_eq!(
+                blocks[0]["text"].as_str(),
+                Some(format!("You are terse.\n\n{carrier}").as_str()),
+                "system plus carrier body, byte for byte"
+            );
+        }
+
+        #[tokio::test]
         async fn fake_child_discards_progress_before_tool_result() {
             let temp = TempDir::new().expect("tempdir");
             let model_provider = fake_provider(&temp, PROGRESS_THEN_TOOL_BODY, 5);
             let reply = model_provider
-                .invoke_acp("hello", "default")
+                .invoke_acp(None, "hello", "default")
                 .await
                 .expect("fake ACP reply");
             assert_eq!(reply, "FAKE_PROGRESS_BOUNDARY_OK");
@@ -1932,7 +2391,7 @@ while IFS= read -r line; do :; done
                 let model_provider =
                     fake_provider_with_extra_args(&temp, PERMISSION_REQUEST_BODY, 5, extra_args);
                 let reply = model_provider
-                    .invoke_acp("hello", "default")
+                    .invoke_acp(None, "hello", "default")
                     .await
                     .expect("fake ACP reply");
                 assert_eq!(reply, "FAKE_PERMISSION_OK");
@@ -1962,7 +2421,7 @@ while IFS= read -r line; do :; done
             );
             let model_provider = fake_provider(&temp, &body, 5);
             let reply = model_provider
-                .invoke_acp("hello", "default")
+                .invoke_acp(None, "hello", "default")
                 .await
                 .expect("stderr must be drained concurrently");
             assert_eq!(reply, "FAKE_ACP_OK");
@@ -1977,7 +2436,7 @@ while IFS= read -r line; do :; done
                 format!("printf '%s\\n' '{secret}' >&2\nprintf '%s\\n' 'not-json'\nsleep 30");
             let model_provider = fake_provider(&temp, &body, 5);
             let error = model_provider
-                .invoke_acp("hello", "default")
+                .invoke_acp(None, "hello", "default")
                 .await
                 .expect_err("invalid ACP response must fail");
             assert!(!error.to_string().contains(secret));
@@ -1995,7 +2454,7 @@ sleep 30
 "#;
             let model_provider = fake_provider(&temp, body, 5);
             let error = model_provider
-                .invoke_acp("hello", "default")
+                .invoke_acp(None, "hello", "default")
                 .await
                 .expect_err("oversized frame must fail");
             assert!(error.to_string().contains("stdout frame exceeded"));
@@ -2018,7 +2477,7 @@ sleep 30
             let model_provider =
                 fake_provider_with_stdout_limit(&temp, body, 5, acp::MIN_ACP_STDOUT_LIMIT_BYTES);
             let error = model_provider
-                .invoke_acp("hello", "default")
+                .invoke_acp(None, "hello", "default")
                 .await
                 .expect_err("configured aggregate stdout limit must fail");
             assert!(error.to_string().contains(&format!(
@@ -2040,10 +2499,10 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"fake-session"}}'
 sleep 30
 "#;
             let model_provider = fake_provider(&temp, body, 1);
-            let prompt = "x".repeat(4 * 1024 * 1024);
+            let prompt = "x".repeat(512 * 1024);
             let started = Instant::now();
             let error = model_provider
-                .invoke_acp(&prompt, "default")
+                .invoke_acp(None, &prompt, "default")
                 .await
                 .expect_err("blocked prompt write must time out");
             assert!(error.to_string().contains("timed out after 1s"));
@@ -2061,7 +2520,7 @@ sleep 30
 "#;
             let model_provider = fake_provider(&temp, body, 60);
             let task = ::zeroclaw_spawn::spawn!(async move {
-                model_provider.invoke_acp("hello", "default").await
+                model_provider.invoke_acp(None, "hello", "default").await
             });
             let leader = wait_for_pid(&temp.path().join("leader.pid")).await;
             let descendant = wait_for_pid(&temp.path().join("descendant.pid")).await;
@@ -2079,7 +2538,7 @@ sleep 30
                 format!("sleep 30 &\nprintf '%s\\n' \"$!\" > descendant.pid\n{SUCCESS_BODY}");
             let model_provider = fake_provider(&temp, &body, 5);
             let reply = model_provider
-                .invoke_acp("hello", "default")
+                .invoke_acp(None, "hello", "default")
                 .await
                 .expect("fake ACP reply");
             assert_eq!(reply, "FAKE_ACP_OK");
@@ -2101,7 +2560,7 @@ sleep 30
             let leader_path = temp.path().join("leader.pid");
             let descendant_path = temp.path().join("descendant.pid");
             let task = ::zeroclaw_spawn::spawn!(async move {
-                model_provider.invoke_acp("hello", "default").await
+                model_provider.invoke_acp(None, "hello", "default").await
             });
             let leader = wait_for_pid(&leader_path).await;
             let descendant = wait_for_pid(&descendant_path).await;

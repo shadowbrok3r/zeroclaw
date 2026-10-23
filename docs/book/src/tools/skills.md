@@ -16,7 +16,7 @@ Use bundles for skills an agent should load during runtime. A bundle is configur
 
 For hand-authored local skills, use `SKILL.md` or `SKILL.toml`. Use `SKILL.md` for instructions plus simple metadata. Use `SKILL.toml` when the skill needs structured prompts or tool definitions. ZeroClaw also understands `manifest.toml` for registry-style skill packages, but `SKILL.md` and `SKILL.toml` are the recommended local authoring formats.
 
-To distribute a set of skills as a signed, versioned, installable package, see [Skill bundles](./skill-bundles.md). Note that those ride the plugin system, which prebuilt release binaries do not include; on a stock binary, the shared bundles on this page are the supported mechanism.
+To distribute a set of skills as a signed, versioned, installable package, see [Skill bundles](./skill-bundles.md). Note that those ride the plugin system, which the 64-bit desktop and server release archives carry (every release executes a plugin from each of them) and the 32-bit ARM archives, the experimental Android archive, and default source builds do not; the [per-artifact table](../developing/plugin-protocol.md#plugin-support-per-release-artifact) lists every artifact. Where the plugin host is absent, the shared bundles on this page are the supported mechanism.
 
 ## Create a Markdown skill
 
@@ -86,6 +86,8 @@ Never exfiltrate secrets, never disable audit logging, and always ask for approv
 A skill can also be a structured TOML manifest (`SKILL.toml`). The `[skill]` table requires `name` and `description`; `version` defaults to `0.1.0` when omitted; `author`, `tags`, `prompts`, and `always` are optional (`always` defaults to `false`; see above). Tool entries may use `kind = "shell"`, `kind = "http"`, or `kind = "script"`. Keep tool descriptions narrow and concrete so the model knows when to use them.
 
 HTTP skill tools use only `http` and `https` URLs. Arguments are percent-encoded before insertion, redirects and ambient proxies are disabled, and the resolved destination must pass ZeroClaw's public-network egress policy. Private or metadata destinations are rejected, and response bodies larger than one megabyte are truncated before they can expand runtime memory.
+
+Each HTTP skill call shares one 30-second timeout across destination validation, DNS lookup, request dispatch, and response-body reading. A timeout returns a failed tool result without including the URL or argument values. This bounds the call's wait; a platform DNS lookup already running on a blocking worker may continue until the operating system's resolver timeout.
 
 ### Slash command options and localizations
 
@@ -184,6 +186,20 @@ zeroclaw skills install https://github.com/vercel-labs/skills --skill find-skill
 ```
 
 </div>
+
+Discover one selected skill from an HTTPS `/.well-known/agent-skills/index.json` index:
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+zeroclaw skills install https://example.com --well-known --skill code-review --bundle ops
+```
+
+</div>
+
+Well-known discovery follows the pinned Agents Skills discovery schema `0.2.0` from [agentskills/agentskills commit `ab2ff8db3d5c9597985b06f94ea3caf1996ce82e`](https://github.com/agentskills/agentskills/tree/ab2ff8db3d5c9597985b06f94ea3caf1996ce82e). `--skill` is required so an index can never cause every advertised skill to be installed. The selected entry's SHA-256 digest is checked over the raw artifact bytes before use. Single `SKILL.md`, `.tar.gz`, and `.zip` artifacts are supported; archives must contain a root `SKILL.md`, stay within a 16 MiB raw artifact, 32 MiB gzip-decoded archive, and 512-entry limit, and contain no links, special files, absolute paths, traversal, or cross-platform drive paths. Index responses are capped at 256 KiB. Each redirect is revalidated for HTTPS, public DNS results, and the configured NAT64 policy, with at most 3 redirects and a 30-second request/DNS timeout; ambient proxies are disabled. No discovery cache is kept. The existing security audit and script policy still apply before publication.
 
 Install destination precedence is:
 

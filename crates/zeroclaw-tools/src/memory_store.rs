@@ -127,7 +127,7 @@ impl Tool for MemoryStoreTool {
                     .find(|e| &e.id == id && e.superseded_by.is_none())
                     .ok_or_else(|| {
                         anyhow::Error::msg(crate::i18n::get_required_tool_string(
-                            "tool-memory-store-missing-predecessor"
+                            "tool-memory-store-missing-predecessor",
                         ))
                     })?;
                 anyhow::ensure!(

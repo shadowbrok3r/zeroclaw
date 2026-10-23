@@ -16,6 +16,8 @@ pub struct LoopDetectorConfig {
     pub window_size: usize,
     /// How many consecutive exact-repeat calls before escalation starts.
     pub max_repeats: usize,
+    /// How many same-call/same-result calls before no-progress escalation starts.
+    pub no_progress_min_calls: usize,
 }
 
 impl Default for LoopDetectorConfig {
@@ -24,6 +26,7 @@ impl Default for LoopDetectorConfig {
             enabled: true,
             window_size: 20,
             max_repeats: 3,
+            no_progress_min_calls: 5,
         }
     }
 }
@@ -305,11 +308,21 @@ impl LoopDetector {
         }
     }
 
-    /// Pattern 3: the same call returning the same result 5+ times anywhere in the window.
+    /// Pattern 3: the same call (tool and arguments) returning the same result
+    /// `no_progress_min_calls`+ times, counted across the whole window so
+    /// interleaved unrelated calls do not reset the streak. Distinct arguments
+    /// with identical results are per-item work (lookups that all come back
+    /// empty, per-item acknowledgements), never a repeat; a contiguous run is
+    /// `detect_exact_repeat`'s.
+    ///
+    /// Unlike exact-repeat and ping-pong this pattern caps at `Block`, so the
+    /// turn keeps running under repeated block messages rather than being torn
+    /// down. A genuinely stuck agent still terminates at `max_tool_iterations`,
+    /// where the graceful summary runs.
     fn detect_no_progress(&self) -> Option<LoopDetectionResult> {
-        const MIN_CALLS: usize = 5;
+        let min_calls = self.config.no_progress_min_calls;
 
-        if self.window.len() < MIN_CALLS {
+        if self.window.len() < min_calls {
             return None;
         }
 
@@ -323,7 +336,7 @@ impl LoopDetector {
             .collect();
 
         let count = positions.len();
-        if count < MIN_CALLS {
+        if count < min_calls {
             return None;
         }
 
@@ -333,12 +346,7 @@ impl LoopDetector {
             return None;
         }
 
-        if count >= MIN_CALLS + 2 {
-            Some(LoopDetectionResult::Break(format!(
-                "Circuit breaker: tool '{}' called {} times with identical arguments and identical results — no progress",
-                last.name, count
-            )))
-        } else if count > MIN_CALLS {
+        if count > min_calls {
             Some(LoopDetectionResult::Block(format!(
                 "Blocked: tool '{}' called {} times with identical arguments and identical results",
                 last.name, count
@@ -364,9 +372,8 @@ mod tests {
 
     fn config_with_repeats(max_repeats: usize) -> LoopDetectorConfig {
         LoopDetectorConfig {
-            enabled: true,
-            window_size: 20,
             max_repeats,
+            ..Default::default()
         }
     }
 
@@ -559,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn no_progress_escalates_to_block_and_break() {
+    fn no_progress_escalates_to_block_and_caps_there() {
         let mut det = LoopDetector::new(default_config());
         let args = json!({"q": "same"});
 
@@ -574,13 +581,74 @@ mod tests {
         }
         assert!(matches!(outcomes[4], LoopDetectionResult::Warning(_)));
         assert!(matches!(outcomes[5], LoopDetectionResult::Block(_)));
+        // Exact-repeat would break by now; no-progress caps at Block.
         match &outcomes[6] {
-            LoopDetectionResult::Break(msg) => {
+            LoopDetectionResult::Block(msg) => {
                 assert!(msg.contains("web_fetch"));
                 assert!(msg.contains("7 times"));
-                assert!(msg.contains("no progress"));
+                assert!(msg.contains("identical results"));
             }
-            other => panic!("expected Break at 7 calls, got {other:?}"),
+            other => panic!("expected Block at 7 calls, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_progress_never_breaks_at_high_call_counts() {
+        // The same call returning the same bytes, interleaved with other
+        // work, keeps getting Block instead of tearing the turn down.
+        let mut det = LoopDetector::new(LoopDetectorConfig {
+            window_size: 40,
+            ..Default::default()
+        });
+        let args = json!({"id": "member"});
+
+        for i in 0..12 {
+            let r = det.record("search", &args, "[]");
+            assert!(
+                !matches!(r, LoopDetectionResult::Break(_)),
+                "no-progress must never Break (call {i}, got {r:?})"
+            );
+            det.record(
+                &format!("reader_{i}"),
+                &json!({"path": format!("/f{i}")}),
+                &format!("body_{i}"),
+            );
+        }
+
+        match det.record("search", &args, "[]") {
+            LoopDetectionResult::Block(msg) => {
+                assert!(msg.contains("13 times"), "got: {msg}");
+                assert!(msg.contains("identical results"), "got: {msg}");
+            }
+            other => panic!("expected Block at 13 calls, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_progress_min_calls_is_configurable() {
+        let mut det = LoopDetector::new(LoopDetectorConfig {
+            no_progress_min_calls: 3,
+            ..Default::default()
+        });
+        let args = json!({"q": "same"});
+
+        for i in 0..2 {
+            assert_eq!(
+                det.record("search", &args, "none"),
+                LoopDetectionResult::Ok,
+                "iteration {i}"
+            );
+            det.record(
+                &format!("reader_{i}"),
+                &json!({"path": format!("/f{i}")}),
+                &format!("body_{i}"),
+            );
+        }
+        match det.record("search", &args, "none") {
+            LoopDetectionResult::Warning(msg) => {
+                assert!(msg.contains("3 times"), "got: {msg}");
+            }
+            other => panic!("expected Warning at the configured threshold, got {other:?}"),
         }
     }
 
@@ -692,9 +760,8 @@ mod tests {
     #[test]
     fn window_size_limits_memory() {
         let config = LoopDetectorConfig {
-            enabled: true,
             window_size: 5,
-            max_repeats: 3,
+            ..Default::default()
         };
         let mut det = LoopDetector::new(config);
         let args = json!({"x": 1});
@@ -761,9 +828,8 @@ mod tests {
     #[test]
     fn window_eviction_prevents_stale_pattern_detection() {
         let config = LoopDetectorConfig {
-            enabled: true,
             window_size: 6,
-            max_repeats: 3,
+            ..Default::default()
         };
         let mut det = LoopDetector::new(config);
         let args = json!({"x": 1});

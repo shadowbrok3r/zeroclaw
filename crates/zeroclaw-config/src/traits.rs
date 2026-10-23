@@ -82,6 +82,13 @@ pub enum PropKind {
     StringArray,
     ObjectArray,
     Object,
+    /// Container row for a `#[secret] HashMap<String, String>` field (MCP
+    /// `env`/`headers`, provider `extra_headers`, …). The row exists so
+    /// surfaces can offer "add key" even when the map is empty; its display
+    /// value lists key names only, never values. Individual entries are the
+    /// `<path>.<KEY>` rows: set one to add/replace it, set it to the empty
+    /// string (`config delete`) to remove it.
+    SecretMap,
 }
 
 /// Maps Rust types to PropKind at compile time.
@@ -184,8 +191,14 @@ impl HasPropKind for crate::multi_agent::MemoryBackendKind {
 impl HasPropKind for crate::multi_agent::OutputModality {
     const PROP_KIND: PropKind = PropKind::Enum;
 }
+impl HasPropKind for crate::multi_agent::MemoryGrant {
+    const PROP_KIND: PropKind = PropKind::Object;
+}
 impl HasPropKind for Vec<crate::multi_agent::AgentAlias> {
     const PROP_KIND: PropKind = PropKind::StringArray;
+}
+impl HasPropKind for Vec<crate::multi_agent::MemoryGrant> {
+    const PROP_KIND: PropKind = PropKind::ObjectArray;
 }
 impl HasPropKind for Vec<crate::multi_agent::PeerUsername> {
     const PROP_KIND: PropKind = PropKind::StringArray;
@@ -235,9 +248,6 @@ impl HasPropKind for crate::schema::DelegateExecutionMode {
     const PROP_KIND: PropKind = PropKind::Enum;
 }
 impl HasPropKind for Vec<crate::schema::DelegateTargetConfig> {
-    const PROP_KIND: PropKind = PropKind::ObjectArray;
-}
-impl HasPropKind for Vec<crate::schema::NevisRoleMappingConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
 }
 impl HasPropKind for Vec<crate::schema::PeripheralBoardConfig> {
@@ -346,6 +356,16 @@ impl std::fmt::Display for ConfigTab {
     }
 }
 
+/// Potential application mechanism, not evidence of consumer adoption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ApplicationCapability {
+    #[default]
+    ReloadRequired,
+    ModelProviderRefresh,
+}
+
 /// Describes a single property field discovered via `#[derive(Configurable)]`.
 #[derive(Clone)]
 pub struct PropFieldInfo {
@@ -376,6 +396,8 @@ pub struct PropFieldInfo {
     pub derived_from_secret: bool,
     /// Explicit security classification for credential-shaped surfaces.
     pub credential_class: Option<CredentialSurfaceClass>,
+    /// Conservative schema-owned application capability.
+    pub application: ApplicationCapability,
     /// Tab grouping for this field. `ConfigTab::None` when the field has
     /// no tab annotation (flat display, no tab bar).
     pub tab: ConfigTab,
@@ -402,6 +424,7 @@ impl PropKind {
             Self::StringArray => "string_array",
             Self::ObjectArray => "object_array",
             Self::Object => "object",
+            Self::SecretMap => "secret_map",
         }
     }
 }
@@ -419,6 +442,7 @@ impl std::fmt::Debug for PropFieldInfo {
             .field("kind", &self.kind)
             .field("is_secret", &self.is_secret)
             .field("credential_class", &self.credential_class)
+            .field("application", &self.application)
             .field("tab", &self.tab)
             .finish_non_exhaustive()
     }
@@ -926,11 +950,14 @@ pub struct IntegrationDescriptor {
 /// Metadata for one channel type, as returned by [`crate::schema::ChannelsConfig::channels`].
 #[derive(Debug, Clone)]
 pub struct ChannelInfo {
-    /// Canonical kebab-case identifier used in config TOML
-    /// (`[channels.<kind>]`). Matches the field name on
-    /// `ChannelsConfig` so Quickstart and other surfaces can
-    /// reuse the schema's own labeling without a parallel map.
+    /// Canonical runtime/API identifier for the channel type. This can differ
+    /// from the config map key when multiple runtime backends share one
+    /// `ChannelsConfig` field, such as `whatsapp-web` and `whatsapp`.
     pub kind: &'static str,
+    /// Canonical `ChannelsConfig` map key used by config APIs and TOML paths.
+    /// Keep this separate from `kind`: runtime channel identifiers can use
+    /// kebab-case or distinguish backends that share one config map.
+    pub config_key: &'static str,
     pub name: &'static str,
     pub desc: &'static str,
     pub configured: bool,

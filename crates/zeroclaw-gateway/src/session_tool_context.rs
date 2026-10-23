@@ -74,9 +74,9 @@ pub(crate) fn with_final_reasoning(
     if limits.keep_turns == 0 || reasoning.is_empty() {
         return turn;
     }
-    let answer = turn
-        .iter()
-        .rposition(|message| matches!(message, ConversationMessage::Chat(chat) if chat.role == "assistant"));
+    let answer = turn.iter().rposition(
+        |message| matches!(message, ConversationMessage::Chat(chat) if chat.role == "assistant"),
+    );
     if let Some(index) = answer {
         turn.insert(
             index,

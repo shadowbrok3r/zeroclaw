@@ -143,6 +143,7 @@ pub(crate) fn deliverables_from(value: &Value, session: &str) -> Result<Vec<Deli
 }
 
 /// Fixed subcommands and argument arrays; never a shell or a caller-selected executable.
+#[allow(clippy::result_large_err)]
 async fn invoke(
     command: &str,
     session: &str,
@@ -358,8 +359,9 @@ mod tests {
         state.pairing = Arc::new(PairingGuard::new(
             true,
             &["fixture-owner".into(), "fixture-other".into()],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
         ));
-        state.config.write().gateway.scope_sessions_to_device = true;
+        state.publish_test_config(|c| c.gateway.scope_sessions_to_device = true);
         (temp, state)
     }
     fn headers(token: &str) -> HeaderMap {
@@ -385,7 +387,11 @@ mod tests {
             authorize(&state, &headers("fixture-owner"), "missing"),
             Err(StatusCode::NOT_FOUND)
         );
-        state.pairing = Arc::new(PairingGuard::new(false, &["fixture-owner".into()]));
+        state.pairing = Arc::new(PairingGuard::new(
+            false,
+            &["fixture-owner".into()],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         assert_eq!(
             authorize(&state, &HeaderMap::new(), "ui-jobs"),
             Err(StatusCode::UNAUTHORIZED)
@@ -635,7 +641,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:42619")
             .await
             .unwrap();
-        println!("ANDROID_JOBS_FIXTURE_READY 127.0.0.1:42619 session=ui-jobs token=fixture-owner");
+        println!("ANDROID_JOBS_FIXTURE_READY 127.0.0.1:42619 session=ui-jobs token=fixture-owner"); // i18n-exempt: machine-read readiness marker for the Android jobs fixture
         axum::serve(listener, app).await.unwrap();
     }
 }

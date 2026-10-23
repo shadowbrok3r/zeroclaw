@@ -72,6 +72,8 @@ pub struct MemoryInjectConfig {
     /// Rerank stage parameters (strategy, threshold, blend weights, floor,
     /// final trim). Only consulted when `rerank_enabled` is set.
     pub rerank: rerank::RerankConfig,
+    /// Prefix each entry with its storage date (`[from YYYY-MM-DD]`).
+    pub date_stamp: bool,
 }
 
 impl Default for MemoryInjectConfig {
@@ -85,6 +87,7 @@ impl Default for MemoryInjectConfig {
             rerank_enabled: false,
             candidate_multiplier: 1,
             rerank: rerank::RerankConfig::disabled(DEFAULT_RECALL_LIMIT, 0.0),
+            date_stamp: true,
         }
     }
 }
@@ -109,6 +112,7 @@ impl MemoryInjectConfig {
             rerank_enabled: memory.rerank_enabled,
             candidate_multiplier: memory.candidate_multiplier.max(1),
             rerank: build_rerank_config(memory, limit),
+            date_stamp: memory.recall_date_stamp,
             ..Default::default()
         }
     }
@@ -249,6 +253,19 @@ fn should_skip_entry(key: &str, content: &str) -> bool {
     false
 }
 
+/// The `YYYY-MM-DD` prefix of an RFC3339 timestamp, or `None` when the value
+/// is not shaped like one. A prefix check, not a full parse: a backend that
+/// stores something else renders the untagged line rather than a half-parsed
+/// date.
+fn stored_on(timestamp: &str) -> Option<&str> {
+    let date = timestamp.get(..10)?;
+    let ok = date.as_bytes().iter().enumerate().all(|(i, b)| match i {
+        4 | 7 => *b == b'-',
+        _ => b.is_ascii_digit(),
+    });
+    ok.then_some(date)
+}
+
 pub async fn render_memory_context(
     mem: &dyn Memory,
     observer: &dyn Observer,
@@ -359,7 +376,17 @@ pub async fn render_memory_context(
         };
 
         let mut line = String::new();
-        let _ = writeln!(line, "- {}: {}", entry.key, content);
+        // Without the stamp a days-old sentence renders identically to the
+        // live user turn it is prepended to — an observed cause of stale
+        // values being copied into fresh tool calls.
+        let stamp = cfg
+            .date_stamp
+            .then(|| stored_on(&entry.timestamp))
+            .flatten();
+        let _ = match stamp {
+            Some(date) => writeln!(line, "- [from {date}] {}: {}", entry.key, content),
+            None => writeln!(line, "- {}: {}", entry.key, content),
+        };
         let line_chars = line.chars().count();
         if used_chars + line_chars > cfg.max_total_chars {
             break;
@@ -382,6 +409,29 @@ pub async fn render_memory_context(
     context
 }
 
+/// Strip a `render_memory_context` preamble off the front of `content`.
+/// `preamble` is the exact block the injecting call recorded rendering
+/// (`run_tool_call_loop`'s `injected_memory_preamble` out-param) — never a
+/// generic marker pattern, since a genuine user message can legitimately
+/// start with the same marker text. Matching the exact rendered string (the
+/// specific recalled entries, not just the wrapper) is also what makes this
+/// safe to call on a buffer the injection never touched at all: a
+/// pre-injection clone of the message (the ordinary no-trim write-back path
+/// keeps one, separate from the buffer the injector actually mutated) simply
+/// won't start with that exact string, so `strip_prefix` is a no-op there.
+/// `None`, or a preamble that isn't an exact prefix of `content`, is a
+/// no-op: the preamble is provider-only per-turn context that must never be
+/// persisted into durable/canonical history (trim write-back, session
+/// storage), only sent to the provider for the turn that recalled it.
+pub(crate) fn strip_memory_context_preamble<'a>(
+    content: &'a str,
+    preamble: Option<&str>,
+) -> &'a str {
+    preamble
+        .and_then(|p| content.strip_prefix(p))
+        .unwrap_or(content)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,6 +446,7 @@ mod tests {
         score: Option<f64>,
     ) -> MemoryEntry {
         MemoryEntry {
+            principal_id: None,
             id: key.to_string(),
             key: key.to_string(),
             content: content.to_string(),
@@ -654,6 +705,103 @@ mod tests {
 
     // ── renderer ──────────────────────────────────────────────────────────
 
+    #[test]
+    fn stored_on_takes_the_date_from_an_rfc3339_timestamp() {
+        assert_eq!(
+            stored_on("2026-09-01T16:35:55.123456789-04:00"),
+            Some("2026-09-01")
+        );
+        assert_eq!(stored_on("2026-09-01T00:00:00Z"), Some("2026-09-01"));
+    }
+
+    // A backend that stores something else renders the untagged line rather
+    // than a half-parsed date.
+    #[test]
+    fn stored_on_rejects_anything_not_shaped_like_a_date() {
+        assert_eq!(stored_on(""), None);
+        assert_eq!(stored_on("2026-09-0"), None);
+        assert_eq!(stored_on("yesterday!!"), None);
+        assert_eq!(stored_on("2026/09/01T00:00:00Z"), None);
+        assert_eq!(stored_on("20260901T00:00:00Z"), None);
+    }
+
+    // Multi-byte content must not panic the 10-byte prefix slice.
+    #[test]
+    fn stored_on_is_safe_on_a_non_ascii_timestamp() {
+        assert_eq!(stored_on("20261日01T00:00:00Z"), None);
+    }
+
+    #[tokio::test]
+    async fn an_entry_without_a_usable_timestamp_renders_untagged() {
+        let mut e = entry(
+            "user_preference",
+            "prefers concise answers",
+            MemoryCategory::Core,
+            Some(0.9),
+        );
+        e.timestamp = "not-a-timestamp".into();
+        let mem = FixtureMemory::with(vec![e]);
+        let observer = RecordingObserver::default();
+
+        let context = render_memory_context(
+            &mem,
+            &observer,
+            "how should I answer",
+            &[],
+            &MemoryInjectConfig::default(),
+            false,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
+        )
+        .await;
+
+        assert!(
+            context.contains("- user_preference: prefers concise answers"),
+            "unparseable timestamp must fall back to the untagged line, got: {context}"
+        );
+        assert!(!context.contains("[from"), "got: {context}");
+    }
+
+    #[tokio::test]
+    async fn the_date_stamp_gate_off_renders_untagged() {
+        let mem = FixtureMemory::with(vec![entry(
+            "user_preference",
+            "prefers concise answers",
+            MemoryCategory::Core,
+            Some(0.9),
+        )]);
+        let observer = RecordingObserver::default();
+
+        let context = render_memory_context(
+            &mem,
+            &observer,
+            "how should I answer",
+            &[],
+            &MemoryInjectConfig {
+                date_stamp: false,
+                ..Default::default()
+            },
+            false,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
+        )
+        .await;
+
+        assert!(
+            context.contains("- user_preference: prefers concise answers"),
+            "got: {context}"
+        );
+        assert!(!context.contains("[from"), "got: {context}");
+    }
+
     #[tokio::test]
     async fn renders_wrapped_block_and_emits_one_recall_event() {
         let mem = FixtureMemory::with(vec![entry(
@@ -681,7 +829,7 @@ mod tests {
         .await;
 
         assert!(context.starts_with(MEMORY_CONTEXT_OPEN));
-        assert!(context.contains("- user_preference: prefers concise answers"));
+        assert!(context.contains("user_preference: prefers concise answers"));
         assert!(context.ends_with(&format!("{MEMORY_CONTEXT_CLOSE}\n\n")));
         assert_eq!(observer.recalls.lock().as_slice(), &[(1, true)]);
     }
@@ -820,7 +968,7 @@ mod tests {
         .await;
 
         assert!(!context.contains("said hi earlier"));
-        assert!(context.contains("- fact: server is prod-3"));
+        assert!(context.contains("fact: server is prod-3"));
     }
 
     #[tokio::test]
@@ -862,7 +1010,7 @@ mod tests {
         assert!(!context.contains("transcript blob"));
         assert!(!context.contains("[IMAGE:"));
         assert!(!context.contains("<tool_result"));
-        assert!(context.contains("- keeper: real knowledge"));
+        assert!(context.contains("keeper: real knowledge"));
     }
 
     #[tokio::test]
@@ -895,8 +1043,8 @@ mod tests {
         .await;
 
         assert!(!context.contains("barely related"));
-        assert!(context.contains("- high: very related"));
-        assert!(context.contains("- unscored: keyword backend"));
+        assert!(context.contains("high: very related"));
+        assert!(context.contains("unscored: keyword backend"));
     }
 
     #[tokio::test]
@@ -928,8 +1076,8 @@ mod tests {
         .await;
 
         // Entry cap: 4 of the 5 render.
-        assert!(context.contains("- d: four"));
-        assert!(!context.contains("- e: five"));
+        assert!(context.contains("d: four"));
+        assert!(!context.contains("e: five"));
         // Per-entry cap: the 900-char content is ellipsis-truncated.
         assert!(context.contains("..."));
         assert!(!context.contains(&long));
@@ -965,9 +1113,9 @@ mod tests {
         )
         .await;
 
-        assert!(context.contains("- a: "));
-        assert!(context.contains("- b: "));
-        assert!(!context.contains("- c: "));
+        assert!(context.contains("] a: "));
+        assert!(context.contains("] b: "));
+        assert!(!context.contains("] c: "));
     }
 
     #[tokio::test]
@@ -1007,10 +1155,10 @@ mod tests {
         .await;
 
         // First scope wins the duplicate key; both uniques render; one event.
-        assert!(context.contains("- shared: from history scope"));
+        assert!(context.contains("shared: from history scope"));
         assert!(!context.contains("from sender scope"));
-        assert!(context.contains("- only_first: h"));
-        assert!(context.contains("- only_sender: s"));
+        assert!(context.contains("only_first: h"));
+        assert!(context.contains("only_sender: s"));
         assert_eq!(observer.recalls.lock().as_slice(), &[(3, true)]);
     }
 
@@ -1063,7 +1211,7 @@ mod tests {
         )
         .await;
 
-        assert!(first.contains("- fact: server is prod-3"));
+        assert!(first.contains("fact: server is prod-3"));
         assert_eq!(
             first, second,
             "direct backend recall must render identically"
@@ -1091,6 +1239,7 @@ mod tests {
         timestamp: chrono::DateTime<chrono::Utc>,
     ) -> MemoryEntry {
         MemoryEntry {
+            principal_id: None,
             timestamp: timestamp.to_rfc3339(),
             importance,
             ..entry(key, content, category, score)
@@ -1101,8 +1250,7 @@ mod tests {
     /// cannot distinguish the rerank arm), a Conversation entry, a stale
     /// scored entry old enough for time decay to drop it, and an autosave
     /// key the skip set filters on every arm. Recall order is fixture order.
-    fn golden_corpus() -> Vec<MemoryEntry> {
-        let now = chrono::Utc::now();
+    fn golden_corpus(now: chrono::DateTime<chrono::Utc>) -> Vec<MemoryEntry> {
         vec![
             scored_entry(
                 "alpha",
@@ -1193,38 +1341,45 @@ mod tests {
     // near-duplicate pair renders twice, recall order is preserved). Later
     // pipeline stages re-prove against these.
     const GOLDEN_FULL: &str = "[Memory context]\n\
-        - alpha: deploy target is prod-cluster-3\n\
-        - alpha_dup: deploy target is prod-cluster-3 for staging\n\
-        - beta: team standup moved to 0930\n\
-        - chat: user said hello\n\
+        - [from {today}] alpha: deploy target is prod-cluster-3\n\
+        - [from {today}] alpha_dup: deploy target is prod-cluster-3 for staging\n\
+        - [from {today}] beta: team standup moved to 0930\n\
+        - [from {today}] chat: user said hello\n\
         [/Memory context]\n\n";
     const GOLDEN_NO_CONVERSATION: &str = "[Memory context]\n\
-        - alpha: deploy target is prod-cluster-3\n\
-        - alpha_dup: deploy target is prod-cluster-3 for staging\n\
-        - beta: team standup moved to 0930\n\
+        - [from {today}] alpha: deploy target is prod-cluster-3\n\
+        - [from {today}] alpha_dup: deploy target is prod-cluster-3 for staging\n\
+        - [from {today}] beta: team standup moved to 0930\n\
         [/Memory context]\n\n";
-    const GOLDEN_TIGHT_BUDGET: &str = "[Memory context]\n\
-        - alpha: deploy target is prod-cluster-3\n\
-        - alpha_dup: deploy target is prod-cluster-3 for staging\n\
+    // Entry-count cap: unaffected by the date stamp.
+    const GOLDEN_TIGHT_ENTRY_BUDGET: &str = "[Memory context]\n\
+        - [from {today}] alpha: deploy target is prod-cluster-3\n\
+        - [from {today}] alpha_dup: deploy target is prod-cluster-3 for staging\n\
+        [/Memory context]\n\n";
+    // Character cap: the date stamp is charged to `max_total_chars` like any
+    // other part of the line, so the 100-char budget fits one entry where it
+    // fitted two; this golden pins that cost.
+    const GOLDEN_TIGHT_CHAR_BUDGET: &str = "[Memory context]\n\
+        - [from {today}] alpha: deploy target is prod-cluster-3\n\
         [/Memory context]\n\n";
     // Rerank arm on the same corpus: the blend re-sorts, MMR demotes the
     // near-duplicate to the tail, the trim drops the unscored Conversation
     // entry, and `stale` survives (the blend's recency factor replaces the
     // decay drop). Divergence from the flags-off goldens is the point.
     const GOLDEN_RERANK: &str = "[Memory context]\n\
-        - alpha: deploy target is prod-cluster-3\n\
-        - beta: team standup moved to 0930\n\
-        - stale: quarterly report workflow uses legacy tool\n\
-        - alpha_dup: deploy target is prod-cluster-3 for staging\n\
+        - [from {today}] alpha: deploy target is prod-cluster-3\n\
+        - [from {today}] beta: team standup moved to 0930\n\
+        - [from {stale}] stale: quarterly report workflow uses legacy tool\n\
+        - [from {today}] alpha_dup: deploy target is prod-cluster-3 for staging\n\
         [/Memory context]\n\n";
     // Conversation exclusion is an eligibility boundary, so it runs before
     // duplicate collapse and MMR. Once the ineligible rows are removed, this
     // fixture is below the advanced-strategy threshold and keeps blend order.
     const GOLDEN_RERANK_NO_CONVERSATION: &str = "[Memory context]\n\
-        - alpha: deploy target is prod-cluster-3\n\
-        - alpha_dup: deploy target is prod-cluster-3 for staging\n\
-        - beta: team standup moved to 0930\n\
-        - stale: quarterly report workflow uses legacy tool\n\
+        - [from {today}] alpha: deploy target is prod-cluster-3\n\
+        - [from {today}] alpha_dup: deploy target is prod-cluster-3 for staging\n\
+        - [from {today}] beta: team standup moved to 0930\n\
+        - [from {stale}] stale: quarterly report workflow uses legacy tool\n\
         [/Memory context]\n\n";
 
     #[tokio::test]
@@ -1302,7 +1457,7 @@ mod tests {
                     max_entries: 2,
                     ..flags_off
                 },
-                GOLDEN_TIGHT_BUDGET,
+                GOLDEN_TIGHT_ENTRY_BUDGET,
             ),
             (
                 "tight_total_char_budget",
@@ -1313,7 +1468,7 @@ mod tests {
                     max_total_chars: 100,
                     ..flags_off
                 },
-                GOLDEN_TIGHT_BUDGET,
+                GOLDEN_TIGHT_CHAR_BUDGET,
             ),
             (
                 "rerank_on_interactive",
@@ -1333,8 +1488,17 @@ mod tests {
             ),
         ];
 
+        // One clock for the fixture and the expectations, so the recall
+        // stamps cannot straddle a UTC midnight mid-test.
+        let now = chrono::Utc::now();
+        let today = now.format("%Y-%m-%d").to_string();
+        let stale = (now - chrono::Duration::days(60))
+            .format("%Y-%m-%d")
+            .to_string();
+
         for (name, origin, has_session, suppress, cfg, want) in cases {
-            let mem = FixtureMemory::with(golden_corpus());
+            let mem = FixtureMemory::with(golden_corpus(now));
+            let want = want.replace("{today}", &today).replace("{stale}", &stale);
             let got = render_for_origin(origin, has_session, suppress, &mem, &cfg).await;
             assert_eq!(got, want, "golden mismatch for case {name}");
         }
@@ -1391,9 +1555,9 @@ mod tests {
             },
         )
         .await;
-        assert!(context.contains("- a: "));
-        assert!(context.contains("- b: "));
-        assert!(context.contains("- c: "));
+        assert!(context.contains("] a: "));
+        assert!(context.contains("] b: "));
+        assert!(context.contains("] c: "));
 
         // Rerank on with a 2-slot trim: MMR demotes the near-duplicate below
         // the unrelated entry and the trim drops it.
@@ -1429,11 +1593,11 @@ mod tests {
             },
         )
         .await;
-        let a_pos = context.find("- a: ").expect("top entry renders");
-        let c_pos = context.find("- c: ").expect("diverse entry renders");
+        let a_pos = context.find("] a: ").expect("top entry renders");
+        let c_pos = context.find("] c: ").expect("diverse entry renders");
         assert!(a_pos < c_pos, "relevance leader stays first");
         assert!(
-            !context.contains("- b: "),
+            !context.contains("] b: "),
             "near-duplicate must be demoted out of the trimmed set"
         );
     }
@@ -1638,6 +1802,55 @@ mod tests {
         assert_eq!(cfg.candidate_multiplier, 1);
     }
 
+    #[test]
+    fn strip_memory_context_preamble_recovers_the_original_user_content() {
+        let existing = "what's the weather like";
+        let preamble =
+            format!("{MEMORY_CONTEXT_OPEN}\n- k: some recalled fact\n{MEMORY_CONTEXT_CLOSE}\n\n");
+        let with_preamble = format!("{preamble}{existing}");
+        assert_eq!(
+            strip_memory_context_preamble(&with_preamble, Some(&preamble)),
+            existing,
+            "must recover exactly the pre-injection user content"
+        );
+    }
+
+    #[test]
+    fn strip_memory_context_preamble_is_a_no_op_without_a_recorded_preamble() {
+        let plain = "no memory preamble here";
+        assert_eq!(strip_memory_context_preamble(plain, None), plain);
+
+        // A user message that happens to start with the marker text is left
+        // untouched when the caller never recorded injecting a preamble on
+        // it — provenance comes from the caller's own record, not the text.
+        let looks_like_a_preamble = format!(
+            "{MEMORY_CONTEXT_OPEN}\n- k: a user-authored fact\n{MEMORY_CONTEXT_CLOSE}\n\nplease keep this text"
+        );
+        assert_eq!(
+            strip_memory_context_preamble(&looks_like_a_preamble, None),
+            looks_like_a_preamble
+        );
+    }
+
+    #[test]
+    fn strip_memory_context_preamble_is_a_no_op_when_the_recorded_preamble_is_not_an_exact_prefix()
+    {
+        // A pre-injection clone of the message (the ordinary no-trim
+        // write-back path keeps one, separate from the buffer the injector
+        // actually mutated) never carries the preamble at all, even though a
+        // preamble was recorded for *some* message this turn. The exact
+        // string match, not a generic marker match, is what keeps this a
+        // no-op instead of chewing into unrelated content.
+        let clean = "short reply";
+        let unrelated_preamble = format!(
+            "{MEMORY_CONTEXT_OPEN}\n- k: some other turn's recalled fact\n{MEMORY_CONTEXT_CLOSE}\n\n"
+        );
+        assert_eq!(
+            strip_memory_context_preamble(clean, Some(&unrelated_preamble)),
+            clean
+        );
+    }
+
     /// Regression: a high-scoring but render-ineligible entry must not consume
     /// a final-selection slot. With a five-entry budget and five eligible facts
     /// plus one ineligible top-scored row, the pre-trim eligibility filter lets
@@ -1740,7 +1953,7 @@ mod tests {
             !context.contains("channel_history"),
             "ineligible row dropped"
         );
-        assert!(context.contains("- fact_e: epsilon elderberry"));
+        assert!(context.contains("fact_e: epsilon elderberry"));
     }
 
     /// Composed score-domain regression: current SQLite recall owns BM25
@@ -1818,10 +2031,10 @@ mod tests {
         .await;
 
         let best = context
-            .find("- best_match: ")
+            .find("best_match: ")
             .expect("the relevance leader survives the configured floor");
         let supporting = context
-            .find("- supporting_match: ")
+            .find("supporting_match: ")
             .expect("the weaker relevant entry survives the configured floor");
         assert!(best < supporting, "BM25 relevance order survives blending");
     }

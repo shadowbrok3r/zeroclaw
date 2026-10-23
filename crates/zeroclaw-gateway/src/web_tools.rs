@@ -132,8 +132,7 @@ mod tests {
     async fn fixture() -> (tempfile::TempDir, AppState, String) {
         let tmp = tempfile::tempdir().unwrap();
         let state = crate::tests::admin_paircode_state(&tmp, true, false);
-        {
-            let mut config = state.config.write();
+        state.publish_test_config(|config| {
             config.gateway.web_tools_enabled = true;
             config.web_search.enabled = true;
             config.web_fetch.enabled = true;
@@ -163,8 +162,11 @@ mod tests {
                     ..AliasedAgentConfig::default()
                 },
             );
-        }
-        let code = state.pairing.generate_new_pairing_code().unwrap();
+        });
+        let code = state
+            .pairing
+            .generate_new_pairing_code(crate::live_pairing_code_policy(&state))
+            .unwrap();
         let token = state
             .pairing
             .try_pair(&code, "web-test")
@@ -205,14 +207,14 @@ mod tests {
             request(&state, "wrong", "GET", "", Value::Null).await.0,
             StatusCode::UNAUTHORIZED
         );
-        state.config.write().gateway.web_tools_enabled = false;
+        state.publish_test_config(|c| c.gateway.web_tools_enabled = false);
         assert_eq!(
             request(&state, &token, "GET", "", Value::Null).await.0,
             StatusCode::NOT_FOUND
         );
         let tmp = tempfile::tempdir().unwrap();
         let anonymous = crate::tests::admin_paircode_state(&tmp, false, false);
-        anonymous.config.write().gateway.web_tools_enabled = true;
+        anonymous.publish_test_config(|c| c.gateway.web_tools_enabled = true);
         assert_eq!(
             request(&anonymous, "anything", "GET", "", Value::Null)
                 .await
@@ -227,13 +229,9 @@ mod tests {
         let (status, body) = request(&state, &token, "GET", "", Value::Null).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["tools"].as_array().unwrap().len(), 2);
-        state
-            .config
-            .write()
-            .risk_profiles
-            .get_mut("bridge")
-            .unwrap()
-            .excluded_tools = vec!["web_fetch".into()];
+        state.publish_test_config(|c| {
+            c.risk_profiles.get_mut("bridge").unwrap().excluded_tools = vec!["web_fetch".into()];
+        });
         let (_, body) = request(&state, &token, "GET", "", Value::Null).await;
         assert_eq!(body["tools"].as_array().unwrap().len(), 1);
         assert_eq!(body["tools"][0]["name"], "web_search_tool");
@@ -249,13 +247,9 @@ mod tests {
             .0,
             StatusCode::FORBIDDEN
         );
-        state
-            .config
-            .write()
-            .risk_profiles
-            .get_mut("bridge")
-            .unwrap()
-            .always_ask = vec!["web_search_tool".into()];
+        state.publish_test_config(|c| {
+            c.risk_profiles.get_mut("bridge").unwrap().always_ask = vec!["web_search_tool".into()];
+        });
         assert_eq!(
             request(&state, &token, "GET", "", Value::Null).await.1["tools"],
             json!([])
@@ -266,13 +260,9 @@ mod tests {
                 .0,
             StatusCode::BAD_REQUEST
         );
-        state
-            .config
-            .write()
-            .agents
-            .get_mut("research")
-            .unwrap()
-            .enabled = false;
+        state.publish_test_config(|c| {
+            c.agents.get_mut("research").unwrap().enabled = false;
+        });
         assert_eq!(
             request(
                 &state,
@@ -299,8 +289,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results":[
                 {"title":"Rust releases","url":"https://blog.rust-lang.org/","content":"Release notes"}
             ]}))).expect(1).mount(&server).await;
-        {
-            let mut config = state.config.write();
+        state.publish_test_config(|config| {
             config.web_search.search_provider = "searxng".into();
             config.web_search.searxng_instance_url = Some(server.uri());
             std::fs::write(
@@ -308,7 +297,7 @@ mod tests {
                 format!("[web_search]\nsearxng_instance_url = {:?}\n", server.uri()),
             )
             .unwrap();
-        }
+        });
         let args = json!({"query":"Rust releases"});
         let (status, first) =
             request(&state, &token, "POST", "/web_search_tool", args.clone()).await;
@@ -333,12 +322,11 @@ mod tests {
             "http://{}/api_key=fixture-search-secret",
             listener.local_addr().unwrap()
         );
-        let server = tokio::spawn(async move {
+        let server = zeroclaw_spawn::spawn!(async move {
             let (socket, _) = listener.accept().await.unwrap();
             drop(socket);
         });
-        {
-            let mut config = state.config.write();
+        state.publish_test_config(|config| {
             config.web_search.search_provider = "searxng".into();
             config.web_search.searxng_instance_url = Some(url.clone());
             std::fs::write(
@@ -346,7 +334,7 @@ mod tests {
                 format!("[web_search]\nsearxng_instance_url = {url:?}\n"),
             )
             .unwrap();
-        }
+        });
         let (status, body) = request(
             &state,
             &token,
@@ -360,7 +348,10 @@ mod tests {
         assert_eq!(body["success"], false, "{body}");
         for field in ["output", "error"] {
             let text = body[field].as_str().unwrap();
-            assert!(text.contains("[REDACTED]"), "{field}: {text}");
+            // Upstream v0.8.6 no longer reflects the request URL into the
+            // error at all (#11026, #11147), so there is nothing left to
+            // redact. The property that matters is that the credential never
+            // reaches either field.
             assert!(!text.contains("fixture-search-secret"), "{field}: {text}");
         }
     }

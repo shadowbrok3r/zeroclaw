@@ -14,6 +14,9 @@
 //!   which packages fine and then fails to compile from the tarball. Feature
 //!   gated ones are the dangerous case: `cargo publish --dry-run` verifies
 //!   default features only, so they pass preflight and ship broken
+//! * publish-order calculation hidden behind the dry-run return and fed the
+//!   full workspace metadata through argv, which exceeded Linux `ARG_MAX`
+//!   only after the irreversible job was approved
 
 use proc_macro2::{TokenStream, TokenTree};
 use std::collections::{BTreeMap, BTreeSet};
@@ -27,6 +30,13 @@ const ROOT_PACKAGE: &str = "zeroclaw";
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn repo_relative_key(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 struct Crate {
@@ -118,8 +128,8 @@ fn release_crates(crates: &[Crate]) -> BTreeSet<&str> {
         .collect()
 }
 
-/// Internal dependency edges that affect publish order. Dev-dependencies are
-/// excluded: cargo strips them when packaging, so a dev-only cycle is legal.
+/// The root's normal/build dependency closure. Versioned dev-dependencies also
+/// affect publishing; scripts/release/publish_order.py owns that full graph.
 fn internal_deps(krate: &Crate, workspace_names: &BTreeSet<String>) -> BTreeSet<String> {
     ["dependencies", "build-dependencies"]
         .iter()
@@ -377,6 +387,28 @@ fn root_package_is_the_installable_crate() {
         root.publishable,
         "the root package must remain publishable; `publish = false` here silently \
          removes ZeroClaw from crates.io"
+    );
+}
+
+#[test]
+fn publish_order_is_streamed_and_exercised_by_preflight() {
+    let script = fs::read_to_string(repo_root().join("scripts/release/publish-crates.sh"))
+        .expect("read crates.io publisher");
+
+    assert!(
+        !script.contains("python3 - \"$META\""),
+        "cargo metadata must not be passed as one argv entry; the full workspace exceeds ARG_MAX"
+    );
+
+    let order = script
+        .find("ORDER=\"$(python3 \"$SCRIPT_DIR/publish_order.py\" \"$VERSION\" <<<\"$META\"")
+        .expect("publisher streams metadata into its order helper");
+    let dry_run = script
+        .find("if [[ $EXECUTE -eq 0 ]]")
+        .expect("publisher has a tokenless dry-run branch");
+    assert!(
+        order < dry_run,
+        "tokenless preflight must compute publish order before returning"
     );
 }
 
@@ -667,6 +699,17 @@ const ESCAPE_EXCEPTIONS: &[(&str, &str)] = &[(
 )];
 
 #[test]
+fn repo_relative_key_normalizes_windows_separators() {
+    let root = Path::new("repository");
+    let source = root.join(r"crates\zeroclaw-gateway\src\static_files.rs");
+
+    assert_eq!(
+        repo_relative_key(&source, root),
+        "crates/zeroclaw-gateway/src/static_files.rs"
+    );
+}
+
+#[test]
 fn published_crates_never_include_files_outside_their_own_directory() {
     let mut violations = Vec::new();
     let crates = workspace_crates();
@@ -708,11 +751,7 @@ fn published_crates_never_include_files_outside_their_own_directory() {
                         .to_path_buf()
                 };
                 let resolved = normalize(&base, &include.path);
-                let rel = source_path
-                    .strip_prefix(repo_root())
-                    .unwrap_or(&source_path)
-                    .to_string_lossy()
-                    .into_owned();
+                let rel = repo_relative_key(&source_path, &repo_root());
                 let excepted = ESCAPE_EXCEPTIONS
                     .iter()
                     .any(|(f, p)| *f == rel && *p == include.path);
@@ -733,10 +772,7 @@ fn published_crates_never_include_files_outside_their_own_directory() {
                 if (!inside_crate || !shipped) && !excepted {
                     violations.push(format!(
                         "  {} ({})\n      includes `{}`\n      -> {}",
-                        source_path
-                            .strip_prefix(repo_root())
-                            .unwrap_or(&source_path)
-                            .display(),
+                        rel,
                         krate.name,
                         include.path,
                         resolved.display(),

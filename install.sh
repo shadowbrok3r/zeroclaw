@@ -264,14 +264,24 @@ detect_target_triple() {
     fi
     ;;
   Linux)
-    libc=$(detect_libc)
-    case "$arch" in
-    x86_64) echo "x86_64-unknown-linux-${libc}" ;;
-    aarch64 | arm64) echo "aarch64-unknown-linux-${libc}" ;;
-    armv7l) echo "armv7-unknown-linux-gnueabihf" ;;
-    armv6l | arm*) echo "arm-unknown-linux-gnueabihf" ;;
-    *) echo "" ;;
-    esac
+    if [ -n "${TERMUX_VERSION:-}" ] || [ -d /data/data/com.termux ]; then
+      case "$arch" in
+      aarch64 | arm64) echo "aarch64-linux-android" ;;
+      *)
+        printf "Unsupported Android architecture: %s (only aarch64/arm64 is supported)\n" "$arch" >&2
+        echo ""
+        ;;
+      esac
+    else
+      libc=$(detect_libc)
+      case "$arch" in
+      x86_64) echo "x86_64-unknown-linux-${libc}" ;;
+      aarch64 | arm64) echo "aarch64-unknown-linux-${libc}" ;;
+      armv7l) echo "armv7-unknown-linux-gnueabihf" ;;
+      armv6l | arm*) echo "arm-unknown-linux-gnueabihf" ;;
+      *) echo "" ;;
+      esac
+    fi
     ;;
   *) echo "" ;;
   esac
@@ -305,7 +315,7 @@ install_prebuilt() {
   printf "%s\n" "$(bold "Installing ZeroClaw ${version} (pre-built)")"
   info "Platform: $triple"
   info "Source:   $asset_url"
-  info "Channels: pre-built binaries ship the lean standard distribution set; availability is target-specific."
+  info "Channels: pre-built binaries ship the standard distribution channel set; availability is target-specific."
   info "Run 'zeroclaw channel list' to inspect this binary. For other channels such as Slack, build from source with --preset full."
   echo
 

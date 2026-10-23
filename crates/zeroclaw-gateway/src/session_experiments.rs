@@ -49,6 +49,7 @@ fn valid_name(name: &str) -> bool {
 }
 
 /// Fixed argument arrays; never a shell and never a caller-selected executable.
+#[allow(clippy::result_large_err)]
 async fn invoke(args: &[String]) -> Result<Value, Response> {
     let Some(exe) = std::env::var_os("ZEROCLAW_COMFY_EXPERIMENTS") else {
         return Err(error(
