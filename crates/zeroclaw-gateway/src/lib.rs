@@ -3,6 +3,11 @@
     clippy::useless_format,
     clippy::collapsible_if
 )]
+// Proving the `/ws/chat` socket future (`handle_socket`, which carries the
+// fork's turn hub and steering) `Send` through hyper/h2 exceeds the default
+// 128. The binary crate already runs at 256; a build of this crate under
+// another root (xtask `web`) otherwise fails with E0275 at `ws.on_upgrade`.
+#![recursion_limit = "256"]
 
 #[cfg(feature = "a2a")]
 pub mod a2a;

@@ -699,6 +699,7 @@ Conflicts concentrate in the shared files below.
 **New in this merge:**
 - `agent::run` passes a `HookRunner` when `hooks.enabled`. Upstream passes `None`, so cron, one-shot, CLI and sub-agent tool calls never reached `webhook_audit` or the critic.
 - `zeroclaw-runtime` sets `#![recursion_limit = "256"]`, because that HookRunner deepens the `cron_run` / `delegate` futures past the default `Send` proof depth.
+- `zeroclaw-gateway` sets `#![recursion_limit = "256"]` too: the `/ws/chat` `handle_socket` future overflows the default `Send` proof depth when the crate is built under a root without the limit (`cargo web build` failed with E0275 at `ws.on_upgrade`).
 
 **Silent mis-merges found and fixed:**
 - `approval/mod.rs`: git moved the fork's `shell_policy: None` into upstream's `for_new_turn` and dropped it from `derive_for_risk_profile`, with no conflict marker.
