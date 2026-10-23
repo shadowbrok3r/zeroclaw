@@ -9130,6 +9130,17 @@ pub struct ShellToolConfig {
     /// Maximum shell command execution time in seconds (default: 60).
     #[serde(default = "default_shell_tool_timeout_secs")]
     pub timeout_secs: u64,
+    /// Programs whose `[IMAGE:<absolute path>]` stdout lines are declared as
+    /// image attachments, so the model sees the image (default: none).
+    ///
+    /// Shell output is otherwise text only: a marker line in it is not loaded
+    /// for the model. List a program here when it is an image-producing CLI
+    /// the agent runs through `shell` and must be able to look at its output.
+    /// Matched by executable name in command position (`comfy-gen` matches
+    /// `comfy-gen ...` and `/usr/local/bin/comfy-gen ...`). Only whole marker
+    /// lines naming an existing absolute image file count, at most 8 per call.
+    #[serde(default)]
+    pub attachment_commands: Vec<String>,
 }
 
 fn default_shell_tool_timeout_secs() -> u64 {
@@ -9140,6 +9151,7 @@ impl Default for ShellToolConfig {
     fn default() -> Self {
         Self {
             timeout_secs: default_shell_tool_timeout_secs(),
+            attachment_commands: Vec::new(),
         }
     }
 }

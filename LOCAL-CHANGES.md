@@ -605,6 +605,27 @@ unchanged. `~/.zeroclaw/config.toml` relies on it (`zc-comfy`, `zc-curator`,
 | `crates/zeroclaw-providers/src/compatible.rs` | `resolved_extra_headers()` resolves the template; `http_client()` and `streaming_http_client()` use it. The three streaming entry points take `for_current_session()`, a clone with the headers resolved before the spawned stream task leaves the turn's task-local scope. Test: `session_headers_isolate_conversations_and_survive_streaming_tasks` (two sessions differ, one session keeps its id across a compacted streaming call, an unscoped call omits the header, literal headers pass through, the configured template is not mutated). |
 | `docs/book/src/providers/configuration.md` | The `{session_hash}` contract and an `x-litellm-session-id` example. |
 
+### Shell output of listed programs carries image attachments (`[shell_tool] attachment_commands`, runtime)
+
+Upstream #10938 stopped reading `[IMAGE:...]` lines in tool text: only tools that
+declare attachments put an image in front of the model, and `shell` declares none.
+An agent that renders through a CLI over `shell` and then inspects the render lost
+its sight of it. Ours adds `[shell_tool] attachment_commands`, empty by default
+(upstream behaviour). When a command runs a listed program in command position
+(after `NAME=value`, `env`/`nice`/`nohup`/`time`/`exec`/`command`/`timeout` and their
+flags and numeric arguments), each whole stdout line `[IMAGE:<absolute path>]`
+naming an existing png/jpg/jpeg/webp/gif/bmp file is declared as an image
+attachment; duplicates count once and more than 8 distinct images declare none
+(the listing rule of the pre-#10938 promotion). The marker text stays in the body,
+so a reply can still copy it for channel delivery. `~/.zeroclaw/config.toml` lists
+`comfy-gen`.
+
+| File | Why |
+|---|---|
+| `crates/zeroclaw-config/src/schema.rs` | `ShellToolConfig::attachment_commands`. |
+| `crates/zeroclaw-runtime/src/tools/shell.rs` | `with_attachment_commands`, `command_runs_listed_program`, `listed_program_image_attachments`. Tests: `listed_program_matches_in_command_position_only`, `listed_program_image_lines_become_attachments`, `listed_program_image_listing_declares_none`, `shell_declares_images_only_for_listed_programs`. |
+| `crates/zeroclaw-runtime/src/tools/mod.rs` | The registered `shell` tool takes the root config's list. |
+
 ### Documentation
 
 | File | Why |
@@ -726,6 +747,9 @@ Re-check these after every upstream merge; they are easy to silently lose:
   detectors; upstream's no-progress and ping-pong detectors trip on per-item calls.
 - **Rolling trace trim is chunked** (`rolling_high_water`) and stale trim temps are
   removed at init; upstream rewrites the file on every event past the cap.
+- **`shell` declares images for `[shell_tool] attachment_commands` programs.**
+  Upstream's shell output is text only (#10938). `shell_declares_images_only_for_listed_programs`
+  pins both sides.
 
 - **Gateway TTL sweep is `gw_`-scoped and hourly.** Upstream runs
   `cleanup_stale` once at startup and deletes stale rows of every family,
