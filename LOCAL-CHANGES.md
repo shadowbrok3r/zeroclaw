@@ -646,9 +646,71 @@ Conflicts concentrate in the shared files below.
 | `web/src/lib/ws.ts` | `adopt` flag | v0.8.5 moved session-id storage out of `ws.ts` into `web/src/lib/chatSessions.ts` (`getActiveSessionId` / `setActiveSessionId`) and made `sessionId` a required `WebSocketClientOptions` field. Keep only `adopt` here; repoint any `setSessionId` importer at `chatSessions`. |
 | `src/main.rs` | `sessions` subcommand arm | Keep both arms; upstream adds subcommands in the same match. |
 
+## v0.8.6 merge record (2026-10-23)
+
+`v0.8.6` (`c47322131`, 576 commits) merged into `main` at `860268793`: 40 files conflicted.
+
+**Superseded by upstream** (resolved toward upstream):
+- `66f4d6d993` → #10538. Upstream's `client_gone` / `detach_mid_turn`; the fork's 5 s stalled-write detach is kept.
+- `bb25160b01` → upstream's `session_queue.generation()` / `PersistedWatermark`. The hub's finished-turn count is retired.
+- `d377d6bc14` / `1e01dfc6d3` → `TurnStop{LoopDetector|IdenticalOutput|MaxIterations}`.
+- `30688df629` runtime half → #11617 / #11725 / #11181.
+
+**Re-ported onto upstream's shape:**
+- Turn-hub replay with parked approvals (`7d80609b4b`).
+- Unread steering, chained or refused (gateway half of `30688df629`).
+- Tool context across reconnects (`c06ca51976`, `21cdc2d564`); seeding now lives in `restore_agent_history`.
+- Cron `on_failure` (`1e82289e88`), `app.<alias>` / `cron_result` (`61b879223b`) and the gate (`0394f8afd5`, `f076d7b557`), rebuilt on `CronDeliveryOutcome` / `DeliveryDisposition` and admission.
+- `SummaryThenStop` via `StoppedTurnOutput`.
+- Stream-guard bracket prose (`5e0223ab0e`) as step 9 of `evaluate_pending`.
+- Loop-detector same-call keying (`a73fd57a80`) over upstream's Block cap.
+- Shell-approval escalation (`26120e6e8b`, `34df5789e7`, `f1e815668f`) interleaved with upstream's Windows path check.
+- Critic hook (`95cc7bb502`, `4aa4a21287`) on `HookRunner::from_root_config`, plus delegate `sub_hooks`.
+- `compatible.rs` truncation notice, empty-turn resample and `{session_hash}` headers (`d98fed2775`, `a7fca88b03`, `66bd57418a`).
+- Web-tools helper (`7460214d33`), now sharing the registry's constructors.
+
+**Kept as is:**
+- `892cd610c8` (exact-name MCP admission).
+- `8fe9bf02ea` (rolling trim; upstream's `rolling` still rewrites per append).
+- The session set, now with **both** owner columns.
+- `/api/complete`, experiment rating, render delivery, memory corrections / clear scoping, the `cc_` family.
+
+**New in this merge:**
+- `agent::run` passes a `HookRunner` when `hooks.enabled`. Upstream passes `None`, so cron, one-shot, CLI and sub-agent tool calls never reached `webhook_audit` or the critic.
+- `zeroclaw-runtime` sets `#![recursion_limit = "256"]`, because that HookRunner deepens the `cron_run` / `delegate` futures past the default `Send` proof depth.
+
+**Silent mis-merges found and fixed:**
+- `approval/mod.rs`: git moved the fork's `shell_policy: None` into upstream's `for_new_turn` and dropped it from `derive_for_risk_profile`, with no conflict marker.
+- Test literals missing fork fields (`GatewayConfig.web_tools_enabled`).
+- Fork tests using the removed `config.write()` and the 2-arg `PairingGuard::new`.
+
+**Validation:**
+- `cargo +1.98.0 clippy --workspace --exclude zeroclaw-desktop --all-targets --features tools-compat -- -D warnings` is clean. 1.98.0 is upstream CI's pin; 1.99's new lints fire only on upstream-identical code.
+- `cargo fmt --check` is clean except upstream's own `tests/architecture/release_workflow.rs`.
+- Tests ran on 1.99.1 with an isolated `HOME`. **Never run the fork's tests with the real HOME:** they create fixture agents in the live `~/.zeroclaw`.
+- `zeroclaw-desktop` needs GTK dev libraries and is excluded on headless hosts.
+- Build production binaries with ≥1.98.1: 1.98.0 has the P-critical vtable miscompile (rust-lang/rust#161441).
+
+**Open follow-ups:**
+- `run_approval_manager` (`loop_.rs`) and the turn-level managers attach no shell policy. Pre-existing on fork `main`; it only matters for profiles with an `approval_route`.
+- The structured non-streaming `chat` path in `compatible.rs` lacks the truncation notice and resample.
+- The native dispatcher still uses `normalize_tool_arguments` rather than upstream's schema-aware `recover_structured_arguments`.
+- `TurnHub::turns_finished` is unused.
+- Stale doc comments: `turn/knobs.rs:16`, the schema doc for `loop_detection_no_progress_min_calls`, and the `__` auto-admit wording in `tool_search.rs` tests and `schema.rs`.
+
 ## Behavior deltas vs upstream
 
 Re-check these after every upstream merge; they are easy to silently lose:
+
+- **The WS chat path persists by append, not by whole-transcript rewrite.**
+  - `persist_turn` → `append_turn` + `retain_tool_context_turns` is the post-turn writer.
+  - Upstream's #9713 rewrite (`replace_conversation_state_if_exists` / `rewrite_messages_on`) deletes all of a session's tool context. Using it per turn would wipe tool context on every reconnect.
+  - The stored transcript is therefore not trimmed to the agent window.
+  - Pinned by `websocket_connect_trims_a_restored_history_without_rewriting_the_store`.
+- **Approvals stay parked in the TurnHub when the viewer leaves.** `detach_mid_turn` logs only; upstream denies them as "unreachable operator".
+- **Session metadata carries both owners.** Upstream's `principal_id` and the fork's `origin_principal`, each with an idempotent migration. The resume guard and device scoping read `origin_principal`.
+- **`ApprovalManager::for_new_turn` keeps the shell policy; `derive_for_risk_profile` drops it.** Git swapped these silently in the v0.8.6 merge. If channel turns lose the policy, an auto-approved shell call reaches the policy as approved with nothing to escalate against.
+- **Cron hooks.** `agent::run` builds `HookRunner::from_config_for_agent(&config, alias)`, which is `from_root_config` plus the agent-scoped critic.
 
 - **`allowed_tools` has no MCP exception.** A merge that brings back
   `|| name.contains("__")` in `ToolAccessPolicy::is_tool_allowed` or

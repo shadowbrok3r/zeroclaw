@@ -230,8 +230,8 @@ impl Tool for SkillShellTool {
 
         match result {
             Ok(Ok(output)) => {
-                let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let mut stdout = super::shell_output::decode_shell_output(&output.stdout);
+                let mut stderr = super::shell_output::decode_shell_output(&output.stderr);
 
                 if stdout.len() > MAX_OUTPUT_BYTES {
                     let mut b = MAX_OUTPUT_BYTES.min(stdout.len());
@@ -291,6 +291,31 @@ pub struct SkillBuiltinTool {
     advertised_schema: Arc<serde_json::Value>,
 }
 
+/// Assembly-local identity of the one pipeline that has not been shared yet.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SlotId(pub(crate) usize);
+
+pub(crate) enum TargetRef {
+    Existing(Arc<dyn Tool>),
+    Pipeline(SlotId),
+}
+
+/// Constructor metadata only: this cannot execute or escape as a `Tool`.
+pub(crate) struct PreparedSkillBuiltin {
+    pub(crate) tool_name: String,
+    tool_description: String,
+    locked_args: serde_json::Map<String, serde_json::Value>,
+    advertised_schema: Arc<serde_json::Value>,
+}
+
+pub(crate) enum PreparedSkill {
+    Ready(Box<dyn Tool>),
+    Elevated {
+        prepared: PreparedSkillBuiltin,
+        target: TargetRef,
+    },
+}
+
 impl SkillBuiltinTool {
     pub fn new(
         skill_name: &str,
@@ -298,17 +323,69 @@ impl SkillBuiltinTool {
         target_tool: Arc<dyn zeroclaw_api::tool::Tool>,
         locked_args: HashMap<String, String>,
     ) -> Self {
+        PreparedSkillBuiltin::prepare(skill_name, tool, locked_args, target_tool.as_ref())
+            .bind(target_tool)
+    }
+}
+
+impl PreparedSkillBuiltin {
+    pub(crate) fn prepare(
+        skill_name: &str,
+        tool: &crate::skills::SkillTool,
+        locked_args: HashMap<String, String>,
+        target: &dyn Tool,
+    ) -> Self {
         let locked: serde_json::Map<String, serde_json::Value> = locked_args
             .into_iter()
             .map(|(k, v)| (k, serde_json::Value::String(v)))
             .collect();
-        let advertised_schema = Arc::new(narrow_schema(target_tool.parameters_schema(), &locked));
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        crate::tools::late_tool_search_observer::record(
+            "skill-schema-enter",
+            "prepare",
+            crate::tools::late_tool_search_observer::borrowed_id(target),
+            0,
+        );
+        let advertised_schema = Arc::new(narrow_schema(target.parameters_schema(), &locked));
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        crate::tools::late_tool_search_observer::record(
+            "skill-schema-return",
+            "prepare",
+            crate::tools::late_tool_search_observer::borrowed_id(target),
+            crate::tools::late_tool_search_observer::arc_id(&advertised_schema),
+        );
         Self {
             tool_name: composed_tool_name(skill_name, &tool.name),
             tool_description: tool.description.clone(),
-            target_tool,
             locked_args: locked,
             advertised_schema,
+        }
+    }
+
+    pub(crate) fn bind(self, target_tool: Arc<dyn Tool>) -> SkillBuiltinTool {
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        crate::tools::late_tool_search_observer::record(
+            "skill-bind",
+            &self.tool_name,
+            crate::tools::late_tool_search_observer::arc_id(&target_tool),
+            crate::tools::late_tool_search_observer::arc_id(&self.advertised_schema),
+        );
+        SkillBuiltinTool {
+            tool_name: self.tool_name,
+            tool_description: self.tool_description,
+            target_tool,
+            locked_args: self.locked_args,
+            advertised_schema: self.advertised_schema,
+        }
+    }
+
+    pub(crate) fn spec(&self) -> zeroclaw_api::tool::ToolSpec {
+        zeroclaw_api::tool::ToolSpec {
+            name: self.tool_name.clone(),
+            description: self.tool_description.clone(),
+            parameters: Arc::clone(&self.advertised_schema),
+            output: None,
+            param_domains: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -358,6 +435,10 @@ fn narrow_schema(
 
 #[async_trait]
 impl Tool for SkillBuiltinTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        self.target_tool.requires_unrestricted_principal()
+    }
+
     fn name(&self) -> &str {
         &self.tool_name
     }
@@ -384,6 +465,18 @@ impl Tool for SkillBuiltinTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.execute_with_context(
+            args,
+            &zeroclaw_api::tool::ToolExecutionContext::current().unwrap_or_default(),
+        )
+        .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: &zeroclaw_api::tool::ToolExecutionContext,
+    ) -> anyhow::Result<ToolResult> {
         // Audit: elevated skill tools delegate to a target that may be blocked
         // by SecurityPolicy or hidden from the model. Record every invocation
         // at INFO with the delegation target and the locked scope keys.
@@ -399,7 +492,7 @@ impl Tool for SkillBuiltinTool {
             "skill-scoped elevated tool invoked"
         );
         let merged = merge_locked_args(&self.locked_args, args);
-        self.target_tool.execute(merged).await
+        self.target_tool.execute_with_context(merged, context).await
     }
 }
 
@@ -617,6 +710,80 @@ mod tests {
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("hello-skill"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn skill_shell_preserves_inherited_powershell_cache_path() {
+        const CHILD: &str = "ZEROCLAW_SKILL_CACHE_TEST_CHILD";
+        const KEY: &str = "PSModuleAnalysisCachePath";
+        const VALUE: &str = r"C:\synthetic cache\ModuleAnalysisCache";
+
+        if let Ok(case) = std::env::var(CHILD) {
+            let expected = match case.as_str() {
+                "present" => Some(VALUE),
+                "absent" => None,
+                _ => panic!("unknown cache forwarding test case"),
+            };
+            assert_eq!(std::env::var(KEY).ok().as_deref(), expected);
+            let workspace = tempfile::tempdir().unwrap();
+            let security = Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Supervised,
+                workspace_dir: workspace.path().to_path_buf(),
+                allowed_commands: vec!["set".into()],
+                ..SecurityPolicy::default()
+            });
+            let skill = SkillTool {
+                name: "cache_probe".into(),
+                description: "Read the inherited cache variable".into(),
+                kind: "shell".into(),
+                command: format!("set {KEY}"),
+                args: HashMap::new(),
+                target: None,
+                locked_args: HashMap::new(),
+                timeout_secs: None,
+            };
+            let tool = SkillShellTool::new_with_runtime(
+                "test",
+                &skill,
+                security,
+                Arc::new(NativeRuntime::with_shell("cmd".into())),
+            );
+            let result = tool.execute(serde_json::json!({})).await.unwrap();
+            if let Some(value) = expected {
+                assert!(result.success, "{:?}", result.error);
+                assert_eq!(result.output.trim(), format!("{KEY}={value}"));
+            } else {
+                assert!(!result.success);
+                assert!(result.output.trim().is_empty());
+                assert!(result.error.as_deref().unwrap_or_default().contains(KEY));
+            }
+            return;
+        }
+
+        // Each case gets its own inherited environment, without racing other tests.
+        for case in ["present", "absent"] {
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+            child.args([
+                "--exact",
+                "tools::skill_tool::tests::skill_shell_preserves_inherited_powershell_cache_path",
+            ]).env(CHILD, case).kill_on_drop(true);
+            if case == "present" {
+                child.env(KEY, VALUE);
+            } else {
+                child.env_remove(KEY);
+            }
+            let output = tokio::time::timeout(Duration::from_secs(120), child.output())
+                .await
+                .expect("isolated cache test timed out")
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{case}: {stdout}");
+            assert!(
+                stdout.contains("1 passed;"),
+                "exact child test was not executed: {stdout}"
+            );
+        }
     }
 
     #[cfg(windows)]

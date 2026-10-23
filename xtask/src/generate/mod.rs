@@ -1,7 +1,7 @@
-//! `cargo generate installers` - render install surfaces from canonical route
-//! semantics and deterministic renderer bodies. The spec owns route policy;
-//! renderers own generated surface content; content outside generated zones is
-//! hand-authored. Every tracked surface is registered below and drift-checked.
+//! Maintainer surface generation. `cargo generate installers` renders install
+//! surfaces from canonical route semantics; `cargo generate review-docs`
+//! materializes repeated PR-review policy. Typed specs own policy, renderers
+//! own generated content, and text outside generated zones stays hand-authored.
 
 pub mod container;
 pub mod container_base;
@@ -10,6 +10,8 @@ pub mod docs;
 pub mod flake;
 pub mod install_sh;
 pub mod packaging;
+pub mod release;
+pub mod review_docs;
 pub mod runtime_locales;
 pub mod setup_bat;
 pub mod sop_syntax;
@@ -106,6 +108,14 @@ fn registry() -> Vec<Surface> {
             file: "Dockerfile.alpine",
             render: |root, cur| render_docker_arg(root, cur),
         },
+        // Base-image pins only: the relay builds `-p zerorelay` with no feature
+        // selection, so it carries no `docker-features-arg` zone and must not go
+        // through `render_docker_arg`.
+        Surface {
+            name: "dockerfile-zerorelay",
+            file: "apps/zerorelay/Dockerfile",
+            render: |root, cur| container_base::splice_zones(root, cur),
+        },
         Surface {
             name: "pkgbuild",
             file: "dist/aur/PKGBUILD",
@@ -127,6 +137,11 @@ fn registry() -> Vec<Surface> {
             render: |root, cur| flake::render_file(root, cur),
         },
         Surface {
+            name: "release-distributions",
+            file: ".github/workflows/release-stable-manual.yml",
+            render: release::render_file,
+        },
+        Surface {
             name: "docker-tags",
             file: "dev/ci/docker-tags.toml",
             render: |root, cur| docker_tags::render_file(root, cur),
@@ -139,7 +154,7 @@ fn registry() -> Vec<Surface> {
     ]
 }
 
-/// Dockerfile-family ARG default: ships the lean standard Dist selection,
+/// Dockerfile-family ARG default: ships the standard Dist selection,
 /// build-time overridable via --build-arg.
 fn render_docker_arg(root: &Path, current: &str) -> anyhow::Result<String> {
     let body = container::render_features_arg(root, &Sel::Dist)?;
@@ -147,8 +162,8 @@ fn render_docker_arg(root: &Path, current: &str) -> anyhow::Result<String> {
     container_base::splice_zones(root, &spliced)
 }
 
-/// Containerfile surface: standard image ships lean Dist; fat image ships All
-/// (kitchen sink). Selections, not literals.
+/// Containerfile surface: standard image ships Dist for minimal/full tools;
+/// fat image ships All (kitchen sink). Selections, not literals.
 fn containerfile_surface() -> ContainerSurface {
     ContainerSurface {
         file: "Containerfile",

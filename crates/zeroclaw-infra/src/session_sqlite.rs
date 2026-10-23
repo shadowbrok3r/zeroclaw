@@ -172,9 +172,24 @@ impl SqliteSessionBackend {
                 "sender_id",
                 "ALTER TABLE session_metadata ADD COLUMN sender_id TEXT",
             ),
+            // Two owner columns, kept apart on purpose: `origin_principal`
+            // is the fork's paired-device owner (`device:<hash>`, first
+            // writer wins) and was added by v0.8.5-fork builds, so existing
+            // databases already carry it; `principal_id` is upstream's
+            // OIDC/RPC owner (v0.8.6). Each ALTER runs only when its column
+            // is missing, so the order is free and every open is idempotent
+            // on a fork DB, an upstream DB, or a fresh one.
             (
                 "origin_principal",
                 "ALTER TABLE session_metadata ADD COLUMN origin_principal TEXT",
+            ),
+            (
+                "trim_breadcrumb",
+                "ALTER TABLE session_metadata ADD COLUMN trim_breadcrumb INTEGER",
+            ),
+            (
+                "principal_id",
+                "ALTER TABLE session_metadata ADD COLUMN principal_id TEXT",
             ),
         ] {
             Self::ensure_metadata_column(&conn, column, ddl)?;
@@ -199,6 +214,11 @@ impl SqliteSessionBackend {
                 "idx_session_metadata_sender_id",
                 "CREATE INDEX IF NOT EXISTS idx_session_metadata_sender_id \
                  ON session_metadata(sender_id)",
+            ),
+            (
+                "idx_session_metadata_principal_id",
+                "CREATE INDEX IF NOT EXISTS idx_session_metadata_principal_id \
+                 ON session_metadata(principal_id)",
             ),
         ] {
             conn.execute(ddl, [])
@@ -256,6 +276,44 @@ impl SqliteSessionBackend {
             "DELETE FROM session_tool_context WHERE session_key = ?1",
             params![session_key],
         )
+    }
+
+    fn rewrite_messages_on(
+        conn: &Connection,
+        session_key: &str,
+        messages: &[ChatMessage],
+    ) -> rusqlite::Result<()> {
+        conn.execute(
+            "DELETE FROM sessions WHERE session_key = ?1",
+            params![session_key],
+        )?;
+        // Tool context is anchored to the ids of the rows just deleted; the
+        // rewritten rows get fresh ids, so it could never be placed again.
+        Self::delete_tool_context_on(conn, session_key)?;
+        let now = Utc::now().to_rfc3339();
+        for message in messages {
+            Self::append_on(conn, session_key, message, &now)?;
+        }
+        conn.execute(
+            "UPDATE session_metadata SET message_count = ?2 WHERE session_key = ?1",
+            params![session_key, messages.len() as i64],
+        )?;
+        Ok(())
+    }
+
+    fn set_session_trim_breadcrumb_on(
+        conn: &Connection,
+        session_key: &str,
+        present: bool,
+    ) -> rusqlite::Result<()> {
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, trim_breadcrumb)
+             VALUES (?1, ?2, ?3, 0, ?4)
+             ON CONFLICT(session_key) DO UPDATE SET trim_breadcrumb = excluded.trim_breadcrumb",
+            params![session_key, now, now, i64::from(present)],
+        )?;
+        Ok(())
     }
 
     fn source_fingerprint(path: &Path, name: &str) -> Result<(String, i64)> {
@@ -702,11 +760,42 @@ impl SqliteSessionBackend {
                 if inserted == 0 && has_non_whitespace_source {
                     bail!("JSONL session {name} contains no valid messages to import");
                 }
+                // Carry the JSONL sidecar's explicit breadcrumb provenance
+                // into the same transaction as the messages it describes,
+                // so a backend switch cannot drop a recorded `true`/`false`
+                // and let a later restore fall back to inferring ownership
+                // from message text.
+                // Only an exact one-byte `b"0"` or `b"1"` is a verified
+                // reading, matching `SessionStore::get_trim_breadcrumb`: any
+                // other content (empty, truncated, extra bytes) is
+                // corruption, not a legitimate `false`, and importing it as
+                // one would let the migrated session mark an untrimmed
+                // transcript as trim-clean.
+                let trim_breadcrumb =
+                    match std::fs::read(sessions_dir.join(format!("{key}.trim_breadcrumb"))) {
+                        Ok(bytes) => match bytes.as_slice() {
+                            [b'0'] => Some(false),
+                            [b'1'] => Some(true),
+                            _ => {
+                                bail!(
+                                    "corrupt trim breadcrumb sidecar for JSONL session {name}: \
+                                     expected a single b'0' or b'1' byte, got {} byte(s)",
+                                    bytes.len()
+                                );
+                            }
+                        },
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(e) => {
+                            return Err(anyhow::Error::new(e).context(format!(
+                                "Failed to read trim breadcrumb sidecar for JSONL session {name}"
+                            )));
+                        }
+                    };
                 tx.execute(
                     "INSERT INTO session_metadata \
-                     (session_key, created_at, last_activity, message_count) \
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![key, now, now, inserted],
+                     (session_key, created_at, last_activity, message_count, trim_breadcrumb) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![key, now, now, inserted, trim_breadcrumb.map(i64::from)],
                 )
                 .with_context(|| format!("Failed to record metadata for JSONL session {name}"))?;
                 tx.execute(
@@ -976,13 +1065,12 @@ impl SessionBackend for SqliteSessionBackend {
                     | ConversationMessage::ToolResults(_)),
                 ) = serde_json::from_str::<ConversationMessage>(&serialized)
                 {
-                    tool_context
-                        .entry(after_id)
-                        .or_default()
-                        .push(TimestampedConversationMessage {
+                    tool_context.entry(after_id).or_default().push(
+                        TimestampedConversationMessage {
                             message,
                             created_at: stamp(created_at),
-                        });
+                        },
+                    );
                 }
             }
         }
@@ -1028,6 +1116,72 @@ impl SessionBackend for SqliteSessionBackend {
             params![session_key, floor],
         )
         .map_err(std::io::Error::other)
+    }
+
+    fn rewrite_messages(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(std::io::Error::other)?;
+        Self::rewrite_messages_on(&tx, session_key, messages).map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
+    /// Replace the transcript and the breadcrumb flag in one transaction, so
+    /// the pair can never commit as a partial write: a crash or error
+    /// between the two rolls the whole transaction back rather than leaving
+    /// a new transcript paired with a stale flag (or vice versa). The
+    /// default `SessionBackend::replace_conversation_state` performs these
+    /// as two separate committed operations; this override replaces it for
+    /// SQLite where a single transaction can make the pair atomic.
+    fn replace_conversation_state(
+        &self,
+        session_key: &str,
+        messages: &[ChatMessage],
+        breadcrumb_present: bool,
+    ) -> std::io::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(std::io::Error::other)?;
+        Self::rewrite_messages_on(&tx, session_key, messages).map_err(std::io::Error::other)?;
+        Self::set_session_trim_breadcrumb_on(&tx, session_key, breadcrumb_present)
+            .map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
+    /// Existence-guarded replacement in one transaction: when the metadata
+    /// row is gone (a concurrent delete won), return `Ok(false)` without
+    /// writing anything, so a completed turn can never recreate a session
+    /// the user just deleted. The plain `replace_conversation_state`
+    /// breadcrumb upsert would `INSERT` a fresh metadata row here.
+    /// `delete_session` holds the same connection mutex, so the existence
+    /// probe and both writes are atomic with respect to it. A genuine query
+    /// failure (anything other than "no such row") is still an error, not a
+    /// silent skip: only a missing row means "deleted".
+    fn replace_conversation_state_if_exists(
+        &self,
+        session_key: &str,
+        messages: &[ChatMessage],
+        breadcrumb_present: bool,
+    ) -> std::io::Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(std::io::Error::other)?;
+        let exists = tx
+            .query_row(
+                "SELECT 1 FROM session_metadata WHERE session_key = ?1 LIMIT 1",
+                params![session_key],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?
+            .is_some();
+        if !exists {
+            return Ok(false);
+        }
+        Self::rewrite_messages_on(&tx, session_key, messages).map_err(std::io::Error::other)?;
+        Self::set_session_trim_breadcrumb_on(&tx, session_key, breadcrumb_present)
+            .map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(true)
     }
 
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
@@ -1122,7 +1276,7 @@ impl SessionBackend for SqliteSessionBackend {
     fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(
-            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, origin_principal
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, principal_id, origin_principal
              FROM session_metadata ORDER BY last_activity DESC",
         ) {
             Ok(s) => s,
@@ -1139,7 +1293,8 @@ impl SessionBackend for SqliteSessionBackend {
             let channel_id: Option<String> = row.get(6)?;
             let room_id: Option<String> = row.get(7)?;
             let sender_id: Option<String> = row.get(8)?;
-            let origin_principal: Option<String> = row.get(9)?;
+            let principal_id: Option<String> = row.get(9)?;
+            let origin_principal: Option<String> = row.get(10)?;
 
             let created = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
@@ -1159,6 +1314,7 @@ impl SessionBackend for SqliteSessionBackend {
                 channel_id,
                 room_id,
                 sender_id,
+                principal_id,
                 origin_principal,
             })
         }) {
@@ -1259,13 +1415,15 @@ impl SessionBackend for SqliteSessionBackend {
         let count = conn.changes() as usize;
         Self::delete_tool_context_on(&conn, session_key).map_err(std::io::Error::other)?;
 
-        if count > 0 {
-            conn.execute(
-                "UPDATE session_metadata SET message_count = 0, last_activity = ?1 WHERE session_key = ?2",
-                params![Utc::now().to_rfc3339(), session_key],
-            )
-            .map_err(std::io::Error::other)?;
-        }
+        // Reset trim_breadcrumb to NULL (unrecorded) regardless of whether
+        // any rows were deleted: a reset transcript has no synthetic marker,
+        // and a stale recorded `true` on an already-empty session must not
+        // survive to misclassify the next first message.
+        conn.execute(
+            "UPDATE session_metadata SET message_count = 0, last_activity = ?1, trim_breadcrumb = NULL WHERE session_key = ?2",
+            params![Utc::now().to_rfc3339(), session_key],
+        )
+        .map_err(std::io::Error::other)?;
 
         Ok(count)
     }
@@ -1345,6 +1503,35 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(true)
     }
 
+    fn delete_session_owned(
+        &self,
+        session_key: &str,
+        owner_principal_id: &str,
+    ) -> std::io::Result<bool> {
+        let conn = self.conn.lock();
+        // The predicated metadata delete IS the ownership check: zero rows
+        // means not-owned (or missing) and nothing else is touched.
+        let owned_rows = conn
+            .execute(
+                "DELETE FROM session_metadata WHERE session_key = ?1 AND principal_id = ?2",
+                params![session_key, owner_principal_id],
+            )
+            .map_err(std::io::Error::other)?;
+        if owned_rows == 0 {
+            return Ok(false);
+        }
+        // Ownership proven and consumed; clean up the message rows (the
+        // FTS5 trigger handles sessions_fts) and the tool context placed
+        // after them.
+        conn.execute(
+            "DELETE FROM sessions WHERE session_key = ?1",
+            params![session_key],
+        )
+        .map_err(std::io::Error::other)?;
+        Self::delete_tool_context_on(&conn, session_key).map_err(std::io::Error::other)?;
+        Ok(true)
+    }
+
     fn clear_agent_attribution(&self, agent_alias: &str) -> std::io::Result<usize> {
         let conn = self.conn.lock();
         let rows = conn
@@ -1415,7 +1602,7 @@ impl SessionBackend for SqliteSessionBackend {
     fn get_session_metadata(&self, session_key: &str) -> Option<SessionMetadata> {
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, origin_principal
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, principal_id, origin_principal
              FROM session_metadata WHERE session_key = ?1",
             params![session_key],
             |row| {
@@ -1428,7 +1615,8 @@ impl SessionBackend for SqliteSessionBackend {
                 let channel_id: Option<String> = row.get(6)?;
                 let room_id: Option<String> = row.get(7)?;
                 let sender_id: Option<String> = row.get(8)?;
-                let origin_principal: Option<String> = row.get(9)?;
+                let principal_id: Option<String> = row.get(9)?;
+                let origin_principal: Option<String> = row.get(10)?;
 
                 let created = DateTime::parse_from_rfc3339(&created_str)
                     .map(|dt| dt.with_timezone(&Utc))
@@ -1448,6 +1636,7 @@ impl SessionBackend for SqliteSessionBackend {
                     channel_id,
                     room_id,
                     sender_id,
+                    principal_id,
                     origin_principal,
                 })
             },
@@ -1541,7 +1730,7 @@ impl SessionBackend for SqliteSessionBackend {
     fn list_running_sessions(&self) -> Vec<SessionMetadata> {
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(
-            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, origin_principal
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, principal_id, origin_principal
              FROM session_metadata WHERE state = 'running' ORDER BY turn_started_at DESC",
         ) {
             Ok(s) => s,
@@ -1558,7 +1747,8 @@ impl SessionBackend for SqliteSessionBackend {
             let channel_id: Option<String> = row.get(6)?;
             let room_id: Option<String> = row.get(7)?;
             let sender_id: Option<String> = row.get(8)?;
-            let origin_principal: Option<String> = row.get(9)?;
+            let principal_id: Option<String> = row.get(9)?;
+            let origin_principal: Option<String> = row.get(10)?;
             let created = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
@@ -1576,6 +1766,7 @@ impl SessionBackend for SqliteSessionBackend {
                 channel_id,
                 room_id,
                 sender_id,
+                principal_id,
                 origin_principal,
             })
         }) {
@@ -1631,7 +1822,7 @@ impl SessionBackend for SqliteSessionBackend {
         #[allow(clippy::cast_possible_wrap)]
         let cutoff = (Utc::now() - chrono::Duration::seconds(threshold_secs as i64)).to_rfc3339();
         let mut stmt = match conn.prepare(
-            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, origin_principal
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, principal_id, origin_principal
              FROM session_metadata
              WHERE state = 'running' AND turn_started_at < ?1
              ORDER BY turn_started_at ASC",
@@ -1650,7 +1841,8 @@ impl SessionBackend for SqliteSessionBackend {
             let channel_id: Option<String> = row.get(6)?;
             let room_id: Option<String> = row.get(7)?;
             let sender_id: Option<String> = row.get(8)?;
-            let origin_principal: Option<String> = row.get(9)?;
+            let principal_id: Option<String> = row.get(9)?;
+            let origin_principal: Option<String> = row.get(10)?;
             let created = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
@@ -1668,6 +1860,7 @@ impl SessionBackend for SqliteSessionBackend {
                 channel_id,
                 room_id,
                 sender_id,
+                principal_id,
                 origin_principal,
             })
         }) {
@@ -1714,7 +1907,7 @@ impl SessionBackend for SqliteSessionBackend {
         keys.iter()
             .filter_map(|key| {
                 conn.query_row(
-                    "SELECT created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, origin_principal FROM session_metadata WHERE session_key = ?1",
+                    "SELECT created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, principal_id, origin_principal FROM session_metadata WHERE session_key = ?1",
                     params![key],
                     |row| {
                         let created_str: String = row.get(0)?;
@@ -1725,7 +1918,8 @@ impl SessionBackend for SqliteSessionBackend {
                         let channel_id: Option<String> = row.get(5)?;
                         let room_id: Option<String> = row.get(6)?;
                         let sender_id: Option<String> = row.get(7)?;
-                        let origin_principal: Option<String> = row.get(8)?;
+                        let principal_id: Option<String> = row.get(8)?;
+                        let origin_principal: Option<String> = row.get(9)?;
                         Ok(SessionMetadata {
                             key: key.clone(),
                             name,
@@ -1741,6 +1935,7 @@ impl SessionBackend for SqliteSessionBackend {
                             channel_id,
                             room_id,
                             sender_id,
+                            principal_id,
                             origin_principal,
                         })
                     },
@@ -1763,6 +1958,24 @@ impl SessionBackend for SqliteSessionBackend {
              VALUES (?1, ?2, ?3, 0, ?4)
              ON CONFLICT(session_key) DO UPDATE SET agent_alias = excluded.agent_alias",
             params![session_key, now, now, alias_val],
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
+    fn set_session_principal(&self, session_key: &str, principal_id: &str) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        let principal_val = if principal_id.is_empty() {
+            None
+        } else {
+            Some(principal_id)
+        };
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, principal_id)
+             VALUES (?1, ?2, ?3, 0, ?4)
+             ON CONFLICT(session_key) DO UPDATE SET principal_id = excluded.principal_id",
+            params![session_key, now, now, principal_val],
         )
         .map_err(std::io::Error::other)?;
         Ok(())
@@ -1803,6 +2016,26 @@ impl SessionBackend for SqliteSessionBackend {
         )
         .map_err(std::io::Error::other)?;
         Ok(())
+    }
+
+    fn set_session_trim_breadcrumb(&self, session_key: &str, present: bool) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        Self::set_session_trim_breadcrumb_on(&conn, session_key, present)
+            .map_err(std::io::Error::other)
+    }
+
+    fn get_session_trim_breadcrumb(&self, session_key: &str) -> std::io::Result<Option<bool>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT trim_breadcrumb FROM session_metadata WHERE session_key = ?1",
+            params![session_key],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(std::io::Error::other(other)),
+        })
+        .map(|v| v.map(|n| n != 0))
     }
 
     fn set_session_context(
@@ -2335,6 +2568,42 @@ mod tests {
     }
 
     #[test]
+    fn clear_messages_resets_trim_breadcrumb() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.set_session_trim_breadcrumb("s1", true).unwrap();
+        assert_eq!(
+            backend.get_session_trim_breadcrumb("s1").unwrap(),
+            Some(true)
+        );
+
+        backend.clear_messages("s1").unwrap();
+
+        // A reset session has no synthetic marker; the recorded flag must
+        // not survive as a stale `true` for the next first message.
+        assert_eq!(backend.get_session_trim_breadcrumb("s1").unwrap(), None);
+    }
+
+    #[test]
+    fn clear_messages_resets_trim_breadcrumb_even_when_already_empty() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.set_session_trim_breadcrumb("s1", true).unwrap();
+        backend.clear_messages("s1").unwrap();
+        assert_eq!(backend.get_session_trim_breadcrumb("s1").unwrap(), None);
+
+        // Clearing an already-empty session must not leave a stale flag
+        // behind either.
+        backend.set_session_trim_breadcrumb("s1", true).unwrap();
+        assert_eq!(backend.clear_messages("s1").unwrap(), 0);
+        assert_eq!(backend.get_session_trim_breadcrumb("s1").unwrap(), None);
+    }
+
+    #[test]
     fn delete_session_removes_all_data() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
@@ -2354,6 +2623,45 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
         assert!(!backend.delete_session("nonexistent").unwrap());
+    }
+
+    #[test]
+    fn owned_delete_is_an_atomic_ownership_predicate() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.set_session_principal("s1", "user:alice").unwrap();
+
+        // The wrong owner deletes nothing and leaves the session intact.
+        assert!(!backend.delete_session_owned("s1", "user:bob").unwrap());
+        assert!(!backend.load("s1").is_empty());
+        assert_eq!(
+            backend
+                .get_session_metadata("s1")
+                .and_then(|m| m.principal_id),
+            Some("user:alice".to_string())
+        );
+
+        // The owner's predicated delete removes the session and its rows.
+        assert!(backend.delete_session_owned("s1", "user:alice").unwrap());
+        assert!(backend.load("s1").is_empty());
+        assert!(backend.get_session_metadata("s1").is_none());
+    }
+
+    #[test]
+    fn owned_delete_refuses_null_owner_rows() {
+        // A legacy row with no owner is not deletable through the owned
+        // path: NULL never equals a principal id, so scoped principals
+        // cannot destroy pre-principal sessions.
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.append("legacy", &ChatMessage::user("old")).unwrap();
+        assert!(
+            !backend
+                .delete_session_owned("legacy", "user:alice")
+                .unwrap()
+        );
+        assert!(!backend.load("legacy").is_empty());
     }
 
     #[test]
@@ -2398,6 +2706,101 @@ mod tests {
         let msgs = backend.load("test_user");
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content, "hello");
+    }
+
+    #[test]
+    fn migrate_from_jsonl_preserves_explicit_trim_breadcrumb() {
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        // A genuine user message that happens to equal the canonical
+        // breadcrumb text, but was explicitly recorded as `false` in JSONL —
+        // the case where an inferring migration would misclassify it.
+        std::fs::write(
+            sessions_dir.join("false_case.jsonl"),
+            "{\"role\":\"user\",\"content\":\"[earlier turns omitted to fit the context window]\"}\n",
+        )
+        .unwrap();
+        std::fs::write(sessions_dir.join("false_case.trim_breadcrumb"), b"0").unwrap();
+
+        std::fs::write(
+            sessions_dir.join("true_case.jsonl"),
+            "{\"role\":\"user\",\"content\":\"hello\"}\n",
+        )
+        .unwrap();
+        std::fs::write(sessions_dir.join("true_case.trim_breadcrumb"), b"1").unwrap();
+
+        std::fs::write(
+            sessions_dir.join("unrecorded_case.jsonl"),
+            "{\"role\":\"user\",\"content\":\"hello\"}\n",
+        )
+        .unwrap();
+
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let migrated = backend.migrate_from_jsonl(tmp.path()).unwrap();
+        assert_eq!(migrated, 3);
+
+        assert_eq!(
+            backend.get_session_trim_breadcrumb("false_case").unwrap(),
+            Some(false),
+            "an explicit false must survive the backend switch despite the text collision"
+        );
+        assert_eq!(
+            backend.get_session_trim_breadcrumb("true_case").unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            backend
+                .get_session_trim_breadcrumb("unrecorded_case")
+                .unwrap(),
+            None,
+            "genuinely unrecorded legacy state must stay NULL, not become an inferred value"
+        );
+    }
+
+    #[test]
+    fn migrate_from_jsonl_rejects_a_corrupt_trim_breadcrumb_sidecar() {
+        // The exact-byte sidecar contract (`SessionStore::get_trim_breadcrumb`)
+        // must hold during a backend migration too: an empty, truncated, or
+        // multi-byte sidecar is corruption, not a legitimate `false`, so
+        // importing it as one would let the migrated session mark an
+        // untrimmed transcript as trim-clean.
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(
+            sessions_dir.join("corrupt_user.jsonl"),
+            "{\"role\":\"user\",\"content\":\"hello\"}\n",
+        )
+        .unwrap();
+        std::fs::write(sessions_dir.join("corrupt_user.trim_breadcrumb"), b"10").unwrap();
+
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        let error = backend.migrate_from_jsonl(tmp.path()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("corrupt trim breadcrumb sidecar"),
+            "unexpected error: {error:#}"
+        );
+
+        // The import must fail before it commits any metadata: the source
+        // JSONL is left in place (not renamed to `.migrated`) and the
+        // session is not visible through the SQLite backend.
+        assert!(sessions_dir.join("corrupt_user.jsonl").exists());
+        assert!(!sessions_dir.join("corrupt_user.jsonl.migrated").exists());
+        assert!(
+            backend
+                .get_session_trim_breadcrumb("corrupt_user")
+                .unwrap()
+                .is_none()
+        );
+        assert!(backend.load("corrupt_user").is_empty());
+        store
+            .append("corrupt_user", &ChatMessage::user("after failed migration"))
+            .unwrap();
+        assert_eq!(store.load("corrupt_user").len(), 2);
     }
 
     #[test]
@@ -3391,6 +3794,68 @@ mod tests {
     }
 
     #[test]
+    fn fork_database_gains_principal_id_beside_origin_principal() {
+        // A v0.8.5-fork database already carries `origin_principal` but
+        // predates upstream's `trim_breadcrumb` and `principal_id`. Opening
+        // it must add only the missing columns, keep the stamped device
+        // owner, and stay idempotent across reopens.
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let db_path = sessions_dir.join("sessions.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_metadata (
+                session_key TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                last_activity TEXT NOT NULL,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                name TEXT,
+                state TEXT NOT NULL DEFAULT 'idle',
+                turn_id TEXT,
+                turn_started_at TEXT,
+                agent_alias TEXT,
+                channel_id TEXT,
+                room_id TEXT,
+                sender_id TEXT,
+                origin_principal TEXT
+            );
+            INSERT INTO session_metadata
+                (session_key, created_at, last_activity, message_count, origin_principal)
+            VALUES ('gw_s', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', 0,
+                    'device:aaa');",
+        )
+        .unwrap();
+        drop(conn);
+
+        drop(SqliteSessionBackend::new(tmp.path()).unwrap());
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        let meta = backend.get_session_metadata("gw_s").unwrap();
+        assert_eq!(meta.origin_principal.as_deref(), Some("device:aaa"));
+        assert!(meta.principal_id.is_none());
+        assert_eq!(backend.get_session_trim_breadcrumb("gw_s").unwrap(), None);
+
+        // The two owners are written independently and never clobber
+        // each other.
+        backend.set_session_principal("gw_s", "user:alice").unwrap();
+        backend
+            .set_session_origin_principal("gw_s", "device:bbb")
+            .unwrap();
+        let meta = backend.get_session_metadata("gw_s").unwrap();
+        assert_eq!(meta.principal_id.as_deref(), Some("user:alice"));
+        assert_eq!(
+            meta.origin_principal.as_deref(),
+            Some("device:aaa"),
+            "the device owner stays first-writer-wins"
+        );
+        let listed = backend.list_sessions_with_metadata();
+        let row = listed.iter().find(|m| m.key == "gw_s").unwrap();
+        assert_eq!(row.principal_id.as_deref(), Some("user:alice"));
+        assert_eq!(row.origin_principal.as_deref(), Some("device:aaa"));
+    }
+
+    #[test]
     fn empty_name_clears_to_none() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
@@ -3753,6 +4218,31 @@ mod tests {
             .unwrap();
         assert_eq!(tool_context_rows(&backend, "gw_replace"), 0);
 
+        // Upstream's authoritative rewrite replaces every chat row, so the
+        // ids the tool context was anchored to are gone with them.
+        seeded("gw_rewrite");
+        assert!(
+            backend
+                .replace_conversation_state_if_exists(
+                    "gw_rewrite",
+                    &[ChatMessage::user("new")],
+                    false
+                )
+                .unwrap()
+        );
+        assert_eq!(tool_context_rows(&backend, "gw_rewrite"), 0);
+
+        seeded("gw_owned");
+        backend
+            .set_session_principal("gw_owned", "user:alice")
+            .unwrap();
+        assert!(
+            backend
+                .delete_session_owned("gw_owned", "user:alice")
+                .unwrap()
+        );
+        assert_eq!(tool_context_rows(&backend, "gw_owned"), 0);
+
         seeded("gw_sweep");
         let old = (Utc::now() - Duration::hours(48)).to_rfc3339();
         backend
@@ -3824,5 +4314,86 @@ mod tests {
         assert_eq!(backend.retain_tool_context_turns("gw_t", 0).unwrap(), 4);
         assert_eq!(tool_context_rows(&backend, "gw_t"), 0);
         assert_eq!(backend.load("gw_t").len(), 6, "chat rows are never pruned");
+    }
+
+    #[test]
+    fn replace_conversation_state_if_exists_is_a_no_op_once_deletion_wins() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("gone", &ChatMessage::user("turn")).unwrap();
+        assert!(backend.delete_session("gone").unwrap());
+
+        // Deterministic delete-versus-completion ordering: the deleter
+        // commits first, then the post-turn write arrives. It must become a
+        // no-op and must not recreate the metadata row the delete removed
+        // (the plain replace's breadcrumb upsert would INSERT one).
+        let written = backend
+            .replace_conversation_state_if_exists("gone", &[ChatMessage::user("late turn")], false)
+            .unwrap();
+        assert!(
+            !written,
+            "post-turn write must be a no-op once deletion wins"
+        );
+        assert!(!backend.session_exists("gone"));
+        assert!(backend.load("gone").is_empty());
+
+        // The live path still writes transcript and flag together.
+        backend.append("live", &ChatMessage::user("turn")).unwrap();
+        let written = backend
+            .replace_conversation_state_if_exists("live", &[ChatMessage::user("new")], true)
+            .unwrap();
+        assert!(written);
+        assert_eq!(backend.load("live").len(), 1);
+        assert_eq!(
+            backend.get_session_trim_breadcrumb("live").unwrap(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn replace_conversation_state_is_atomic() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend
+            .append("s1", &ChatMessage::user("pre-replace turn"))
+            .unwrap();
+        backend.set_session_trim_breadcrumb("s1", false).unwrap();
+
+        // A trigger that fails the breadcrumb half of the write, so the call
+        // has to roll back the transcript half too if it is truly one
+        // transaction rather than two committed statements.
+        {
+            let conn = backend.conn.lock();
+            conn.execute_batch(
+                "CREATE TRIGGER poison_trim_breadcrumb
+                 BEFORE UPDATE OF trim_breadcrumb ON session_metadata
+                 WHEN NEW.session_key = 's1'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'simulated breadcrumb write failure');
+                 END;",
+            )
+            .unwrap();
+        }
+
+        let result = backend.replace_conversation_state(
+            "s1",
+            &[ChatMessage::user(
+                "replacement turn that must not land alone",
+            )],
+            true,
+        );
+        assert!(result.is_err(), "the poisoned trigger must fail the call");
+
+        // The transcript half must have rolled back with the breadcrumb
+        // half, not landed as a new transcript paired with the old flag.
+        let messages = backend.load("s1");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "pre-replace turn");
+        assert_eq!(
+            backend.get_session_trim_breadcrumb("s1").unwrap(),
+            Some(false)
+        );
     }
 }

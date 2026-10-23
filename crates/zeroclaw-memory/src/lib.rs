@@ -32,6 +32,7 @@ pub mod policy;
 pub mod policy_gate;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
+pub mod principal_plane;
 pub mod qdrant;
 pub mod redact;
 pub mod rerank;
@@ -40,11 +41,12 @@ pub mod retrieval;
 pub mod scanned;
 pub mod snapshot;
 pub mod sqlite;
+mod sqlite_permissions;
 pub mod threat;
 pub mod traits;
 pub mod vector;
 
-pub use agent_scoped::AgentScopedMemory;
+pub use agent_scoped::{AgentMemoryGrant, AgentScopedMemory};
 pub use agent_scoped_markdown::{AgentScopedMarkdownMemory, MarkdownPeer};
 pub use audit::AuditedMemory;
 #[allow(unused_imports)]
@@ -62,6 +64,7 @@ pub use policy::PolicyEnforcer;
 #[cfg(feature = "memory-postgres")]
 #[allow(unused_imports)]
 pub use postgres::PostgresMemory;
+pub use principal_plane::PrincipalPlaneMemory;
 pub use qdrant::QdrantMemory;
 pub use rerank::{RerankConfig, RerankStrategy};
 pub use response_cache::ResponseCache;
@@ -633,19 +636,48 @@ pub fn create_memory_with_storage_and_routes(
         }
     }
 
+    build_memory_with_storage(
+        config,
+        active_storage,
+        workspace_dir,
+        Some(&resolved_embedding),
+    )
+}
+
+/// Build the selected backend without the runtime startup maintenance above.
+/// Operator commands use this path without runtime startup maintenance.
+/// SQLite/Lucid imports omit the configured embedder so they cannot reconcile
+/// vectors or send embedding requests.
+fn build_memory_with_storage(
+    config: &MemoryConfig,
+    active_storage: ActiveStorage<'_>,
+    workspace_dir: &Path,
+    resolved_embedding: Option<&ResolvedEmbeddingConfig>,
+) -> anyhow::Result<Box<dyn Memory>> {
+    let backend_name = backend_kind_from_dotted(&config.backend);
+    let backend_kind = classify_memory_backend(&backend_name);
+
+    fn create_embedder(
+        resolved_embedding: Option<&ResolvedEmbeddingConfig>,
+    ) -> Arc<dyn embeddings::EmbeddingProvider> {
+        match resolved_embedding {
+            Some(resolved) => Arc::from(embeddings::create_embedding_provider(
+                &resolved.model_provider,
+                resolved.api_key.as_deref(),
+                &resolved.model,
+                resolved.dimensions,
+            )),
+            None => Arc::new(embeddings::NoopEmbedding),
+        }
+    }
+
     fn build_sqlite_memory(
         config: &MemoryConfig,
         sqlite_open_timeout_secs: Option<u64>,
         workspace_dir: &Path,
-        resolved_embedding: &ResolvedEmbeddingConfig,
+        resolved_embedding: Option<&ResolvedEmbeddingConfig>,
     ) -> anyhow::Result<SqliteMemory> {
-        let embedder: Arc<dyn embeddings::EmbeddingProvider> =
-            Arc::from(embeddings::create_embedding_provider(
-                &resolved_embedding.model_provider,
-                resolved_embedding.api_key.as_deref(),
-                &resolved_embedding.model,
-                resolved_embedding.dimensions,
-            ));
+        let embedder = create_embedder(resolved_embedding);
         let has_embedder = embedder.dimensions() > 0;
 
         #[allow(clippy::cast_possible_truncation)]
@@ -660,7 +692,9 @@ pub fn create_memory_with_storage_and_routes(
             config.search_mode.clone(),
         )?;
 
-        if has_embedder {
+        if let Some(resolved_embedding) = resolved_embedding
+            && has_embedder
+        {
             reconcile_embedding_identity(
                 &mem,
                 &embeddings::EmbeddingIdentity {
@@ -696,13 +730,7 @@ pub fn create_memory_with_storage_and_routes(
             .context("Qdrant memory backend requires `url` in [storage.qdrant.<alias>]")?;
         let collection = qdrant_cfg.collection.clone();
         let qdrant_api_key = qdrant_cfg.api_key.clone().filter(|s| !s.trim().is_empty());
-        let embedder: Arc<dyn embeddings::EmbeddingProvider> =
-            Arc::from(embeddings::create_embedding_provider(
-                &resolved_embedding.model_provider,
-                resolved_embedding.api_key.as_deref(),
-                &resolved_embedding.model,
-                resolved_embedding.dimensions,
-            ));
+        let embedder = create_embedder(resolved_embedding);
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -747,7 +775,7 @@ pub fn create_memory_with_storage_and_routes(
             config,
             sqlite_open_timeout_secs,
             workspace_dir,
-            &resolved_embedding,
+            resolved_embedding,
         )?;
         return wrap_scanned_and_audit(
             build_lucid_memory(workspace_dir, local, active_storage),
@@ -765,7 +793,7 @@ pub fn create_memory_with_storage_and_routes(
                 config,
                 sqlite_open_timeout_secs,
                 workspace_dir,
-                &resolved_embedding,
+                resolved_embedding,
             )
         },
         "",
@@ -918,31 +946,37 @@ pub fn create_memory_for_migration(config: &Config) -> anyhow::Result<Box<dyn Me
     // (`create_memory_with_storage_and_routes`) applies the configured
     // `[memory.policy]`, so flagged rows remain withheld from recall
     // wherever `threat_scan_load_time` is enabled.
-    let policy = MemoryPolicyConfig {
+    //
+    // Migration writes also bypass the audit trail: the imported rows are
+    // bulk history, not live memory operations.
+    //
+    // Share storage-aware backend construction with the runtime, but not its
+    // hygiene or snapshot startup behavior. Qdrant needs the configured
+    // dimensions to initialize a fresh collection for operator reads; the
+    // import caller rejects Qdrant, so only SQLite/Lucid omit the embedder.
+    let mut operator_config = config.memory.clone();
+    operator_config.policy = MemoryPolicyConfig {
         threat_scan_on_hit: "block-on-read".into(),
         threat_scan_load_time: false,
         ..MemoryPolicyConfig::default()
     };
+    operator_config.audit_enabled = false;
 
-    // Migration writes bypass the audit trail: the imported rows are bulk
-    // history, not live memory operations.
-    if matches!(classify_memory_backend(&backend), MemoryBackendKind::Lucid) {
-        let local = SqliteMemory::new("sqlite", &config.data_dir)?;
-        return wrap_scanned_and_audit(
-            build_lucid_memory(&config.data_dir, local, config.resolve_active_storage()),
-            &policy,
-            &config.data_dir,
-            false,
-        );
-    }
+    let qdrant_embedding = matches!(classify_memory_backend(&backend), MemoryBackendKind::Qdrant)
+        .then(|| {
+            resolve_embedding_config(
+                &operator_config,
+                &config.embedding_routes,
+                None,
+                Some(&config.providers.models),
+            )
+        });
 
-    create_memory_with_builders(
-        &backend,
+    build_memory_with_storage(
+        &operator_config,
+        config.resolve_active_storage(),
         &config.data_dir,
-        || SqliteMemory::new("sqlite", &config.data_dir),
-        " during migration",
-        &policy,
-        false,
+        qdrant_embedding.as_ref(),
     )
 }
 
@@ -994,6 +1028,20 @@ pub async fn create_memory_for_agent(
         .with_context(|| format!("agents.{agent_alias} is not configured"))?;
     let backend_kind = agent_cfg.memory.backend;
 
+    // Config::validate rejects duplicate source grants, but boot deliberately
+    // remains validation-resilient so operators can repair malformed config
+    // through the dashboard. Refuse the ambiguous grant set at the runtime
+    // boundary before any wrapper can resolve it with order-dependent policy.
+    let mut seen_grants = std::collections::HashSet::new();
+    for grant in &agent_cfg.workspace.read_memory_from {
+        if !seen_grants.insert(grant.as_str()) {
+            anyhow::bail!(
+                "agents.{agent_alias}.workspace.read_memory_from contains duplicate grant for agent {:?}; combine categories into one grant",
+                grant.as_str()
+            );
+        }
+    }
+
     // Typed-memory producers are SQLite-only. Config::validate already
     // rejects this combination on every save path, but boot is
     // deliberately validation-resilient (a hand-edited config still
@@ -1027,14 +1075,24 @@ pub async fn create_memory_for_agent(
     // apply the install-wide policy decorator to own and peer Markdown
     // stores before composition.
     if matches!(backend_kind, ConfigBackend::Markdown) {
+        if agent_cfg
+            .workspace
+            .read_memory_from
+            .iter()
+            .any(|grant| grant.categories().is_some())
+        {
+            anyhow::bail!(
+                "agents.{agent_alias}.workspace.read_memory_from contains a category-scoped grant, but Markdown memory does not preserve per-row categories; use an unrestricted grant or a backend with category attribution"
+            );
+        }
         let own_workspace = config.agent_workspace_dir(agent_alias);
         let own: Arc<dyn Memory> = Arc::new(ScannedMemory::new(
             MarkdownMemory::new("markdown", &own_workspace),
             &config.memory.policy,
         ));
         let mut peers: Vec<agent_scoped_markdown::MarkdownPeer> = Vec::new();
-        for peer in &agent_cfg.workspace.read_memory_from {
-            let peer_alias = peer.as_str();
+        for grant in &agent_cfg.workspace.read_memory_from {
+            let peer_alias = grant.as_str();
             let peer_workspace = config.agent_workspace_dir(peer_alias);
             peers.push(agent_scoped_markdown::MarkdownPeer {
                 alias: peer_alias.to_string(),
@@ -1042,6 +1100,9 @@ pub async fn create_memory_for_agent(
                     MarkdownMemory::new("markdown", &peer_workspace),
                     &config.memory.policy,
                 )),
+                allowed_categories: grant
+                    .categories()
+                    .map(|categories| categories.iter().cloned().collect()),
             });
         }
         let scoped = AgentScopedMarkdownMemory::new(agent_alias, own, peers);
@@ -1077,13 +1138,18 @@ pub async fn create_memory_for_agent(
     let inner_arc: Arc<dyn Memory> = Arc::from(inner);
 
     let bound_id = inner_arc.ensure_agent_uuid(agent_alias).await?;
-    let mut allowlist_ids = Vec::with_capacity(agent_cfg.workspace.read_memory_from.len());
-    for peer in &agent_cfg.workspace.read_memory_from {
-        let uuid = inner_arc.ensure_agent_uuid(peer.as_str()).await?;
-        allowlist_ids.push(uuid);
+    let mut grants = Vec::with_capacity(agent_cfg.workspace.read_memory_from.len());
+    for grant in &agent_cfg.workspace.read_memory_from {
+        let uuid = inner_arc.ensure_agent_uuid(grant.as_str()).await?;
+        grants.push(AgentMemoryGrant {
+            agent_id: uuid,
+            categories: grant
+                .categories()
+                .map(|categories| categories.iter().cloned().collect()),
+        });
     }
 
-    let scoped = AgentScopedMemory::new(inner_arc, bound_id, allowlist_ids);
+    let scoped = AgentScopedMemory::new_with_grants(inner_arc, bound_id, grants);
     Ok(wrap_in_retrieval_pipeline(Arc::new(scoped), &config.memory))
 }
 
@@ -1146,7 +1212,9 @@ mod tests {
 
     #[tokio::test]
     async fn per_agent_markdown_factory_applies_memory_policy() {
-        use zeroclaw_config::multi_agent::{AgentAlias, AgentMemoryConfig, MemoryBackendKind};
+        use zeroclaw_config::multi_agent::{
+            AgentAlias, AgentMemoryConfig, MemoryBackendKind, MemoryGrant,
+        };
         use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 
         let tmp = TempDir::new().unwrap();
@@ -1161,7 +1229,7 @@ mod tests {
         alpha
             .workspace
             .read_memory_from
-            .push(AgentAlias::new("beta"));
+            .push(MemoryGrant::Agent(AgentAlias::new("beta")));
         alpha.memory = AgentMemoryConfig {
             backend: MemoryBackendKind::Markdown,
         };
@@ -1213,6 +1281,48 @@ mod tests {
                 .iter()
                 .any(|entry| entry.content.contains("$API_TOKEN")),
             "flagged peer Markdown rows must be filtered by the wrapped peer memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_agent_markdown_factory_rejects_scoped_grant() {
+        use zeroclaw_config::multi_agent::{
+            AgentAlias, AgentMemoryConfig, MemoryBackendKind, MemoryGrant,
+        };
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let tmp = TempDir::new().unwrap();
+        let alpha_dir = tmp.path().join("alpha");
+        let beta_dir = tmp.path().join("beta");
+        std::fs::create_dir_all(&alpha_dir).unwrap();
+        std::fs::create_dir_all(&beta_dir).unwrap();
+
+        let mut config = Config::default();
+        let mut alpha = AliasedAgentConfig::default();
+        alpha.workspace.path = Some(alpha_dir);
+        alpha.workspace.read_memory_from.push(MemoryGrant::Scoped {
+            agent: AgentAlias::new("beta"),
+            categories: Some(vec!["core".to_string()]),
+        });
+        alpha.memory = AgentMemoryConfig {
+            backend: MemoryBackendKind::Markdown,
+        };
+        let mut beta = AliasedAgentConfig::default();
+        beta.workspace.path = Some(beta_dir);
+        beta.memory = AgentMemoryConfig {
+            backend: MemoryBackendKind::Markdown,
+        };
+        config.agents.insert("alpha".into(), alpha);
+        config.agents.insert("beta".into(), beta);
+
+        let err = match create_memory_for_agent(&config, "alpha", None).await {
+            Ok(_) => panic!("Markdown factory must fail closed for scoped grants"),
+            Err(error) => error,
+        };
+        assert!(
+            err.to_string()
+                .contains("Markdown memory does not preserve per-row categories"),
+            "expected Markdown factory backstop explanation, got: {err}"
         );
     }
 
@@ -2095,28 +2205,81 @@ store_timeout_ms = 40000
         );
     }
 
-    /// Regression for the builder-only factory: `qdrant` must never silently
-    /// degrade to the Markdown fallback. On the pre-fix code this returned a
-    /// working handle named "markdown"; now it is an explicit error naming
-    /// supported targets without exposing an internal factory function.
+    /// Regression for the migration/CLI factory: `qdrant` without a resolved
+    /// `[storage.qdrant.<alias>]` entry must never silently degrade to the
+    /// Markdown fallback. Historically (builder-only path) this returned a
+    /// working handle named "markdown"; now the migration factory is routed
+    /// through the same storage-aware resolution as the runtime, so it gives
+    /// the same explicit "needs a storage alias" error instead.
     #[test]
-    fn builder_only_factory_rejects_qdrant_instead_of_markdown_fallback() {
+    fn migration_factory_rejects_qdrant_without_storage_alias_instead_of_markdown_fallback() {
         let tmp = TempDir::new().unwrap();
         let mut config = Config::default();
         config.memory.backend = "qdrant".into();
         config.data_dir = tmp.path().to_path_buf();
         let error = create_memory_for_migration(&config)
             .err()
-            .expect("backend=qdrant must be rejected by the builder-only factory");
+            .expect("backend=qdrant without a storage alias must be rejected");
         let message = error.to_string();
         assert!(
-            message.contains("not supported")
-                && message.contains("sqlite")
-                && message.contains("lucid")
-                && message.contains("markdown"),
-            "error should direct operators to supported targets: {message}"
+            message.contains("storage.qdrant") && message.contains("alias"),
+            "error should direct operators to configure a storage alias: {message}"
         );
-        assert!(!message.contains("create_memory_"));
+        // `.err().expect(...)` above already proves this returned an error
+        // rather than an `Ok` handle of any kind (markdown fallback included).
+    }
+
+    /// The migration/CLI factory (used by `zeroclaw memory
+    /// list`/`get`/`stats`/`clear`) must support Postgres and Qdrant, not
+    /// just sqlite/lucid/markdown — those two backends need resolved
+    /// `[storage.*]` config that the old sqlite-only builder path had no way
+    /// to supply, so `create_memory_for_migration` used to follow the
+    /// `create_memory_with_builders` postgres/qdrant bail arms. Qdrant
+    /// construction is lazy (no server contact),
+    /// so this exercises success end-to-end without a live server; Postgres
+    /// connects eagerly and is covered instead by
+    /// `migration_factory_postgres_without_storage_alias_errors` below,
+    /// which proves it takes the storage-aware error path rather than the
+    /// old unconditional "requires storage config" bail.
+    #[test]
+    fn migration_factory_builds_qdrant_with_storage_config() {
+        let tmp = TempDir::new().unwrap();
+        let raw = r#"
+[memory]
+backend = "qdrant.default"
+
+[storage.qdrant.default]
+url = "http://localhost:6333"
+"#;
+        let mut config: Config = toml::from_str(raw).expect("parse qdrant storage alias");
+        config.data_dir = tmp.path().to_path_buf();
+
+        let mem = create_memory_for_migration(&config)
+            .expect("migration factory must build Qdrant when a storage alias resolves");
+        assert_eq!(mem.name(), "qdrant");
+    }
+
+    /// Companion to the Qdrant case above: without `memory-postgres`
+    /// compiled in, or without a `[storage.postgres.<alias>]` entry, the
+    /// migration factory now surfaces the same storage-aware error the
+    /// runtime gives — not the old unconditional "postgres backend requires
+    /// storage config; call create_memory_with_storage_and_routes instead"
+    /// bail that made `zeroclaw memory list` unusable for every Postgres
+    /// user regardless of config.
+    #[test]
+    fn migration_factory_postgres_without_storage_alias_errors() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.memory.backend = "postgres".into();
+        config.data_dir = tmp.path().to_path_buf();
+        let error = create_memory_for_migration(&config)
+            .err()
+            .expect("backend=postgres without a storage alias must be rejected");
+        let message = error.to_string();
+        assert!(
+            !message.contains("call create_memory_with_storage_and_routes"),
+            "must not surface the internal builder-only factory error: {message}"
+        );
     }
 
     /// The storage-aware factory still accepts Qdrant when a
@@ -2809,6 +2972,41 @@ store_timeout_ms = 40000
             .unwrap();
         let fresh = handle_a.recall("fact", 10, None, None, None).await.unwrap();
         assert_eq!(fresh.len(), 3, "the decorator must preserve direct recall");
+    }
+
+    #[tokio::test]
+    async fn create_memory_for_agent_rejects_duplicate_grants_before_wrapper() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = agent_config(&tmp);
+        config.agents.insert(
+            "beta".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let scoped = zeroclaw_config::multi_agent::MemoryGrant::Scoped {
+            agent: zeroclaw_config::multi_agent::AgentAlias::new("beta"),
+            categories: Some(vec!["core".to_string()]),
+        };
+        let unrestricted = zeroclaw_config::multi_agent::MemoryGrant::Agent(
+            zeroclaw_config::multi_agent::AgentAlias::new("beta"),
+        );
+
+        for grants in [
+            [scoped.clone(), unrestricted.clone()],
+            [unrestricted, scoped],
+        ] {
+            let mut candidate = config.clone();
+            candidate
+                .agents
+                .get_mut("ops")
+                .unwrap()
+                .workspace
+                .read_memory_from = grants.into();
+            let error = match create_memory_for_agent(&candidate, "ops", None).await {
+                Ok(_) => panic!("ambiguous duplicate grants must fail closed"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("duplicate grant"));
+        }
     }
 
     /// The reserved `"fts"` / `"vector"` stage names do not enable caching, so

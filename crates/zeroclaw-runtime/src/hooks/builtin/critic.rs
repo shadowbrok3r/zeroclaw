@@ -114,7 +114,7 @@ mod tests {
     async fn stub(reply: &'static str) -> (String, tokio::task::JoinHandle<String>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/review", listener.local_addr().unwrap());
-        let task = tokio::spawn(async move {
+        let task = zeroclaw_spawn::spawn!(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut buf = vec![0u8; 65536];
             let mut got = Vec::new();

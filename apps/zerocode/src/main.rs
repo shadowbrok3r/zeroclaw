@@ -17,6 +17,7 @@ use std::time::Duration;
 use clap::Parser;
 
 mod acp;
+mod agent_sidebar;
 mod app;
 mod attachment;
 mod chat;
@@ -25,6 +26,7 @@ mod client_crypto;
 mod clipboard;
 mod color_depth;
 mod config;
+mod config_application;
 mod config_manager;
 mod dashboard;
 mod diff;
@@ -40,8 +42,11 @@ mod jsonrpc;
 mod keymap;
 mod logs;
 mod mouse;
+mod oidc_enroll;
+mod osc_status;
 mod quickstart_pane;
 mod relay_proto;
+mod secure_file;
 mod sop_pane;
 mod terminal_backend;
 #[cfg(test)]
@@ -51,6 +56,7 @@ mod text_selection;
 mod theme;
 mod todo_tracker;
 mod turn_status;
+mod url_open;
 mod widgets;
 mod wire;
 mod zerocode_pane;
@@ -67,14 +73,19 @@ static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
 struct ShutdownSignals {
     interrupt: tokio::signal::unix::Signal,
     terminate: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+    quit: tokio::signal::unix::Signal,
 }
 
 #[cfg(unix)]
 impl ShutdownSignals {
     fn new() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
         Ok(Self {
-            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
-            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+            hangup: signal(SignalKind::hangup())?,
+            quit: signal(SignalKind::quit())?,
         })
     }
 
@@ -82,6 +93,8 @@ impl ShutdownSignals {
         tokio::select! {
             _ = self.interrupt.recv() => {}
             _ = self.terminate.recv() => {}
+            _ = self.hangup.recv() => {}
+            _ = self.quit.recv() => {}
         }
     }
 }
@@ -222,6 +235,13 @@ pub(crate) struct WssRoute {
     pub(crate) relay: Option<client::RelayDial>,
     /// TLS verification + mutual-TLS client identity, shared by both legs.
     pub(crate) tls: client::ClientTls,
+    /// Bearer presented as `auth_token` in the initialize handshake (a gateway
+    /// pairing token, or an OIDC access token with `auth_provider`), shared by
+    /// both legs. The mTLS cert is transport/device admission; this is
+    /// principal authentication.
+    pub(crate) auth_token: Option<String>,
+    /// Provider selection for `auth_token` (e.g. `oidc.corp`); `native` default.
+    pub(crate) auth_provider: Option<String>,
     /// How many direct attempts before falling back to the relay (min 1).
     pub(crate) direct_attempts: u32,
     /// Per-attempt direct-connect timeout, in seconds (min 1).
@@ -250,7 +270,14 @@ impl WssRoute {
         if let Some(url) = &self.direct_url {
             let mut last_err: Option<anyhow::Error> = None;
             for _ in 0..self.direct_attempts.max(1) {
-                let fut = client::RpcClient::connect_wss_direct(url, prev_id, prev_sig, &self.tls);
+                let fut = client::RpcClient::connect_wss_direct(
+                    url,
+                    prev_id,
+                    prev_sig,
+                    &self.tls,
+                    self.auth_token.as_deref(),
+                    self.auth_provider.as_deref(),
+                );
                 match tokio::time::timeout(
                     Duration::from_secs(self.direct_timeout_secs.max(1)),
                     fut,
@@ -275,6 +302,8 @@ impl WssRoute {
                     prev_sig,
                     &self.tls,
                     relay,
+                    self.auth_token.as_deref(),
+                    self.auth_provider.as_deref(),
                 )
                 .await?;
                 return Ok((client, ActiveLeg::WssRelay));
@@ -293,6 +322,8 @@ impl WssRoute {
             prev_sig,
             &self.tls,
             relay,
+            self.auth_token.as_deref(),
+            self.auth_provider.as_deref(),
         )
         .await?;
         Ok((client, ActiveLeg::WssRelay))
@@ -310,7 +341,14 @@ impl WssRoute {
             .direct_url
             .as_ref()
             .ok_or_else(|| anyhow::Error::msg("no direct address to re-probe"))?;
-        let fut = client::RpcClient::connect_wss_direct(url, prev_id, prev_sig, &self.tls);
+        let fut = client::RpcClient::connect_wss_direct(
+            url,
+            prev_id,
+            prev_sig,
+            &self.tls,
+            self.auth_token.as_deref(),
+            self.auth_provider.as_deref(),
+        );
         match tokio::time::timeout(Duration::from_secs(self.direct_timeout_secs.max(1)), fut).await
         {
             Ok(r) => r,
@@ -388,6 +426,71 @@ fn resolve_direct_url(cli_connect: Option<String>, cfg_wss: &config::WssSection)
 /// Server verification is skipped when either the flag or the config asks.
 fn resolve_skip_verify(cli_skip_verify: bool, cfg_wss: &config::WssSection) -> bool {
     cli_skip_verify || cfg_wss.tls.skip_verify
+}
+
+/// The credential presented in the initialize handshake, in precedence
+/// order: `ZEROCLAW_AUTH_TOKEN`, then `[wss].auth_token_file`, then
+/// `[wss].auth_token`. The provider selection comes from config. The mTLS
+/// client cert is transport/device admission; this is the principal.
+fn resolve_auth(cfg_wss: &config::WssSection) -> (Option<String>, Option<String>) {
+    let env_token = std::env::var("ZEROCLAW_AUTH_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    auth_from(cfg_wss, env_token)
+}
+
+/// Testable core of [`resolve_auth`]. Split so unit tests inject the env value
+/// rather than mutate process environment.
+fn auth_from(
+    cfg_wss: &config::WssSection,
+    env_token: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let auth_token = env_token
+        .or_else(|| cfg_wss.auth_token_file.as_deref().and_then(read_token_file))
+        .or_else(|| cfg_wss.auth_token.clone());
+    (auth_token, cfg_wss.auth_provider.clone())
+}
+
+/// Read a bearer from a referenced file, refusing one any other account can
+/// read. A referenced secret that is world-readable is worse than the inline
+/// value it replaces, so it is reported and ignored rather than used.
+fn read_token_file(path: &str) -> Option<String> {
+    let path = std::path::Path::new(path.trim());
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) => {
+            eprintln!("auth_token_file {}: {e}", path.display());
+            return None;
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            eprintln!(
+                "auth_token_file {} is readable beyond its owner; refusing to use it",
+                path.display()
+            );
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+    }
+    match std::fs::read_to_string(path) {
+        Ok(body) => {
+            let token = body.trim().to_string();
+            (!token.is_empty()).then_some(token)
+        }
+        Err(e) => {
+            eprintln!("auth_token_file {}: {e}", path.display());
+            None
+        }
+    }
 }
 
 fn should_enroll_via_relay(cli: &Cli, cfg_wss: &config::WssSection, relay_available: bool) -> bool {
@@ -583,11 +686,15 @@ fn install_panic_hook() {
 /// Best-effort terminal restoration used by the panic hook and Unix shutdown
 /// handlers. Errors are intentionally ignored — we're already crashing.
 fn force_restore_terminal() {
+    // Terminal status outlives the process, so it has to be handed back
+    // here too — otherwise a crash leaves the tab reading as busy.
+    crate::osc_status::release();
     if TERMINAL_ACTIVE.load(Ordering::Relaxed) {
         let _ = crossterm::terminal::disable_raw_mode();
         let _ = crossterm::execute!(
             std::io::stdout(),
             crossterm::event::DisableBracketedPaste,
+            crossterm::style::Print(config_manager::mouse_shift_capture_sequence(false)),
             crossterm::event::DisableMouseCapture,
             crossterm::terminal::LeaveAlternateScreen
         );
@@ -909,6 +1016,69 @@ async fn run() -> anyhow::Result<()> {
                     .or_else(|| opt_path(&cfg_wss.tls.client_key_path))
                     .or_else(|| default_tls_path(&config_dir, "client.key")),
             };
+            let (mut auth_token, auth_provider) = resolve_auth(cfg_wss);
+            // An OIDC provider with no token means "enroll first": run the
+            // device grant through the gateway enrollment API and hold the
+            // token for this session only.
+            if auth_token.is_none()
+                && let Some(alias) = auth_provider
+                    .as_deref()
+                    .and_then(|p| p.strip_prefix("oidc."))
+            {
+                let Some(enroll_url) = cfg_wss.enroll_url.as_deref() else {
+                    anyhow::bail!(i18n::t_args(
+                        "zc-oidc-enroll-missing-url",
+                        &[("provider", auth_provider.as_deref().unwrap_or(""))],
+                    ));
+                };
+                // `tls` is borrowed here and moved into the WssRoute below: the
+                // enrollment leg runs on exactly the trust material the WSS
+                // connection is about to use.
+                let token = oidc_enroll::run_device_flow(
+                    enroll_url,
+                    &tls,
+                    alias,
+                    |start| {
+                        let uri = start
+                            .verification_uri_complete
+                            .as_deref()
+                            .unwrap_or(&start.verification_uri);
+                        eprintln!(
+                            "{}",
+                            i18n::t_args(
+                                "zc-oidc-enroll-visit",
+                                &[("uri", uri), ("code", &start.user_code)],
+                            )
+                        );
+                        eprintln!(
+                            "{}",
+                            i18n::t_args(
+                                "zc-oidc-enroll-waiting",
+                                &[("seconds", &start.expires_in.to_string())],
+                            )
+                        );
+                    },
+                    // The enrollment origin is its own peer: it may not be the
+                    // daemon this run connects to afterwards, so it is
+                    // acknowledged under its own URL rather than the WSS
+                    // route's. A non-interactive run reads EOF, which the
+                    // prompt maps to abort, so enrollment refuses instead of
+                    // proceeding unverified.
+                    |origin| {
+                        if cfg_wss.tls.route_acked(origin) {
+                            return Ok(());
+                        }
+                        apply_insecure_tls_choice(
+                            confirm_insecure_tls(origin)?,
+                            &config_dir,
+                            origin,
+                        )
+                    },
+                )
+                .await?;
+                eprintln!("{}", i18n::t("zc-oidc-enroll-done"));
+                auth_token = Some(token);
+            }
             ConnectTarget::Wss(Box::new(WssRoute {
                 direct_url,
                 relay_inner_url: DEFAULT_RELAY_INNER_URL.to_string(),
@@ -919,6 +1089,8 @@ async fn run() -> anyhow::Result<()> {
                     .direct_timeout_secs
                     .unwrap_or(DEFAULT_DIRECT_TIMEOUT_SECS),
                 reprobe_secs: cfg_wss.reprobe_secs.unwrap_or(DEFAULT_REPROBE_SECS),
+                auth_token,
+                auth_provider,
             }))
         } else {
             let socket = client::resolve_socket_path(&config_dir)?;
@@ -930,10 +1102,11 @@ async fn run() -> anyhow::Result<()> {
     let mut shutdown_signals = None;
 
     // Initial connection (before the terminal is initialized).
-    // `owns_ephemeral` records whether THIS process spawned the daemon
-    // (initial connect failed → we started one). Only an owned ephemeral
-    // daemon may be respawned on disconnect, and then exactly once.
-    let mut owns_ephemeral = false;
+    // `owned_daemon_pid` records the spawned daemon's PID when THIS process
+    // started it (initial connect failed → we started one). Only an owned
+    // ephemeral daemon may be respawned on disconnect, and then exactly once,
+    // gated on the liveness/grace check in app.rs.
+    let mut owned_daemon_pid: Option<u32> = None;
     let (rpc, initial_leg) = match &target {
         ConnectTarget::LocalSocket(socket) => {
             #[cfg(unix)]
@@ -964,10 +1137,11 @@ async fn run() -> anyhow::Result<()> {
 
                     match readiness {
                         Ok(client) => {
-                            owns_ephemeral =
+                            let owns_ephemeral =
                                 reconcile_spawned_daemon_identity(client.server_pid, &mut daemon)?;
                             if owns_ephemeral {
                                 daemon.detach();
+                                owned_daemon_pid = client.server_pid;
                             }
                             client
                         }
@@ -1041,7 +1215,7 @@ async fn run() -> anyhow::Result<()> {
         &mut term,
         &target,
         &local_config_dir,
-        owns_ephemeral,
+        owned_daemon_pid,
         initial_leg,
         #[cfg(unix)]
         shutdown_signals
@@ -1056,7 +1230,7 @@ async fn run() -> anyhow::Result<()> {
 }
 
 /// Runs the TUI under Unix shutdown handlers so the terminal is restored on
-/// SIGINT or SIGTERM instead of dying mid-draw. `app::run` owns the full session
+/// SIGINT, SIGTERM, SIGHUP, or SIGQUIT instead of dying mid-draw. `app::run` owns the full session
 /// lifecycle — including in-loop reconnection and recovery — and returns
 /// only when the user quits.
 async fn run_until_exit(
@@ -1064,7 +1238,7 @@ async fn run_until_exit(
     term: &mut config_manager::Term,
     target: &ConnectTarget,
     config_dir: &std::path::Path,
-    owns_ephemeral: bool,
+    owned_daemon_pid: Option<u32>,
     initial_leg: ActiveLeg,
     #[cfg(unix)] shutdown_signals: &mut ShutdownSignals,
 ) -> anyhow::Result<()> {
@@ -1080,7 +1254,7 @@ async fn run_until_exit(
     #[cfg(unix)]
     {
         tokio::select! {
-            r = app::run(rpc, term, &label, insecure_tls, reconnect_state, config_dir, target, owns_ephemeral, initial_leg) => r.map(|_| ()),
+            r = app::run(rpc, term, &label, insecure_tls, reconnect_state, config_dir, target, owned_daemon_pid, initial_leg) => r.map(|_| ()),
             _ = shutdown_signals.recv() => Ok(()),
         }
     }
@@ -1094,7 +1268,7 @@ async fn run_until_exit(
             reconnect_state,
             config_dir,
             target,
-            owns_ephemeral,
+            owned_daemon_pid,
             initial_leg,
         )
         .await
@@ -1102,18 +1276,7 @@ async fn run_until_exit(
     }
 }
 
-pub(crate) fn spawn_ephemeral_daemon(
-    config_dir: &std::path::Path,
-    socket: &std::path::Path,
-) -> anyhow::Result<()> {
-    let mut cmd = ephemeral_daemon_command(config_dir, socket);
-    cmd.stderr(std::process::Stdio::null());
-    cmd.spawn()
-        .map_err(|e| anyhow::Error::msg(format!("failed to spawn daemon: {e}")))?;
-    Ok(())
-}
-
-fn spawn_owned_ephemeral_daemon(
+pub(crate) fn spawn_owned_ephemeral_daemon(
     config_dir: &std::path::Path,
     socket: &std::path::Path,
 ) -> anyhow::Result<SpawnedDaemon> {
@@ -1163,7 +1326,7 @@ fn configure_ephemeral_daemon_command(
         .env("ZEROCLAW_SOCKET", socket);
 }
 
-struct SpawnedDaemon {
+pub(crate) struct SpawnedDaemon {
     child: std::process::Child,
     stderr: Arc<Mutex<std::collections::VecDeque<u8>>>,
     capture_stderr: Arc<AtomicBool>,
@@ -1250,8 +1413,12 @@ impl SpawnedDaemon {
         self.child.try_wait()
     }
 
-    fn id(&self) -> u32 {
+    pub(crate) fn id(&self) -> u32 {
         self.child.id()
+    }
+
+    pub(crate) fn has_exited(&mut self) -> anyhow::Result<bool> {
+        Ok(self.poll_exit()?.is_some())
     }
 
     fn poll_exit(&mut self) -> anyhow::Result<Option<SpawnedDaemonExit>> {
@@ -1285,7 +1452,7 @@ impl SpawnedDaemon {
         sanitize_daemon_stderr(&bytes)
     }
 
-    fn detach(mut self) {
+    pub(crate) fn detach(mut self) {
         self.cleanup_on_drop = false;
         self.capture_stderr.store(false, Ordering::Release);
         self.stderr_done.take();
@@ -1474,6 +1641,15 @@ async fn await_spawned_daemon_ready(
     socket: &std::path::Path,
     daemon: &mut SpawnedDaemon,
 ) -> anyhow::Result<client::RpcClient> {
+    let socket_path = socket.display().to_string();
+    let readiness_seconds = SPAWNED_DAEMON_CONNECT_TIMEOUT.as_secs().to_string();
+    eprintln!(
+        "{}",
+        crate::i18n::t_args(
+            "zc-daemon-wait-notice",
+            &[("path", &socket_path), ("seconds", &readiness_seconds)],
+        )
+    );
     let deadline = tokio::time::Instant::now() + SPAWNED_DAEMON_CONNECT_TIMEOUT;
     loop {
         if let Some(exit) = daemon.poll_exit()? {
@@ -1481,9 +1657,11 @@ async fn await_spawned_daemon_ready(
         }
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
-                "daemon did not become ready within {}s (socket: {})",
-                SPAWNED_DAEMON_CONNECT_TIMEOUT.as_secs(),
-                socket.display(),
+                "{}",
+                crate::i18n::t_args(
+                    "zc-error-daemon-not-ready-timeout",
+                    &[("path", &socket_path), ("seconds", &readiness_seconds)],
+                )
             );
         }
         match client::RpcClient::connect(socket, None, None).await {
@@ -1536,6 +1714,26 @@ mod connection_tests {
 
         assert!(!exit.status.success());
         assert!(daemon.try_wait().expect("poll reaped helper").is_some());
+    }
+
+    #[test]
+    fn reconnect_identity_uses_the_actual_spawned_child_pid() {
+        let mut daemon =
+            SpawnedDaemon::spawn(spawned_daemon_helper_command("sleep")).expect("spawn helper");
+        let spawned_pid = daemon.id();
+
+        assert!(crate::app::reconnect_matches_owned_daemon(
+            Some(spawned_pid.wrapping_add(1)),
+            Some(spawned_pid),
+            Some(spawned_pid),
+        ));
+        assert!(!crate::app::reconnect_matches_owned_daemon(
+            Some(spawned_pid.wrapping_add(1)),
+            Some(spawned_pid),
+            Some(spawned_pid.wrapping_add(2)),
+        ));
+
+        daemon.terminate_and_wait().expect("terminate helper");
     }
 
     #[test]
@@ -1665,7 +1863,10 @@ mod connection_tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let daemon_pid = loop {
             if let Ok(pid) = std::fs::read_to_string(&pid_path) {
-                break pid.trim().parse::<u32>().expect("parse daemon pid");
+                let pid = pid.trim();
+                if !pid.is_empty() {
+                    break pid.parse::<u32>().expect("parse daemon pid");
+                }
             }
             assert!(
                 owner.try_wait().expect("poll signal owner").is_none(),
@@ -1701,14 +1902,10 @@ mod connection_tests {
 
     #[cfg(unix)]
     #[test]
-    fn spawned_daemon_parent_only_sigterm_cleans_up_child() {
-        assert_parent_signal_cleans_up_child(libc::SIGTERM);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn spawned_daemon_parent_only_sigint_cleans_up_child() {
-        assert_parent_signal_cleans_up_child(libc::SIGINT);
+    fn spawned_daemon_parent_termination_signals_clean_up_child() {
+        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+            assert_parent_signal_cleans_up_child(signal);
+        }
     }
 
     #[cfg(unix)]
@@ -2140,6 +2337,63 @@ mod connection_tests {
         cfg.tls.skip_verify = false;
         assert!(resolve_skip_verify(true, &cfg)); // flag wins
         assert!(!resolve_skip_verify(false, &cfg)); // neither
+    }
+
+    #[test]
+    fn auth_env_token_overrides_config() {
+        let cfg = WssSection {
+            auth_token: Some("cfg_token".to_string()),
+            auth_provider: Some("oidc.corp".to_string()),
+            ..Default::default()
+        };
+        // Env wins over config.
+        assert_eq!(
+            auth_from(&cfg, Some("env_token".to_string())),
+            (Some("env_token".to_string()), Some("oidc.corp".to_string()))
+        );
+        // No env falls back to config.
+        assert_eq!(
+            auth_from(&cfg, None),
+            (Some("cfg_token".to_string()), Some("oidc.corp".to_string()))
+        );
+        // Neither: no token, provider still passes through if set.
+        assert_eq!(auth_from(&WssSection::default(), None), (None, None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_token_file_wins_over_the_inline_token_and_loses_to_env() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let token_path = tmp.path().join("bearer");
+        std::fs::write(&token_path, "file_token\n").unwrap();
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let cfg = WssSection {
+            auth_token: Some("cfg_token".to_string()),
+            auth_token_file: Some(token_path.to_string_lossy().into_owned()),
+            auth_provider: Some("oidc.corp".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            auth_from(&cfg, None).0,
+            Some("file_token".to_string()),
+            "the referenced file beats the inline token"
+        );
+        assert_eq!(
+            auth_from(&cfg, Some("env_token".to_string())).0,
+            Some("env_token".to_string()),
+            "the environment still wins"
+        );
+
+        // A file any other account can read is refused, not used.
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            auth_from(&cfg, None).0,
+            Some("cfg_token".to_string()),
+            "a group- or world-readable file must be ignored"
+        );
     }
 
     #[test]

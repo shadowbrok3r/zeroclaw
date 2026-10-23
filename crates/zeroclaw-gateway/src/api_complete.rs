@@ -51,7 +51,10 @@ fn validate(request: &CompleteRequest) -> Result<(), String> {
     if size > INPUT_CAP {
         return Err(format!("input is {size} bytes; the cap is {INPUT_CAP}"));
     }
-    if request.temperature.is_some_and(|t| !(0.0..=2.0).contains(&t)) {
+    if request
+        .temperature
+        .is_some_and(|t| !(0.0..=2.0).contains(&t))
+    {
         return Err("temperature must be between 0.0 and 2.0".into());
     }
     Ok(())
@@ -92,7 +95,10 @@ pub async fn handle_complete(
         Err(e) => {
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("model_provider `{}` failed to build: {e}", route.model_provider),
+                format!(
+                    "model_provider `{}` failed to build: {e}",
+                    route.model_provider
+                ),
             );
         }
     };
@@ -103,18 +109,27 @@ pub async fn handle_complete(
         .unwrap_or_default();
     match resolved
         .provider
-        .chat_with_system(request.system.as_deref(), &request.prompt, &model, request.temperature)
+        .chat_with_system(
+            request.system.as_deref(),
+            &request.prompt,
+            &model,
+            request.temperature,
+        )
         .await
     {
-        Ok(response) => Json(serde_json::json!({ "response": response, "model": model, "hint": hint }))
-            .into_response(),
+        Ok(response) => {
+            Json(serde_json::json!({ "response": response, "model": model, "hint": hint }))
+                .into_response()
+        }
         Err(e) => {
             let sanitized = zeroclaw_providers::sanitize_api_error(&e.to_string());
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({ "hint": hint, "model": model, "error": sanitized })),
+                    .with_attrs(
+                        ::serde_json::json!({ "hint": hint, "model": model, "error": sanitized })
+                    ),
                 "complete model_provider error"
             );
             error(StatusCode::BAD_GATEWAY, sanitized)
@@ -127,7 +142,12 @@ mod tests {
     use super::*;
 
     fn request(prompt: &str) -> CompleteRequest {
-        CompleteRequest { hint: None, system: None, prompt: prompt.into(), temperature: None }
+        CompleteRequest {
+            hint: None,
+            system: None,
+            prompt: prompt.into(),
+            temperature: None,
+        }
     }
 
     #[test]
@@ -140,7 +160,10 @@ mod tests {
             ..Default::default()
         });
         let route = route_for(&config, "quick").expect("configured");
-        assert_eq!((route.model_provider.as_str(), route.model.as_str()), ("ollama.quick", "zc-quick"));
+        assert_eq!(
+            (route.model_provider.as_str(), route.model.as_str()),
+            ("ollama.quick", "zc-quick")
+        );
         assert!(route_for(&config, "openrouter.flash").is_err());
         assert!(route_for(&config, "").is_err());
     }

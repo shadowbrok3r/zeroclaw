@@ -20,15 +20,41 @@ use serde::{Deserialize, Serialize};
 /// and the wording is not.
 pub const VERIFIABLE_INTENT_TOOL_WITHHELD: &str = "verifiable_intent_tool_withheld";
 
+/// Stable code for the empty `server_fallback_models` entry notice.
+pub const EMPTY_SERVER_FALLBACK_MODEL: &str = "empty_server_fallback_model";
+
+/// Stable code for `server_fallback_models` entry duplicating primary model notice.
+pub const SERVER_FALLBACK_MODEL_DUPLICATES_PRIMARY: &str =
+    "server_fallback_model_duplicates_primary";
+
+/// Stable code for a disabled audit section, which drops the certificate
+/// issuance and renewal trail without adding any command record.
+pub const SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD: &str =
+    "security_audit_disabled_drops_certificate_record";
+
+/// Stable code for a section that enables an opt-in tool this build was
+/// compiled without. The section has no effect, and the tool's own settings
+/// are not checked; see [`crate::opt_in_tools`].
+pub const TOOL_COMPILED_OUT: &str = "tool_compiled_out";
+
 /// One non-fatal validation issue surfaced after a successful save.
 ///
 /// Stable codes (extend as new warnings are added):
+/// - `empty_server_fallback_model`: `server_fallback_models` contains an empty
+///   string entry, which cannot match any model name and is dropped before the
+///   request is sent.
+/// - `server_fallback_model_duplicates_primary`: `server_fallback_models` contains
+///   the primary model name, which duplicates the requested model and is dropped
+///   before the request is sent.
 /// - `codex_cli_extra_args_security_boundary`: `codex_cli.extra_args` contains
 ///   a known Codex CLI argument that can change sandbox, approval, policy,
 ///   workspace, feature, trust, or executable-integration boundaries. The
 ///   argument remains allowed.
 /// - `memory_semantic_search_without_embedder`: `memory.search_mode` requests
 ///   vector search on sqlite memory, but no effective embedder is configured.
+/// - `cron_job_contested_claim`: a cron job id is listed in the `cron_jobs` of
+///   more than one enabled agent; without a stored owner the job is refused
+///   rather than run under an arbitrary claimant.
 /// - `whatsapp_chat_policy_inert`: a WhatsApp Web `self_chat_mode` is set but
 ///   the transport only consults it under `mode = "personal"`, so it currently
 ///   has no effect. `dm_policy` and `group_policy` apply under both modes and
@@ -42,6 +68,10 @@ pub const VERIFIABLE_INTENT_TOOL_WITHHELD: &str = "verifiable_intent_tool_withhe
 /// - `memory_config_knob_inert`: a `[memory]` knob is set to a non-default
 ///   value but has no runtime consumer yet, so it currently has no effect
 ///   (see `validate_memory_semantics` in `schema.rs` for the current list).
+/// - `security_audit_disabled_drops_certificate_record`:
+///   `security.audit.enabled` is `false`, so certificate issuance and renewal
+///   have no audit-log record. Command execution is not audited under either
+///   value, because no production path records tool commands.
 /// - `peer_group_channel_dangling`: a `peer_groups.<name>.channel` dotted
 ///   alias (`<type>.<alias>`) does not resolve to any configured
 ///   `[channels.<type>.<alias>]` block — typically a typo that silently
@@ -65,6 +95,9 @@ pub const VERIFIABLE_INTENT_TOOL_WITHHELD: &str = "verifiable_intent_tool_withhe
 ///   that trace has no sink under `observability.log_persistence = "none"`;
 ///   this warning is the channel that survives, since `zeroclaw doctor` and the
 ///   config API read the structured list rather than the log.
+/// - `tool_compiled_out`: a `[<tool>]` section is enabled, but this build was
+///   compiled without the tool's `tool-*` feature, so the section has no
+///   effect and its settings are not validated.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ValidationWarning {

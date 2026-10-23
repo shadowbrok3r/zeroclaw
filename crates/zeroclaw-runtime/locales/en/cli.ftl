@@ -16,7 +16,29 @@ cli-models-about = Manage provider model catalogs
 cli-providers-about = List supported AI providers
 cli-channel-about = Manage communication channels
 cli-integrations-about = Browse 50+ integrations
+cli-integrations-unknown = Unknown integration: {$name}. Check README for supported integrations or run {$quickstart} to configure a model provider, then {$channel_config} for channels.
+cli-integrations-category-heading = Category
+cli-integrations-category-chat = Chat Providers
+cli-integrations-category-ai-model = AI Models
+cli-integrations-category-tools-automation = Tools & Automation
+cli-integrations-category-platform = Platforms
+cli-integrations-status-heading = Status
+cli-integrations-status-active = Active
+cli-integrations-status-available = Available
+cli-integrations-setup-heading = Setup
+cli-integrations-setup-macos-heading = Setup (macOS only)
+cli-integrations-builtin-heading = Built-in
+cli-integrations-chat-telegram-prepare = Message {$botfather} on {$channel} to create a bot and obtain its token.
+cli-integrations-chat-discord-prepare = Create a bot at {$url}, obtain its token, and enable the {$intent} intent.
+cli-integrations-chat-slack-prepare = Create an app at {$url}, configure its bot scopes, enable Socket Mode and create an app-level token, then install the app to obtain its bot token.
+cli-integrations-chat-configure = Run {$command}, open Config, and configure a {$channel} instance and its credentials.
+cli-integrations-chat-bind = Bind the channel alias to an agent and review peer-group access.
+cli-integrations-chat-enable = Enable the channel instance only after reviewing its settings and access.
+cli-integrations-chat-imessage-transport = Sends messages through AppleScript automation and receives messages by reading the local Messages database.
+cli-integrations-chat-imessage-permissions = Grant macOS Automation access to control Messages and Full Disk Access to read the Messages database.
+cli-integrations-chat-generic-setup = Run {$command}, open Config, configure the required fields, routing, and access for {$channel}, review the settings, then enable it.
 cli-skills-about = Manage skills (user-defined capabilities)
+cli-plugin-about = Manage WASM plugins
 cli-sop-about = Manage standard operating procedures (SOPs)
 cli-migrate-about = Migrate data from other agent runtimes
 cli-auth-about = Manage provider subscription authentication profiles
@@ -65,6 +87,8 @@ cli-wechat-login-confirmed-missing-field = Login confirmed but {$field} missing.
 cli-wechat-connected = ✅ WeChat connected!
 cli-wechat-bound-success = ✅ WeChat account bound successfully. You can talk to ZeroClaw now.
 cli-wechat-invalid-bind-code = ❌ Invalid bind code. Please try again.
+cli-wechat-bind-denied = ❌ This account is blocked by an `ignore` entry in the runtime config. Ask the operator to remove it, then retry with the same code.
+cli-wechat-bind-not-saved = ❌ Could not save the binding, so nothing changed. Your code is still valid; ask the operator to check the config file, then retry.
 
 cli-skills-list-about = List all installed skills
 cli-skills-audit-about = Audit a skill source directory or installed skill name
@@ -92,6 +116,9 @@ cli-skills-install-git-failed = failed to install git skill source: {$source}
 cli-skills-install-registry-failed = failed to install skill from registry: {$source}
 cli-skills-install-extra-registry-failed = failed to install skill from extra registry: {$source}
 cli-skills-install-local-failed = failed to install local skill source: {$source}
+cli-skills-install-well-known-requires-skill = --well-known requires --skill <name>; refusing to install every advertised skill
+cli-skills-install-resolving-well-known = { "  " }Resolving selected skill '{$skill}' from well-known index at {$source}...
+cli-skills-install-well-known-failed = failed to install well-known skill '{$skill}' from {$source}
 cli-skills-install-installed-audited = { "  " }{$status} Skill installed and audited: {$path} ({$files} files scanned)
 cli-skills-install-security-audit-completed = { "  " }Security audit completed successfully.
 cli-skills-install-into-bundle = { "  " }Installed into bundle '{$alias}'. Agents that list this bundle in skill_bundles will load it.
@@ -145,6 +172,15 @@ cli-auth-login-about = Login with OAuth (OpenAI Codex, Gemini, or xAI)
 cli-auth-refresh-about = Refresh OAuth access token using refresh token
 cli-auth-logout-about = Remove auth profile
 cli-auth-use-about = Set active profile for a provider
+cli-oidc-unknown-alias = No [oidc.{ $alias }] entry in the config. Configured entries: { $known }
+cli-oidc-device-visit = To sign in, visit { $uri } and enter code { $code }
+cli-oidc-device-waiting = Waiting for identity-provider approval (the code expires in { $seconds } seconds)...
+cli-oidc-device-expired = The device code expired before approval; run the command again.
+cli-oidc-enrolled = Enrolled with [oidc.{ $alias }]. The access token is on stdout; present it as auth_token in the RPC handshake or export it as ZEROCLAW_AUTH_TOKEN.
+cli-oidc-token-expiry = The token expires in { $seconds } seconds.
+cli-oidc-browser-open = Opening your browser to sign in. If nothing opens, visit:
+    { $uri }
+cli-oidc-browser-waiting = Waiting for the browser sign-in to complete...
 cli-auth-list-about = List auth profiles
 cli-auth-status-about = Show auth status with active profile and token expiry info
 
@@ -211,6 +247,7 @@ cli-acp-long-about =
 
     Examples:
       zeroclaw acp                        # start ACP server
+      zeroclaw acp --agent fable         # default new sessions to agent fable
       zeroclaw acp --max-sessions 5       # limit concurrent sessions
 
 cli-daemon-long-about =
@@ -424,8 +461,11 @@ channel-discord-delivery-failure-note-many = (note: I couldn't deliver {$count} 
 channel-whatsapp-web-delivery-failure-note-one = (note: I could not deliver {$count} WhatsApp media attachment.)
 channel-whatsapp-web-delivery-failure-note-many = (note: I could not deliver {$count} WhatsApp media attachments.)
 channel-line-bind-success = ✅ Paired! You can now chat.
+channel-line-bind-persist-failed = Pairing could not be saved. Ask the bot administrator for a new pairing code and try again.
 channel-line-bind-invalid-code = ❌ Invalid code. Please try again.
 channel-line-bind-rate-limited = ⏳ Too many attempts. Retry in { $secs }s.
+channel-line-bind-denied = ❌ This account is blocked by an `ignore` entry. Ask the operator to remove it, then retry.
+channel-line-bind-not-saved = ❌ Could not save the binding, so nothing changed. Your code is still valid; ask the operator to check the config file, then retry.
 channel-telegram-cmd-new-desc = Start a new conversation session
 channel-telegram-cmd-clear-desc = Clear this conversation session
 channel-telegram-cmd-stop-desc = Cancel the current in-flight task
@@ -462,6 +502,16 @@ cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" —
 cli-doctor-codex-auth-profile-no-slot = OpenAI Codex credentials are signed in but no model provider slot uses them. Set `requires_openai_auth = true` on an OpenAI provider slot and point an agent's `model_provider` at it, or run `zeroclaw quickstart`.
 cli-doctor-codex-auth-slot-no-profile = OpenAI slot(s) {$slots} set `requires_openai_auth = true` but no OpenAI Codex credentials are signed in. Run `zeroclaw auth login --provider openai-codex`.
 cli-doctor-codex-auth-ok = OpenAI Codex credentials are signed in and referenced by a model provider slot.
+# Bootstrap files over the per-file cap the agent-loop and channel prompt
+# paths apply while the agent's effective `compact_context` setting is on.
+# Prospective wording: ACP sessions load these files through a separate
+# 20000-char loader and AIEOS identities load none of them (see the
+# exclusions in `crates/zeroclaw-runtime/src/doctor/mod.rs`); the counts are
+# the per-file stage, before the whole-prompt budget, and the same counts
+# are logged under `agent.bootstrap_file_truncated` when a file is cut.
+cli-doctor-bootstrap-file-truncated-compact = [{$alias}] {$file}: on agent-loop and channel turns that inject it, the per-file cap retains {$retained} of {$total} chars ({$discarded} discarded, before the whole-prompt budget). compact_context is on for this agent and caps each bootstrap file at {$limit} chars. Set `compact_context = false` in `[runtime_profiles.{$profile}]`, or shorten the file.
+cli-doctor-bootstrap-file-truncated-compact-no-profile = [{$alias}] {$file}: on agent-loop and channel turns that inject it, the per-file cap retains {$retained} of {$total} chars ({$discarded} discarded, before the whole-prompt budget). compact_context is on for this agent (the default, no runtime profile assigned) and caps each bootstrap file at {$limit} chars. Add a `[runtime_profiles.<name>]` with `compact_context = false` and set `runtime_profile = "<name>"` on the agent, or shorten the file.
+cli-doctor-bootstrap-file-truncated = [{$alias}] {$file}: on agent-loop and channel turns that inject it, the per-file cap retains {$retained} of {$total} chars ({$discarded} discarded, before the whole-prompt budget). Each bootstrap file is capped at {$limit} chars; shorten the file.
 cli-doctor-systemd-linger-enabled = systemd user lingering enabled
 cli-doctor-systemd-linger-disabled = systemd user lingering disabled; user service may stop after logout. Enable with: loginctl enable-linger {$user}
 cli-doctor-systemd-linger-unknown = systemd user lingering could not be checked with loginctl
@@ -472,6 +522,7 @@ cli-self-test-web-dist-dir-fail-expansion = WARNING: {$path} — {$reason}; gate
 
 # Service lifecycle warnings.
 cli-service-systemd-linger-disabled-warning = systemd user lingering is disabled. ZeroClaw's user service may stop after logout. Enable it with: loginctl enable-linger {$user}
+cli-standalone-daemon-owned = Cannot run `zeroclaw {$command}` while another ZeroClaw process owns the config state at {$path}. Stop the owning process or use its daemon-backed interface, then retry. No agent work was started.
 
 # ── peripherals (zeroclaw peripheral) ──
 cli-peripherals-none = No peripherals configured.
@@ -507,6 +558,11 @@ cli-sop-none = No SOPs found.
 cli-sop-pending-none = No SOP runs waiting for approval.
 cli-sop-pending-header = SOP runs waiting for approval:
 cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] step {$step}/{$total}
+cli-sop-logs-none = No persisted logs found for SOP run {$run_id}.
+cli-sop-logs-header = Logs for SOP run {$run_id}:
+cli-sop-logs-row = {$timestamp} {$severity} {$category}.{$action} {$message}
+cli-sop-logs-disabled = Log persistence is not enabled.
+cli-sop-logs-incomplete = Some retained log segments could not be read; this history may be incomplete.
 cli-sop-status-failure-reason = Failure reason: {$reason}
 # gateway WebSocket SOP approval error frames (UI-surfaced)
 cli-sop-ws-invalid-approval = sop approval_response requires run_id and a decision of approve or deny
@@ -519,8 +575,11 @@ cli-sop-loaded-header = Loaded SOPs ({$count}):
 cli-sop-none-to-validate = No SOPs found to validate.
 cli-sop-valid = ✅ {$name} — valid
 cli-sop-deleted = Deleted SOP: {$name}
+cli-sop-renamed = Renamed SOP {$from} to {$to}
 cli-sop-warnings = ⚠️  {$name} — {$count} warning(s):
 cli-sop-all-passed = All SOPs passed validation.
+cli-sop-load-failed = ❌ {$name} — failed to load: {$error}
+cli-sop-load-failed-summary = {$count} SOP(s) failed to load.
 cli-sop-priority = {"  "}Priority:       {$value}
 cli-sop-execution-mode = {"  "}Execution mode: {$value}
 cli-sop-deterministic = {"  "}Deterministic:  {$value}
@@ -595,6 +654,11 @@ cli-no-command = No command provided.
 cli-press-enter = Press Enter to exit...
 cli-quickstart-title = Quickstart — create one working agent end-to-end.
 cli-quickstart-needs-tty = Quickstart is interactive and needs a terminal on stdin and stderr. Run it from an interactive shell, or use `zeroclaw config set <path> <value>` for headless configuration.
+cli-quickstart-terminal-size-unknown = Quickstart could not determine the terminal size, so it cannot verify the checklist fits. Run it from a terminal that reports its dimensions, or use `zeroclaw config set <path> <value>` for headless configuration.
+cli-quickstart-terminal-too-narrow = Quickstart needs a terminal at least {$min_width} columns wide; the current terminal is {$width} columns. Widen the terminal and try again.
+cli-quickstart-terminal-too-short = Quickstart needs a terminal at least {$min_height} rows tall; the current terminal is {$height} rows. Make the terminal taller and try again.
+cli-quickstart-terminal-resized = The terminal changed from {$initial_width}x{$initial_height} to {$current_width}x{$current_height} while the Quickstart checklist was open. Reopen the checklist to continue.
+cli-quickstart-empty-checklist = Quickstart cannot open an empty checklist.
 cli-quickstart-cancelled = Quickstart cancelled. No config written.
 cli-quickstart-incomplete = {"  "}Not all selectors are filled yet.
 cli-quickstart-create-agent = ── Create agent
@@ -609,6 +673,7 @@ cli-quickstart-row-risk-profile = {$glyph} Risk profile       — {$summary}
 cli-quickstart-row-memory = {$glyph} Memory             — {$summary}
 cli-quickstart-row-channels = {$glyph} Channels (0..N)    — {$summary}
 cli-quickstart-row-peer-groups = {$glyph} Peer groups        — {$summary}
+cli-quickstart-row-plugins = {$glyph} Plugins            — {$summary}
 cli-quickstart-row-agent-identity = {$glyph} Agent identity     — {$summary}
 cli-quickstart-summary-not-yet-chosen = not yet chosen
 cli-quickstart-summary-not-yet-visited = not yet visited
@@ -664,6 +729,7 @@ cli-quickstart-esc-return-checklist = {" "}(Esc to return to checklist)
 cli-quickstart-personality-file-prompt = {$filename}{$position} — what next?{$back_hint}
 cli-quickstart-next-agent-command = {"  "}zeroclaw agent -a {$alias}  # chat with this agent in your terminal
 cli-quickstart-fix-and-rerun = Your existing config is untouched. Fix the following and run quickstart again:
+cli-quickstart-partial-personality-failure = The agent config for {$alias} was saved, but installing its personality files failed. Repair the reported paths or permissions, then create or edit the intended personality files in this existing agent's workspace. Do not rerun Quickstart for this saved alias.
 cli-quickstart-could-not-finish = quickstart could not finish: {$count} problem(s) to fix
 cli-quickstart-pick-preset = Pick a preset
 cli-quickstart-pick-existing-prompt = Pick an existing {$prompt}
@@ -678,6 +744,8 @@ cli-quickstart-step-agent = Agent
 cli-quickstart-error-internal-no-result = internal error: apply_into returned no result despite no validation errors
 cli-quickstart-error-completion-flag = failed to flip quickstart-completed: {$err}
 cli-quickstart-error-persist-config = failed to persist config: {$err}
+cli-quickstart-error-publish-config = failed to publish quickstart config: {$err}
+cli-quickstart-error-auth-validation = authorization config rejected before persistence: {$err}
 cli-quickstart-error-not-type-alias-ref = `{$reference}` is not a `<type>.<alias>` reference
 cli-quickstart-error-no-configured-path = no `{$path}` configured
 cli-quickstart-error-provider-required = provider type, alias, and model are required
@@ -706,6 +774,105 @@ cli-quickstart-error-personality-stage-failed = stage {$filename} failed: {$err}
 cli-quickstart-error-personality-write-failed = write {$path} failed: {$err}
 cli-quickstart-error-agent-name-required = agent name is required
 cli-quickstart-error-agent-exists = agent `{$name}` already exists
+cli-quickstart-plugins-summary-none = none
+cli-quickstart-plugins-summary-installed = {$name} (installed)
+cli-quickstart-plugins-registry-unavailable = The plugin registry index could not be fetched: {$error}
+cli-quickstart-plugins-registry-unpopulated = The public plugin registry is not populated yet. To use another registry, set the ZEROCLAW_PLUGIN_REGISTRY_URL environment variable to its index URL and run Quickstart again.
+cli-quickstart-plugins-registry-prompt = Plugin registry unavailable
+cli-quickstart-plugins-registry-retry = Retry
+cli-quickstart-plugins-registry-continue = Continue without plugins
+cli-quickstart-plugins-row-failed = The plugin list could not be opened: {$error}
+cli-quickstart-plugins-section-unreadable = The [plugins] section of {$path} could not be read, so Quickstart cannot install plugins. Repair that section, then run Quickstart again to install them.
+cli-quickstart-plugins-none-available = The registry offers no tool plugins right now.
+cli-quickstart-plugins-select-prompt = Tool plugins to install (Space toggles, Enter confirms, Esc goes back)
+cli-quickstart-plugins-choice-available = {$name} {$version}: {$description}
+cli-quickstart-plugins-choice-installed = {$name} {$version} (installed): {$description}
+cli-quickstart-plugins-choice-installed-other = {$name} {$version} (installed; the registry has {$registry_version}): {$description}
+cli-quickstart-plugins-installing = Installing the selected plugins before creating the agent.
+cli-quickstart-plugins-resolving = Resolving {$name} {$version} from the plugin registry...
+cli-quickstart-plugins-not-available = {$name} is no longer installed and is not in the registry, so nothing was installed for it.
+cli-quickstart-plugins-no-integrity-hash = Refused {$name}: its registry entry has no sha256 digest, so the download cannot be verified. Nothing was installed.
+cli-quickstart-plugins-not-a-tool = Skipped {$name}: its manifest provides no tool, and Quickstart installs tool plugins only. Nothing was installed.
+cli-quickstart-plugins-failed = {$name} was not installed: {$error}
+cli-quickstart-plugins-legacy-row-refused = {$name} was not installed: its config entry would go beside the [[plugins.entries]] row named '{$legacy}', which is in the pre-1.0 key format from before typed config. Rename that row to '{$key}' in your config file, save, then run Quickstart again.
+cli-quickstart-plugins-load-check-failed = {$name} was not installed: it does not load against this host: {$error}. To install it anyway, knowing it is skipped at startup, run: {$command}. That command asks no signature or network access question, and seeds a config entry it creates with the HTTP destinations the manifest declares.
+cli-quickstart-plugins-rollback-failed = {$name} could not be configured: {$error}. Undoing its install failed too ({$rollback_error}), so it is still installed. Remove it with: {$command}
+cli-quickstart-plugins-about-name = Plugin {$name} {$version}
+cli-quickstart-plugins-about-author = Author: {$author}
+cli-quickstart-plugins-about-author-claimed = Author (publisher's claim, not verified): {$author}
+cli-quickstart-plugins-about-signature-verified = Signature: verified, signed with the trusted publisher key {$key}
+cli-quickstart-plugins-about-signature-unsigned = Signature: none, so nothing verifies who published this plugin.
+cli-quickstart-plugins-about-signature-untrusted = Signature: present, but its publisher key is not in plugins.security.trusted_publisher_keys, so who published this plugin is not verified.
+cli-quickstart-plugins-about-signature-invalid = Signature: invalid. The manifest does not verify against the signature it carries, so it may have been changed after it was signed.
+cli-quickstart-plugins-about-description = Description: {$description}
+cli-quickstart-plugins-about-capabilities = Capabilities: {$list}
+cli-quickstart-plugins-about-permissions = Permissions: {$list}
+cli-quickstart-plugins-about-destinations = Declared network destinations: {$list}
+cli-quickstart-plugins-about-none = none
+cli-quickstart-plugins-unverified-prompt = Install {$name} although nothing verifies who published it?
+cli-quickstart-plugins-existing-row = {$name} already has a config entry. Quickstart keeps its network grant and its settings as they are.
+cli-quickstart-plugins-egress-prompt = Network access for {$name}
+cli-quickstart-plugins-egress-grant = Grant the declared destinations
+cli-quickstart-plugins-egress-withhold = Install without network access
+cli-quickstart-plugins-egress-skip = Skip this plugin
+cli-quickstart-plugins-skipped = Skipped {$name}. Nothing was installed for it.
+cli-quickstart-plugins-config-heading = Settings for {$name}:
+cli-quickstart-plugins-config-unsupported = {$name} has settings Quickstart cannot prompt for: {$keys}. Set them later with `zeroclaw config set`.
+cli-quickstart-plugins-config-required-unsupported = {$name} requires settings Quickstart cannot prompt for: {$keys}. No answers here could complete its settings, so Quickstart asks for none of them.
+cli-quickstart-plugins-config-optional-prompt = Configure the optional settings for {$name}?
+cli-quickstart-plugins-config-invalid = These settings do not satisfy the schema of {$name}: {$error}
+cli-quickstart-plugins-config-defaults-prompt = Install {$name} without these settings? You can set them later with `zeroclaw config set`.
+cli-quickstart-plugins-config-undeclared-prompt = The settings schema of {$name} requires settings it does not declare: {$keys}. No config entry can satisfy it, so the plugin's tool would not be usable. Install it anyway?
+cli-quickstart-plugins-config-cancelled = Configuration of {$name} was cancelled.
+cli-quickstart-plugins-config-saved = Saved settings for {$name}: {$keys}
+cli-quickstart-plugins-config-save-failed = {$name} is installed, but its settings ({$keys}) could not be saved: {$error}. Set each one with:
+cli-quickstart-plugins-field-json-array = Enter a JSON array.
+cli-quickstart-plugins-field-json-object = Enter a JSON object.
+cli-quickstart-plugins-installed = Installed {$name} {$version}.
+cli-quickstart-plugins-already-installed = {$name} is already installed. Quickstart leaves the installed version as it is.
+cli-quickstart-plugins-kept-not-configured = {$name} stays installed, but Quickstart could not finish setting it up: {$error}
+cli-quickstart-plugins-missing-row = {$name} has no config entry, so Quickstart creates one. Choose what network access it grants.
+cli-quickstart-plugins-row-skipped = {$name} stays installed without a config entry, so it reaches no network destination. To create the entry later, without network access, run: {$command}
+cli-quickstart-plugins-grant-declared-later = To let {$name} reach its {$count} declared destination(s), also run this after creating the entry: {$command}
+cli-quickstart-plugins-no-declared-hosts = {$name} requests network access but declares no destinations, so its config entry grants none. To grant the hosts your deployment uses, append them to this command as one comma-separated value: {$command}
+cli-quickstart-plugins-declared-hosts-not-granted = {$name} declares these destinations: {$hosts}. Quickstart offers to grant declared destinations only to plugins that request http_client, so its config entry grants none of them. To grant them, run: {$command}
+cli-quickstart-plugins-activation-heading = Activating plugins turns on {$settings}, which activates:
+cli-quickstart-plugins-activation-tool = tool plugin {$name}
+cli-quickstart-plugins-activation-skill = skill plugin {$name}
+cli-quickstart-plugins-activation-channel = channel plugin.{$alias} (package {$name})
+cli-quickstart-plugins-activation-others = This also activates plugins or channel instances that this run did not install or finish setting up.
+cli-quickstart-plugins-activation-unverified = The plugins directory could not be read ({$error}), so this list may leave out plugins that would also activate.
+cli-quickstart-plugins-activation-prompt = Activate plugins now?
+cli-quickstart-plugins-activation-declined = The plugins stay installed but inactive. Activate them later with:
+cli-quickstart-plugins-activation-enabled = Plugin activation is on.
+cli-quickstart-plugins-activation-save-failed = Plugin activation could not be saved: {$error}. Activate plugins later with:
+cli-quickstart-plugins-readiness-heading = Plugin status:
+cli-quickstart-plugins-ready = {$name}: admitted as a tool (config entry {$key}). The tool registry registers it when it is next built, unless its name clashes with a tool already registered or its tool description cannot be read.
+cli-quickstart-plugins-ready-plugins-disabled = {$name}: inactive, because plugins.enabled is off.
+cli-quickstart-plugins-ready-auto-discover-disabled = {$name}: inactive, because plugins.auto_discover is off.
+cli-quickstart-plugins-ready-not-installed = {$name}: not installed.
+cli-quickstart-plugins-ready-not-a-tool = {$name}: installed, but it provides no tool.
+cli-quickstart-plugins-ready-does-not-load = {$name}: installed, but it does not load against this host, so ZeroClaw skips it at startup. See why with: {$command}
+cli-quickstart-plugins-ready-ceiling = {$name}: inactive, because the plugins.max_active_instances limit ({$max}) is reached.
+cli-quickstart-plugins-ready-unknown = {$name}: status unavailable: {$error}
+cli-quickstart-plugins-ready-rejected = {$name}: installed, but not usable, because its config entry does not satisfy the plugin's settings schema: {$error}
+cli-quickstart-plugins-ready-missing-settings = {$name}: these required settings are not set: {$keys}. Set each one with:
+cli-quickstart-plugins-ready-missing-nonportable = {$name}: these required settings are not set: {$keys}. Quickstart prints commands only for setting names of up to 128 ASCII letters, digits, `.`, `-` and `_`, which are safe to show and to paste into a shell. Set these in the config file, or with a `zeroclaw config set` command you quote yourself.
+cli-quickstart-plugins-ready-undeclared-required = {$name}: its settings schema requires settings it does not declare, so no config entry can satisfy it until the plugin's publisher fixes the schema: {$keys}.
+cli-quickstart-plugins-ready-no-row = {$name}: installed, but it has no config entry yet, so it has no settings and no network grant. Create the entry with: {$command}
+cli-quickstart-plugins-ready-legacy-row = {$name}: installed, but its config entry is still the [[plugins.entries]] row named '{$legacy}', in the pre-1.0 key format from before typed config, which the runtime does not read, so the plugin has no settings and no network grant. Rename that row to '{$key}' in your config file, then save.
+cli-quickstart-plugins-ready-legacy-row-listed = {$name}: installed, but its config entry is still the [[plugins.entries]] row named '{$legacy}', in the pre-1.0 key format from before typed config, which the runtime does not read, so the plugin has no settings and no network grant. Rename that row to '{$key}' in your config file, then save. To see the update steps, including any network grant the renamed row still needs, run: {$command}
+cli-quickstart-plugins-ready-no-entry-needed = {$name}: admitted as a tool. It has nothing to configure, so it needs no config entry. The tool registry registers it when it is next built, unless its name clashes with a tool already registered or its tool description cannot be read.
+cli-quickstart-plugins-readiness-unavailable = Plugin status is unavailable: {$error}
+cli-quickstart-plugins-restart-note = A daemon that is already running keeps the configuration it loaded: the config entries, settings, network grants and plugin activation changes this run wrote reach it only after it restarts or reloads its configuration. If plugin activation was already on in that configuration, it can load a newly installed plugin sooner, the next time it builds its tool registry (for example for a new session), with the config entry it had loaded for that plugin, never one this run wrote: without one, the plugin has no settings and no network grant, and an older entry, such as one kept from an earlier install, applies with its settings and network grant. If it runs as the installed service, restart it with: {$command}. `zeroclaw agent` and other one-shot commands pick them up the next time they start.
+cli-quickstart-plugins-stopped = Quickstart stopped before creating the agent. Plugins installed or configured in this run stay in place: {$names}.
+cli-quickstart-plugins-stopped-none = Quickstart stopped before creating the agent. No plugin was installed or configured.
+cli-quickstart-plugins-apply-failed-state = Plugins installed or configured before the agent step stay in place: {$names}. Re-running Quickstart will not reinstall them.
+cli-quickstart-plugins-apply-failed-state-activated = Plugins installed or configured before the agent step stay in place: {$names}, and plugin activation stays on. Re-running Quickstart will not reinstall them.
+cli-quickstart-plugins-apply-failed-activated = Plugin activation turned on before the agent step stays on.
+cli-quickstart-plugins-agent-not-created = Your agent was not created.
+cli-quickstart-plugins-remove-heading = To remove a plugin this run installed, run:
+cli-quickstart-plugins-fix-and-rerun = Fix the following and run quickstart again:
 cli-no-channels-compiled = {"  "}No channel types are compiled into this binary.
 cli-quickstart-complete = Quickstart complete. Created agent `{$alias}`.
 cli-next-steps = Next steps:
@@ -785,7 +952,11 @@ cli-status-model = {"   "}Model:         {$model}
 cli-status-observability = 📊 Observability:  {$v}
 cli-status-trace-storage = 🧾 Trace storage:  {$mode} ({$path})
 cli-status-agents = 🛡️  Agents:        {$v}
+cli-status-agent-risk-profile = {$alias}={$level}
+cli-status-agent-no-risk-profile-summary = {$alias}=<no risk_profile>
 cli-status-runtime = ⚙️  Runtime:       {$v}
+cli-status-web-ui-found = 🌐 Web UI:        FOUND ({$path})
+cli-status-web-ui-missing = 🌐 Web UI:        MISSING
 cli-status-heartbeat = 💓 Heartbeat:      {$v}
 cli-status-heartbeat-every-minutes = every {$minutes}min
 cli-status-memory = 🧠 Memory:         {$backend} (auto-save: {$auto_save})
@@ -800,6 +971,7 @@ cli-status-max-cost-day = {"  "}Max cost/day:      ${$v}
 cli-status-max-cost-month = {"  "}Max cost/month:    ${$v}
 cli-status-spent-today = {"  "}Spent today:       ${$spent} / ${$limit}
 cli-status-spent-month = {"  "}Spent this month:  ${$spent} / ${$limit}
+cli-status-pricing-unavailable = {"  "}⚠ Pricing unavailable for {$count} model(s) ({$tokens} tokens uncosted): {$models}. Recorded spend is understated and daily/monthly caps CANNOT be enforced for these. Add pricing to the active provider profile or supply a catalog entry.
 cli-status-otp = {"  "}OTP enabled:       {$v}
 cli-status-estop = {"  "}E-stop enabled:    {$v}
 cli-status-peripherals-enabled = {"  "}Enabled:   {$v}
@@ -813,6 +985,8 @@ cli-status-word-off = off
 cli-status-word-none = (none)
 cli-status-word-configured = configured
 cli-status-word-not-configured = not configured
+cli-status-channel-configured = ✅ {$status}
+cli-status-channel-not-configured = ❌ {$status}
 cli-status-channel-not-compiled = 🚫 configured, not compiled
 
 # ── desktop / config / plugins / estop / auth ──
@@ -820,10 +994,19 @@ cli-desktop-not-installed = ZeroClaw companion app is not installed.
 cli-desktop-blurb1 = The companion app is a lightweight menu bar app that
 cli-desktop-blurb2 = connects to the same gateway as the CLI.
 cli-config-all-configured = All sections already configured.
+cli-config-initialized-sections = Initialized {$count} section(s) with defaults:
 cli-config-schema-current = Config already at current schema version.
 cli-config-applied-ops = Applied {$count} operation(s):
+cli-config-patch-notice-flush-failed = Config patch was saved, but its notice could not be flushed
 cli-plugins-none = No plugins installed.
 cli-plugins-installed = Installed plugins:
+cli-plugin-catalog-heading = Plugins:
+cli-plugin-catalog-empty = No installed or cached-registry plugins.
+cli-plugin-catalog-installed = {"  "}● {$name} v{$version} — installed — {$description}
+cli-plugin-catalog-installed-listed = {"  "}● {$name} v{$version} — installed, listed — {$description}
+cli-plugin-catalog-installed-other-version = {"  "}● {$name} v{$installed_version} — installed; registry v{$available_version} — {$description}
+cli-plugin-catalog-available = {"  "}○ {$name} v{$version} — available in cached registry — {$description}
+cli-plugin-catalog-cache-failed = warning: could not read cached plugin registry: {$error}
 cli-plugin-search-none = No plugins matching '{$query}'.
 cli-plugin-search-results = Plugins matching '{$query}' ({$count}):
 cli-plugin-search-result =   {$name} v{$version} — {$description}
@@ -833,15 +1016,121 @@ cli-plugin-installed-from = Plugin installed from {$source}
 cli-plugin-installed-name-version = Installed plugin {$name} v{$version}
 cli-plugin-config-entry-seeded = Seeded [[plugins.entries]] for '{$name}'. Set plugin config values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
 cli-plugin-config-entry-key = Config entry key ({$capability}): {$key}
+cli-plugin-config-entry-key-channel = Config entry key (channel plugin.{$alias}): {$key}
 cli-plugin-config-entry-seed-skipped = warning: skipped seeding the config entry for '{$name}': the [plugins] section on disk is malformed. Repair it, add a [[plugins.entries]] block with `name = "{$name}"`, then set values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
-cli-config-section-degraded = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
+cli-plugin-egress-seeded = Granted egress for '{$name}' from its manifest declaration ({$count} destination(s)):
+cli-plugin-egress-destination = → {$host}
+cli-plugin-egress-edit-command = Edit this grant later with: {$command}
+cli-plugin-egress-withheld = Network access for '{$name}' was withheld: its config entry grants no destinations. Grant the {$count} declared destination(s) later with: {$command}
+cli-plugin-egress-declared-not-granted = Plugin '{$name}' declares {$count} destination(s) its existing config entry does not grant:
+cli-plugin-egress-added = + {$host}
+cli-plugin-egress-apply-command = Grant them deliberately with: {$command}
+cli-plugin-egress-granted-not-declared = Plugin '{$name}' grants {$count} destination(s) its manifest no longer declares (left in place):
+cli-plugin-egress-removed = - {$host}
+cli-plugin-egress-never-extended = The existing egress grant for '{$name}' was NOT modified: installing a package never extends an entry's allowlist.
+cli-plugin-egress-inherited = Plugin '{$name}' declares no egress, but its existing config entry still grants {$grants}. The installed package inherits that grant; edit or remove it under plugins.entries.{$key}.
+cli-plugin-egress-gap = {$name}: declares {$hosts}, which its config entry does not grant — requests there are denied. Grant with: {$command}
+cli-plugin-egress-gap-legacy = {$name}: declares {$hosts}, which its config entry does not grant — requests there are denied. Its config row still uses the pre-1.0 key format, so migrate the row before granting:
+cli-plugin-egress-migrate-step = 1) migrate the row: rename the [[plugins.entries]] row named '{$legacy}' to '{$key}' in your config file, then save. `zeroclaw plugin info {$name}` prints that key.
+cli-plugin-egress-grant-step = 2) grant: {$command}
+cli-plugin-egress-legacy-inert = {$name}: its config row still uses the pre-1.0 key format, which the runtime does not read — its egress grant is not in effect and requests are denied. Rename the [[plugins.entries]] row named '{$legacy}' to '{$key}' in your config file, then save. `zeroclaw plugin info {$name}` prints that key.
+cli-plugin-egress-invalid-grant = {$name}: the runtime rejects its egress grant ({$reason}) — every request is denied until it is fixed. Replace the grant with: {$command}
+cli-plugin-egress-invalid-grant-legacy = {$name}: the runtime rejects its egress grant ({$reason}) — every request is denied until it is fixed. Its config row still uses the pre-1.0 key format, so migrate the row, then replace the grant:
+cli-plugin-egress-repair-incomplete = {$name}: after the printed command the runtime would still reject the grant ({$reason}). Fix `plugins.entries.{$key}.egress_allow_private` to match the granted hosts, or remove the carve-out.
+cli-plugin-egress-deployment-rejected = The runtime rejects every plugin egress policy in this deployment ({$reason}), so no plugin's grant can take effect until it is fixed. Check `security.nat64_prefixes` and `plugins.limits.max_connections_per_instance`.
+cli-plugin-install-verify-failed = install failed: '{$name}' does not load against this host: {$error} — rebuild the plugin against this host's WIT (see wit/v0), or override with --no-verify to install anyway.
+cli-plugin-install-verify-bypassed = note: skipping the install-time load check for '{$name}' (--no-verify); if it does not load against this host it will be skipped at startup
+cli-plugin-install-unadmitted-package = install failed: '{$name}' already exists in the plugins directory but is not an installed package, and install never overwrites it. If an interrupted install left it behind, delete it with `zeroclaw plugin remove {$name}`, then install again.
+cli-plugin-remove-unadmitted-package = `zeroclaw plugin remove` left '{$name}' in place: {$reason}. It deletes a directory the host has not loaded only when the directory is empty, or when it holds only what an install writes and admission rejects its own contents rather than its signature; delete '{$name}' by hand if it should go.
+cli-plugin-install-retained = Install could not publish the package and kept the staged copy at {$path}: {$reason}. Resolve the occupied name or filesystem error, then run the install again.
+cli-plugin-install-move-unsupported = Install needs a rename that refuses an existing destination, and this platform or filesystem has none ({$reason}). Nothing was installed and no staged copy was kept. This build refuses that move on FreeBSD and other Unix systems besides Linux, Android and macOS. Linux before 3.15 and NFS mounts without no-replace support also lack the operation; choose a plugins directory on a filesystem that supports atomic no-replace moves.
+cli-plugin-install-move-unsupported-cleanup = Install cannot safely publish on this platform or filesystem ({$reason}). Nothing was installed. Cleanup of its unpublished transaction could not be confirmed at {$path}. Repair safe no-replace move support and resolve this cleanup failure before attempting another install.
+cli-plugin-recovery-retained = Recovery retained files at {$path}: {$reason}. Resolve the occupied destination or filesystem error, then retry plugin remove.
+cli-plugin-staging-retained = Retained staging at {$path} because its ownership could not be proved abandoned. The recovered package can be installed again using fresh staging.
+cli-plugin-namespace-changed = Plugin operation refused because filesystem ownership changed: {$reason}. Inspect the plugins directory before retrying.
+cli-config-section-degraded = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Use the running executable at `{$executable}` with `config migrate` to see the parse error, then repair the file.
+cli-config-section-degraded-executable = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Use the running executable at `{$executable}` with `config migrate` to see the parse error, then repair the file.
+cli-plugin-list-entry-loads = {$name} v{$version} — {$description} [loads]
+cli-plugin-list-entry-failed = {$name} v{$version} — {$description} [does not load: {$error}]
+cli-plugin-list-entry-no-component = {$name} v{$version} — {$description} [no component to load]
 cli-config-section-retired-wati = warning: retired WATI channel config section `{$section}` is ignored because WATI support was removed. Migrate to `[channels.whatsapp.<alias>]` using the Cloud API or WhatsApp Web, then revoke the unused WATI API token.
 cli-config-section-retired-node-transport = warning: retired `[node_transport]` config is ignored because the legacy HMAC node transport was removed. Delete the section from config.toml.
 cli-plugin-removed = Plugin '{$name}' removed.
+cli-plugin-removed-grant-kept = Its config entry '{$key}' is kept, with its egress grant ({$grants}): a package installed later as '{$name}' inherits it. Delete the [[plugins.entries]] row named '{$key}' to drop the grant.
+cli-plugin-removed-binding-kept = The channel binding plugin.{$alias} still names '{$name}'. It stays inert until a package of that name is installed again; remove the {$table} table to drop it.
+cli-plugin-removed-channel-grant-kept = The config entry '{$key}' for plugin.{$alias} is kept, with its egress grant ({$grants}): a package installed later as '{$name}' and bound to that alias inherits it. Delete the [[plugins.entries]] row named '{$key}' to drop the grant.
+cli-plugin-channel-bound = Bound channel instance plugin.{$alias} to package '{$name}'.
+cli-plugin-channel-binding-kept = Channel instance plugin.{$alias} is already bound to '{$name}'; the binding was left unchanged.
+cli-plugin-channel-not-provided = Package '{$name}' does not provide a channel, so it cannot be bound to plugin.{$alias}.
+cli-plugin-channel-invalid-alias = '{$alias}' is not a valid channel alias: {$reason}
+cli-plugin-channel-alias-owned = Channel alias plugin.{$alias} is bound to package '{$owner}', not '{$name}'. Choose another alias, or remove the [channels.plugin.{$alias}] table first.
+cli-plugin-channel-config-degraded = Refusing to bind plugin.{$alias}: the [{$section}] section on disk is malformed and was not loaded. Repair it and retry.
+cli-plugin-channel-egress-decision-required = Package '{$name}' declares {$count} destination(s) for plugin.{$alias}: {$hosts}. Re-run with `--egress declared` to grant them, or `--egress none` to bind with no network reach.
+cli-plugin-channel-egress-withheld = No egress was granted to plugin.{$alias} (--egress none). Its manifest declares {$hosts}. Grant them later with: {$command}
+cli-plugin-channel-egress-nothing-declared = Package '{$name}' declares no destinations. To grant plugin.{$alias} the hosts your deployment uses, append them to this command as one comma-separated value: {$command}
+cli-plugin-channel-egress-flag-ignored = --egress was not applied: the config entry for plugin.{$alias} already exists, and this command never extends an existing grant.
+cli-plugin-channel-permissions = plugin.{$alias} holds the permissions its manifest requests: {$permissions}
+cli-plugin-channel-permissions-none = plugin.{$alias} requests no permissions.
+cli-plugin-channel-row-missing = plugin.{$alias} has no config entry yet, so its configuration cannot be set. Create it with: {$command}
+cli-plugin-channel-row-missing-declared = plugin.{$alias} has no config entry yet, so its configuration cannot be set, and its manifest declares {$hosts}. Create the entry with one of the commands below: `--egress none` creates it with no network reach, and `--egress declared` grants them.
+cli-plugin-channel-row-missing-invalid-alias = plugin.{$alias} has no config entry yet, and `plugin bind` cannot create one because the config alias grammar rejects the alias ({$reason}). Rename the {$table} table to a valid alias, then bind that alias.
+cli-plugin-channel-alias-unkeyed = The channel binding plugin.{$alias} of package '{$name}' is skipped: no plugin instance can be named by that alias ({$reason}). Rename or remove the {$table} table.
+cli-plugin-channel-required-config = Required configuration for plugin.{$alias} ({$count} key(s)):
+cli-plugin-channel-required-key-set = {$key}: set
+cli-plugin-channel-required-key-missing = {$key}: missing. Set it with: {$command}
+cli-plugin-channel-required-secret-missing = {$key}: missing (secret; the command prompts without echo). Set it with: {$command}
+cli-plugin-channel-required-key-unaddressable = {$key}: missing. No command is printed for a property name outside the portable key grammar; set it in the [[plugins.entries]] row named '{$row}' in the config file.
+cli-plugin-channel-config-invalid = plugin.{$alias} configuration does not validate yet: {$error}
+cli-plugin-channel-retained-row = The refused values are on the [[plugins.entries]] row named '{$key}'. The installed package declares no configuration, so delete that row from the config file to clear the refusal for plugin.{$alias}.
+cli-plugin-channel-retained-values = The refused values are in the `config` map of the [[plugins.entries]] row named '{$key}'. The installed package declares no configuration, so remove those values from the config file to clear the refusal for plugin.{$alias}, and keep the row: it holds the instance's egress grant.
+cli-plugin-channel-config-valid = plugin.{$alias} configuration validates against the package schema.
+cli-plugin-channel-activation-ready = The activation plan admits plugin.{$alias}: it starts at the next daemon start or reload if its component loads.
+cli-plugin-channel-activation-plugins-disabled = plugin.{$alias} will not activate: plugins.enabled is false. Enable the plugin system with: {$command}
+cli-plugin-channel-activation-binding-disabled = plugin.{$alias} will not activate: its binding is disabled. Enable it with: {$command}
+cli-plugin-channel-activation-binding-disabled-manual = plugin.{$alias} will not activate: its binding is disabled. Set `enabled = true` in the {$table} table of the config file by hand. No command is printed for an alias outside the config alias grammar; for a dotted alias, `config set` would create another binding.
+cli-plugin-channel-activation-no-owner = plugin.{$alias} will not activate: no enabled agent lists plugin.{$alias} in its channels. Add plugin.{$alias} to an enabled agent's `channels` list (agents.<agent>.channels).
+cli-plugin-channel-activation-over-ceiling = plugin.{$alias} will not activate: plugins.max_active_instances leaves no slot for it.
+cli-plugin-channel-activation-package-missing = plugin.{$alias} will not activate: package '{$name}' is not installed.
+cli-plugin-channel-activation-not-a-channel = plugin.{$alias} will not activate: package '{$name}' does not provide a channel.
+cli-plugin-channel-activation-plan-failed = plugin.{$alias} will not activate: the runtime cannot build its plugin activation plan ({$error}).
+cli-plugin-channel-restart-note = A running daemon picks up plugin.{$alias} after a restart or reload.
+cli-plugin-channel-bind-hint = Package '{$name}' provides a channel. To bind an instance, replace ALIAS with the alias you choose and run: {$command}
+cli-plugin-channel-bind-hint-egress = Package '{$name}' provides a channel, and its manifest declares {$hosts}. To bind an instance, replace ALIAS with the alias you choose and run one of the commands below: `--egress none` binds with no network reach, and `--egress declared` grants those destinations.
 cli-plugin-not-found = Plugin '{$name}' not found.
 cli-plugin-legacy-detected = Note: plugins in a legacy location ({$path}) are not loaded by the agent — run `zeroclaw plugin migrate` to move them into {$target}.
 cli-plugin-migrated = Moved {$count} plugin(s) from {$path} to {$target}.
 cli-plugin-migrate-none = Nothing to migrate.
+cli-plugin-install-already-installed = install failed: '{$name}' is already installed, and install never replaces a package. Update it with: {$command}
+cli-plugin-list-displaced = Note: an interrupted update left '{$name}' displaced, so it is not loaded. Run `{$command}` to put it back and update it from the registry, or `{$local}` to put it back and update it from a package directory instead.
+cli-plugin-update-about = Replace installed plugins with another version from the registry, or with a local package directory
+cli-plugin-update-usage-from = --from takes exactly one plugin name, without a version: the package directory decides the version.
+cli-plugin-update-usage-allow = --allow and --allow-token apply to exactly one plugin: name that plugin alone, pinned to the version you approve.
+cli-plugin-update-usage-allow-item = '{$item}' is not an --allow or --allow-token item: use permission:<name>, capability:<name>, provides:<id>, or publisher:<key>.
+cli-plugin-update-checking = Checking the plugin registry for updates...
+cli-plugin-update-restored = Restored '{$name}' {$version}, which an interrupted update had left displaced.
+cli-plugin-update-updated = Updated '{$name}' from {$from} to {$to}.
+cli-plugin-update-downgraded = Replaced '{$name}' {$from} with {$to}, an older version than the one installed.
+cli-plugin-update-reinstalled = Reinstalled '{$name}' {$version}.
+cli-plugin-update-up-to-date = '{$name}' is up to date ({$version}).
+cli-plugin-update-not-listed = Skipped '{$name}': the registry does not list it.
+cli-plugin-update-needs-approval = '{$name}' {$version} requests authority the installed version does not have:
+cli-plugin-update-approval-item = + {$item}
+cli-plugin-update-approval-command = Nothing was changed. To accept it and update, run: {$command}
+cli-plugin-update-not-installed = Could not update '{$name}': it is not installed. Install it with: {$command}
+cli-plugin-update-failed = Could not update '{$name}': {$error}
+cli-plugin-update-failed-kept = Could not update '{$name}': {$error}. Version {$version} is still installed.
+cli-plugin-update-legacy-row = Could not update '{$name}': its config row still uses the pre-1.0 key format. Version {$version} is still installed.
+cli-plugin-update-interrupted = Could not update '{$name}': {$error}. Its previous version was not moved back and is preserved at {$preserved}. Run `{$command}` to put it back and try the update again, unless a package named '{$name}' is installed by then.
+cli-plugin-update-not-in-registry = the registry does not list '{$spec}'
+cli-plugin-update-does-not-load = it does not load against this host: {$error}
+cli-plugin-update-displaced-ambiguous = an interrupted update left several copies of '{$name}' ({$paths}), and which one was installed last is not known. Rename the one to keep to '{$name}' in the plugins directory, then run this command again
+cli-plugin-update-displaced-occupied = an interrupted update left it at {$displaced}, but {$occupant} is in the way. Move that aside, then run this command again
+cli-plugin-update-config-rejected = warning: '{$name}' {$version} rejects the configuration of its instance {$key} ({$error}). That instance will not load until its configuration fits the new version.
+cli-plugin-update-leftover = warning: the replaced version of '{$name}' could not be deleted from {$path} ({$error}). It is not loaded; delete it by hand, or the next update of '{$name}' tries to delete it again.
+cli-plugin-update-restored-not-admitted = the copy an interrupted update left was put back at {$path}, but this host does not admit it; run `zeroclaw plugin list --verbose` to see why
+cli-plugin-update-summary = Updated: {$updated}. Up to date: {$current}. Skipped: {$skipped}. Not updated: {$failed}.
+cli-plugin-update-restart = Restart the daemon so plugin instances it has already started use the new version.
+cli-plugin-update-failed-exit = {$count} plugin(s) not updated.
 cli-estop-resume-done = Estop resume completed.
 cli-estop-engaged = Estop engaged.
 cli-estop-status = Estop status:
@@ -859,6 +1148,10 @@ cli-config-secret-set = {$path} is set (encrypted secret — value not displayed
 cli-config-secret-unset = {$path} is not set (encrypted secret)
 cli-config-updated = {$path} updated.
 cli-config-review-hint = Run `zeroclaw config list` to review, then set required fields.
+cli-config-catalog-unavailable-manual = {"  "}⚠ Catalog for {$provider} is unavailable ({$error}); enter the model ID manually.
+model-switch-catalog-failed = Could not load catalog for configured provider profile {$provider}: {$error}
+model-switch-provider-not-allowed = Model switch to {$provider} is not allowed by the active effort-routing policy.
+model-switch-route-selector-not-allowed = Model ID cannot be a route selector; provide a provider-local model ID.
 cli-config-backed-up = Backed up to {$path}
 cli-plugin-name-version = Plugin: {$name} v{$version}
 cli-plugin-description = Description: {$desc}
@@ -866,6 +1159,12 @@ cli-plugin-capabilities = Capabilities: {$v}
 cli-plugin-permissions = Permissions: {$v}
 cli-plugin-wasm = WASM: {$path}
 cli-plugin-wasm-none = WASM: (skill-only plugin)
+cli-plugin-info-load-ok = Loads: yes. The component instantiates against this host's WIT world.
+cli-plugin-info-load-failed =
+    Loads: no. {$error}
+    Rebuild the plugin against the WIT shipped with this host (see wit/v0) and reinstall it.
+cli-plugin-info-load-not-applicable = Loads: not applicable. This is a skill-only plugin, so there is no component to instantiate.
+cli-plugin-info-load-failed-exit = plugin '{$name}' does not load against this host
 cli-estop-domains-none = {"  "}domain_blocks:  (none)
 cli-estop-domains = {"  "}domain_blocks:  {$v}
 cli-estop-tools-none = {"  "}tool_freeze:    (none)
@@ -940,6 +1239,16 @@ turn-interrupted-by-user = [interrupted by user]
 # on this path, so the wording names the channel, not a user.
 turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
+turn-single-tool-rounds-prompt = Use at most one tool call in each response. Wait for its result before choosing another tool call.
+turn-single-tool-rounds-unsupported = [Single-tool rounds are unavailable on the current provider route. Continuing with batch tool calls.]
+turn-single-tool-rounds-violation = The provider returned multiple tool calls under single-tool policy. No tools from this response were executed.
+turn-provider-images-quarantined =
+    { $count_plural ->
+        [one] 1 image that had not previously succeeded with this provider was omitted after the provider rejected the request.
+       *[other] { $count } images that had not previously succeeded with this provider were omitted after the provider rejected the request.
+    } Send an omitted image again in a new message to try it again.
+turn-failed = [turn failed]
+turn-failed-attachment-omitted = [attachment omitted: the provider rejected it on the failed turn]
 # Trailing notice appended (and streamed as a final chunk) when the resilient
 # provider wrapper served the turn with a different model or provider than the
 # one requested, so silent model downgrades stay visible on direct-turn
@@ -948,12 +1257,15 @@ turn-model-fallback-notice = ⚡ { $requested_model } ({ $requested_provider }) 
 # Shown at the end of agent output when the tool call loop exhausted its
 # iteration budget and the agent cannot continue without exceeding limits.
 turn-max-iterations-reached = *Turn stopped: reached maximum tool iterations ({ $max_iterations }).*
+turn-execution-tree-budget-reached = *Turn stopped: exhausted the execution-tree iteration budget.*
+turn-context-window-exceeded-error = This request exceeds the selected model's context window. Reduce the request or enabled tools, or choose a model with a larger context window.
 # Breadcrumb injected into history where older turns were dropped to fit the
 # context budget; user-visible across channels, WS, RPC, ACP.
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 # Reason carried on every history_trimmed event (WS, SSE, ACP).
 history-trim-reason-budget = context token budget exceeded
-history-trim-reason-message-cap = history message limit exceeded
+history-trim-reason-message-cap = history turn limit exceeded
+history-trim-reason-recovery = context window overflow recovery
 # Remediation surfaced when the system prompt + inlined tool definitions alone
 # meet or exceed the context budget, so no amount of conversation trimming can
 # fit the request (#5808).
@@ -966,6 +1278,14 @@ turn-tool-interrupted-before-result = [interrupted by user before this tool prod
 # Safe reply delivered when the model repeatedly emits malformed internal
 # tool-call protocol and the turn gives up retrying.
 channel-runtime-malformed-tool-output = I generated an internal tool-call format error and could not complete this request. Please try again.
+# Safe reply delivered when the streaming protocol guard withheld the same
+# response text on two attempts that were both rejected as tool-protocol
+# parse issues (a recovered valid tool call is not stopped this way):
+# retrying cannot recover the withheld envelope, so the turn ends instead of
+# spending another model call. Prose released ahead of the envelope may
+# already have reached the user, so the text claims nothing about the rest
+# of the reply.
+cli-agent-error-protocol-guard-withheld = I withheld the tool-protocol-shaped part of this reply, and a retry produced the same text.
 channel-runtime-progress-received = Received
 channel-runtime-progress-planning = Planning
 channel-runtime-progress-waiting-on-model = Waiting on model
@@ -976,6 +1296,8 @@ channel-runtime-matrix-progress-item-too-large = ⚠️ This line is too large t
 channel-runtime-new-session = Conversation history cleared. Starting fresh.
 channel-runtime-stop-sent = Stop signal sent.
 channel-runtime-stop-no-task = No in-flight task for this sender scope.
+channel-runtime-stop-folded-followup = Nothing to stop here: this reply was merged into the earlier message it answers, which is still being processed. Send /stop in that conversation to cancel it.
+channel-runtime-conversation-busy = This conversation has too many pending messages; this one was dropped. Wait for a reply, or send /stop to clear your queued requests.
 channel-runtime-model-empty = Model ID cannot be empty. Use `/model <model-id>`.
 channel-runtime-model-switched = Model switched to `{ $model }` (model_provider: `{ $provider }`). Context preserved.
 channel-runtime-agent-scope-rejected = Sender `{ $sender }` is not authorized for `/model --agent` on agent `{ $agent }`. Use `/model --user { $model }` for a session-only override, or ask an admin to mark a peer group `admin_for_agent_scope = true` with you as a member.
@@ -1016,6 +1338,7 @@ channel-runtime-set-provider-switched =
 channel-runtime-set-provider-init-failed =
     Failed to initialize model_provider `{ $provider }`. Route unchanged.
     Details: { $error }
+channel-runtime-effort-routing-invalid = ⚠️ Effort routing configuration is invalid. Check the configured local and cloud route hints.
 channel-runtime-provider-ambiguous = ModelProvider `{ $family }` has multiple configured aliases. Qualify which one with `/models { $family }.<alias>`: { $list }
 channel-runtime-provider-no-alias = No configured provider entry for `{ $provider }`. Add `[providers.models.{ $provider }]` (with its api_key/uri) or select a configured provider — `/models` lists valid ones.
 channel-runtime-provider-unknown = Unknown model_provider `{ $provider }`. Use `/models` to list valid model_providers.
@@ -1036,9 +1359,17 @@ channel-runtime-provider-turn-init-failed =
 channel-runtime-fallback-footer =
     ⚡ `{ $requested }` unavailable — response from **{ $actual }** (`{ $model }`)
     Switch model: /models
+channel-runtime-model-fallback-redacted = ⚡ The requested model was unavailable; a fallback model served this reply.
+channel-runtime-safeguard-footer-server =
+    🛡️ Safety safeguards flagged this request — Anthropic served the response with **{ $served }** (requested `{ $requested }`).
+channel-runtime-safeguard-footer-client =
+    🛡️ Safety safeguards flagged this request — switched to **{ $served }** (requested `{ $requested }`).
+channel-runtime-safeguard-footer-client-server =
+    🛡️ Safety safeguards flagged this request — switched through a fallback chain to **{ $served }** (requested `{ $requested }`).
 
 delegate-provider-fallback-warning = Warning: The delegated agent recovered through a provider fallback. Provider failure details were logged and omitted from this result.
 turn-tool-protocol-strict-mixed-error = Strict tool parsing cannot run a fallback chain that mixes native-tool and text-only candidates. Configure every reachable candidate to use the same tool protocol, or set strict_tool_parsing to false.
+turn-context-hook-mutation-unsafe-error = A before-LLM-call hook changed existing messages in a way that cannot be safely reconciled with a required context-budget trim. Configure the hook to only append messages, or shorten the current turn.
 delegate-provider-fallback-header = [Agent '{ $agent }' (requested: { $requested_provider }/{ $requested_model }; served: { $actual_provider }/{ $actual_model })]
 delegate-provider-fallback-header-agentic = [Agent '{ $agent }' (requested: { $requested_provider }/{ $requested_model }; served: { $actual_provider }/{ $actual_model }, agentic)]
 
@@ -1073,6 +1404,43 @@ cli-alias-live-acp-sessions = {$count} live ACP session(s) for `{$alias}` — en
 cli-alias-owned-state-unavailable = note: config references were updated, but the agent's owned state (memory rows, workspace dir, cron/acp/session rows) was NOT cascaded by this CLI yet — use the gateway API for the full owned-state cascade.
 cli-bundle-not-configured = skill bundle '{$alias}' is not configured
 cli-bundle-rename-failed = rename failed: {$error}
+
+# ── Agent bundle export — zeroclaw agents export ──
+cli-agent-export-workspace-root-escape = the agent workspace {$path} is not reachable through real directories under the install's agents tree: {$at} is a symlink or leaves that tree, so the copy cannot prove what it would carry
+cli-agent-export-skill-root-escape = skill bundle `{$alias}` at {$path} is not reachable through real directories under the install's shared tree: {$at} is a symlink or leaves that tree, so the copy cannot prove what it would carry
+cli-agent-export-path-unresolvable = {$path} reaches through `..` inside a directory that does not exist yet, so what it names cannot be checked before the export writes; write the path without `..`
+cli-agent-export-source-not-a-directory = {$path} exists but is not a directory; the export refuses to publish a bundle that silently lacks the source it names
+cli-agent-export-workspace-path-unresolvable = the configured workspace path {$path} does not end in a plain directory name, so the export cannot bind what it copies to what it checked; set `workspace.path` to the resolved directory and export again
+cli-agent-export-source-root-replaced = {$path} was replaced while the export was opening it; the copy carries the tree it inspected or nothing at all, so run the export again
+cli-agent-export-workspace-root-symlink = the agent workspace {$path} is a symlink; the bundle would carry whatever it points at as the agent's own tree, so set `workspace.path` to the real directory and export again
+cli-agent-export-skill-root-symlink = skill bundle `{$alias}` resolves to the symlink {$path}; a bundle directory must be a real directory inside the install's shared tree
+cli-agent-export-dest-not-a-dir = destination {$path} exists and is not a directory
+cli-agent-export-dest-symlink = destination {$path} is a symlink; publishing would replace whatever it points at rather than the path you named, so name the directory itself
+cli-agent-export-dest-appeared = destination {$path} did not exist when the export started and does now; replacing it was never admitted, so nothing was written
+cli-agent-export-dest-changed = destination {$path} is not the directory this export checked before copying; nothing was replaced, so look at what is there and export again
+cli-agent-export-dest-is-source = destination {$path} is now one of the trees this export read; publishing would replace the source it just copied, so nothing was written
+cli-agent-export-dest-not-empty = destination {$path} is not empty — pass --force to replace its contents
+cli-agent-export-dest-no-parent = destination {$path} has no parent directory to stage the bundle beside
+cli-agent-export-dest-contains-workspace = destination {$path} contains the agent workspace {$workspace} — exporting there would replace the workspace itself
+cli-agent-export-dest-inside-workspace = destination {$path} is inside the agent workspace {$workspace} — choose a path outside it
+cli-agent-export-dest-contains-skills = destination {$path} contains skill bundle `{$alias}` at {$source} — exporting there would replace the skills the bundle carries
+cli-agent-export-dest-inside-skills = destination {$path} is inside skill bundle `{$alias}` at {$source} — choose a path outside it
+cli-agent-export-restore-failed = failed to publish the bundle to {$path} ({$error}), and the previous bundle could not be moved back — it is at {$retired}
+cli-agent-export-written = exported agent `{$alias}` to {$path} ({$files} workspace file(s), {$kib} KiB)
+cli-agent-export-skills-carried = {"  "}{$files} skill file(s) carried from {$bundles} skill bundle(s)
+cli-agent-export-replaced-skipped = {"  "}{$count} entry/entries were replaced while the export ran and were skipped — the bundle carries the objects it inspected
+cli-agent-export-hard-links-skipped = {"  "}{$count} hard-linked file(s) skipped — a second name for a file that may live anywhere on this host is not this workspace's content to carry
+cli-agent-export-others-skipped = {"  "}{$count} special file(s) skipped — sockets, FIFOs, and devices are host state, not content a bundle can carry
+cli-agent-export-symlinks-skipped = {"  "}{$count} symlink(s) skipped — links are not followed into a bundle
+cli-agent-export-risk-header = ⚠️  {$count} capability grant(s) an importing operator must accept:
+cli-agent-export-risk-entry = {"  "}[{$kind}] {$path} — {$detail}
+cli-agent-export-secrets-header = 🔑 {$count} credential(s) were scrubbed and must be supplied on import:
+cli-agent-export-secrets-entry = {"  "}{$path}
+cli-agent-export-dropped-header = ℹ️  {$count} item(s) could not travel and were left behind:
+cli-agent-export-dropped-entry = {"  "}{$path} ({$reason}) — {$detail}
+cli-agent-export-scrub-scope = ⚠️  Scrubbing blanks the fields the schema marks secret. It is not credential detection: other config values travel as written, so a token in an MCP server's url, or a credential in its command or args, is carried and repeated in the manifest's risk flags.
+cli-agent-export-content-not-scrubbed = ⚠️  {$count} carried file(s) are copied as-is. Scrubbing covers config.toml only: workspace and skill content is never scanned for secrets, so a .env file, a token in a note, or a credential in a git remote will be contained in the export.
+cli-agent-export-review-hint = Review config.toml, zeroclaw-agent.toml, and the files the bundle carries before sharing it.
 
 # ── Skill-bundle CLI — zeroclaw skills bundle {add,remove,rename} (#7468 / #7175) ──
 cli-bundle-exists = skill bundle '{$alias}' already exists (no change)
@@ -1112,6 +1480,8 @@ cli-daemon-started-stop = Ctrl+C or SIGTERM to stop
 
 # ── daemon mTLS and enrollment operator output ──
 cli-relay-rotation-requested = Requested a relay node-id rotation. A running daemon will rotate within ~{$secs}s; the new id reaches clients in-band on their next certificate renewal.
+cli-relay-claim-ok = Daemon claimed as node-id {$node_id} on relay {$relay}. Wrote [relay] to your config; start (or restart) the daemon to register against the relay.
+cli-relay-claim-wss-disabled = Note: [wss] is disabled, and the relay refuses registration until it is enabled. The claim above is saved and stays valid - enable the WSS listener (see the secure-transport guide) and the binding takes effect on the next start.
 cli-mtls-issued-client-cert = Issued client certificate for '{$name}':
 cli-mtls-issued-cert-path = {"  "}cert: {$path}
 cli-mtls-issued-key-path = {"  "}key:  {$path}
@@ -1134,6 +1504,7 @@ cli-enroll-confirm-sas-line-1 = this one-time pairing code and confirm the short
 cli-enroll-confirm-sas-line-2 = matches on both ends before trusting the daemon:
 cli-enroll-pairing-code = {"    "}pairing code : {$code}
 cli-enroll-sas = {"    "}SAS          : {$sas}
+cli-tunnel-tcp-service-published = {"  "}🔒 Tunnel {$service} (TLS passthrough): {$endpoint}
 
 # ── Context window (doctor update-context-windows, agent interactive) ──
 cli-delegate-error-invalid-semantic-completion = Agent '{$agent_name}' failed: model provider returned an invalid semantic completion.
@@ -1156,6 +1527,7 @@ cli-agent-error-provider-connection-remote = Cannot reach the model provider at 
 cli-agent-error-provider-connection = Cannot reach the selected model provider. Check network access or choose another provider.
 cli-agent-error-provider-timeout = The selected model provider timed out. Try again or choose another provider.
 cli-agent-error-provider-generic = The selected model provider failed. Review provider configuration or choose another provider.
+cli-agent-error-provider-refusal = The model's safety system declined this request. Rephrase it, or configure fallback_models on the provider to auto-switch models.
 cli-doctor-context-window-ok = {$provider_ref}: context window: {$context_window} tokens
 cli-doctor-context-window-zero = {$provider_ref}: context_window is 0 (invalid; set it to the model's real context limit)
 cli-doctor-context-window-unset = {$provider_ref}: no context_window set — will use {$fallback} token fallback when selected; likely far below this model's real limit; set context_window on this profile
@@ -1181,6 +1553,7 @@ cli-doctor-probe-timeout-message = Model probing timed out. Some provider catalo
 cli-doctor-degraded-security = SECURITY-CRITICAL config section `{$path}` is invalid and was reset to its default so the daemon can boot; the running posture may be WEAKER than intended. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-doctor-degraded-section = config section `{$path}` is malformed and was reset to defaults; values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-doctor-verifiable-intent-tool-withheld = verifiable_intent.enabled is set, but the vi_verify tool is withheld from the model-visible registry until a credential chain verifier exists. Enabling the section does not enable credential verification on commerce tool calls. The issuance and verification library paths are unaffected.
+cli-doctor-security-audit-disabled-drops-certificate-record = security.audit.enabled=false: certificates are issued and renewed with no audit record. Command execution is not audited either way, because no production path records tool commands. Leave the section enabled to keep the certificate trail, and use an external supervisor or logging wrapper that observes the ZeroClaw process, or OS-level process accounting, if you need a record of what ran.
 sop-approval-deferred-at-capacity = Approval could not resume run {$run_id}: execution slots are full. The gate remains waiting; retry after a slot frees.
 sop-approval-policy-unavailable = Approval failed because the parked SOP step is unavailable: {$reason}. The run remains waiting.
 sop-rpc-decision-invalid-state = Run {$run_id} cannot be resolved in its current state.
@@ -1207,6 +1580,7 @@ cli-approval-prompt = { "   " }[Y]es / [N]o / [A]lways for {$tool}:{ " " }
 # always) stay hardcoded ASCII in Rust — only the surrounding prose is
 # localized here.
 channel-approval-heading = Tool approval required
+channel-approval-independent-delegate = Independent delegate {$target} from {$caller}
 channel-approval-heading-shout = APPROVAL REQUIRED
 channel-approval-tool-label = Tool
 channel-approval-args-label = Args
@@ -1214,6 +1588,7 @@ channel-approval-btn-approve = Approve
 channel-approval-btn-deny = Deny
 channel-approval-btn-always = Always
 channel-approval-tap-instruction = Tap a button below:
+channel-approval-position = Tool call { $index } of { $total }
 channel-approval-reply-instruction-yesno = Reply: "{ $yes_command }", "{ $no_command }", or "{ $always_command }"
 channel-approval-reply-instruction-approve-deny = Reply `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`.
 channel-approval-group-visibility-warning =
@@ -1224,6 +1599,20 @@ channel-telegram-approval-ack-denied = Denied
 channel-telegram-approval-ack-not-accepted = Approval not accepted
 channel-telegram-approval-ack-unknown = Unknown action
 channel-telegram-approval-ack-already-resolved = Approval already resolved
+channel-telegram-model-picker-provider-title = Current: { $provider } / { $model }
+    Choose a provider:
+channel-telegram-model-picker-model-title = Choose a model from { $provider }:
+channel-telegram-model-picker-previous = ◀ Previous
+channel-telegram-model-picker-next = Next ▶
+channel-telegram-model-picker-back = ◀ Back
+channel-telegram-model-picker-cancel = Cancel
+channel-telegram-model-picker-cancelled = Cancelled
+channel-telegram-model-picker-queued = Switching model…
+channel-telegram-model-picker-rejected = This model picker is no longer valid.
+channel-telegram-model-picker-unavailable = Model switching is temporarily unavailable. Try again.
+channel-telegram-voice-drop-too-long = ⚠️ Audio message skipped: it is longer than the { $limit_secs }s limit. Send a shorter recording or split it into parts.
+channel-telegram-voice-drop-file-unavailable = ⚠️ Audio message skipped: the file could not be retrieved from Telegram — it may be too large or no longer available. Please try a smaller or shorter file.
+channel-telegram-voice-drop-empty-transcript = ⚠️ Audio message skipped: nothing could be recognized in the recording. Please try again with a clearer recording.
 channel-discord-approval-btn-allow-once = Allow once
 channel-discord-approval-btn-allow-session = Allow this session
 channel-discord-approval-btn-allow-always = Always allow
@@ -1252,3 +1641,33 @@ cli-sessions-delete-confirm = Delete session {$key} ({$count} message(s))? [y/N]
 cli-sessions-delete-aborted = aborted — no changes made
 cli-sessions-deleted = deleted session {$key}
 cli-sessions-delete-unsupported = the session backend reported nothing deleted for {$key} — it may not support delete
+
+# ── Peer-agent delivery ──
+peer-delivery-control-plane-unavailable = in-process peer delivery requires an available durable task store: {$error}
+peer-delivery-registration-failed = peer delivery rejected: {$error}
+peer-delivery-accepted = accepted for in-process delivery to peer agent "{$recipient}" (task_id={$task_id})
+tool-git-operations-error-docker-runtime-write-unsupported = Git write commands are unavailable with the Docker runtime because they cannot be confined to its container.
+
+# ── RPC inbound authentication ──
+rpc-auth-required-token = Authentication required: present auth_token in initialize, or connect from a mapped local uid
+rpc-auth-credential-rejected = Credential rejected
+rpc-auth-credential-expired = Credential expired: re-initialize with a fresh token
+rpc-auth-assurance-required = Authentication assurance not met (MFA/ACR required)
+rpc-auth-unknown-provider = Unknown auth_provider selection
+rpc-auth-not-entitled = Authenticated, but no permission profile grants this identity anything
+rpc-auth-alias-not-entitled = Principal is not entitled to the requested agent
+rpc-auth-misconfigured = Authentication is misconfigured on this daemon (fail closed)
+rpc-auth-local-roster-required = A local user roster is configured: connect from a mapped uid or present auth_token in initialize
+rpc-auth-remote-token-required = Remote connections must present auth_token in initialize
+rpc-auth-first-call-initialize = First call must be 'initialize'
+rpc-auth-revalidation-due = Credential revalidation due: re-initialize to revalidate
+rpc-auth-pairing-revoked = Pairing token revoked: re-pair and re-initialize
+
+cron-agent-job-failed = The scheduled task could not be completed. Please try again or ask an administrator to check the logs.
+
+# Atomic RPC configuration batches
+rpc-config-set-many-empty = config/set-many requires at least one entry in `sets`
+rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries in `sets`; got { $count }
+rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
+
+skill-http-request-timeout = HTTP request timed out

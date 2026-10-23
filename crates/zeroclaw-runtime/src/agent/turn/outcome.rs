@@ -1,15 +1,36 @@
 //! Turn-loop control-flow outcomes: cancellation and model-switch errors.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 /// Callback type for checking if model has been switched during tool execution.
 /// Returns Some((model_provider, model)) if a switch was requested, None otherwise.
 pub type ModelSwitchCallback = Arc<Mutex<Option<(String, String)>>>;
 
+/// The provider/model and resolved limits that actually served the most recent
+/// LLM call in a tool loop. Written every dispatching iteration so the last
+/// value is the FINAL serving route — including a per-call vision switch that
+/// differs from the turn's selected text route.
+#[derive(Clone, Debug)]
+pub struct ServedRoute {
+    pub provider_name: String,
+    pub model: String,
+    pub context_limits: zeroclaw_config::schema::ResolvedContextLimits,
+}
+
+/// Shared sink a caller hands the loop to observe the final serving route.
+/// `None` on paths that do not return serving-route metadata (tests, sub-turns).
+pub type ServedRouteSink = Arc<Mutex<Option<ServedRoute>>>;
+
 tokio::task_local! {
     /// Pending model switch for one active tool loop. The loop owns this state;
     /// tools only borrow the current task-local handle while they execute.
     static MODEL_SWITCH_REQUEST: ModelSwitchCallback;
+
+    /// Provider profiles that a model-issued switch may target in this tool
+    /// loop. This is separate from the general provider-attempt scope so
+    /// unrelated tools keep their own network and provider policies.
+    static MODEL_SWITCH_PROVIDER_ALLOWLIST: Option<Arc<HashSet<String>>>;
 }
 
 pub(crate) fn current_model_switch_state() -> anyhow::Result<ModelSwitchCallback> {
@@ -23,6 +44,26 @@ where
     F: std::future::Future,
 {
     MODEL_SWITCH_REQUEST.scope(state, future).await
+}
+
+pub(crate) fn model_switch_provider_allowed(provider_ref: &str) -> bool {
+    MODEL_SWITCH_PROVIDER_ALLOWLIST
+        .try_with(|allowed| {
+            allowed
+                .as_ref()
+                .is_none_or(|allowed| allowed.contains(provider_ref))
+        })
+        .unwrap_or(true)
+}
+
+pub(crate) async fn scope_model_switch_provider_allowlist<F>(
+    allowed: Option<Arc<HashSet<String>>>,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    MODEL_SWITCH_PROVIDER_ALLOWLIST.scope(allowed, future).await
 }
 
 #[derive(Debug)]
@@ -40,60 +81,60 @@ pub fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
     err.chain().any(|source| source.is::<ToolLoopCancelled>())
 }
 
-/// Why the tool loop ended a turn before the model finished it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ToolLoopStop {
-    /// The turn used all `max_tool_iterations` rounds.
-    MaxIterations(usize),
-    /// The loop detector's circuit breaker fired with this message.
-    LoopDetected(String),
-    /// Tool output repeated for this many consecutive rounds.
-    IdenticalOutput(usize),
+/// The complete provider-facing request cannot fit the active model's capacity.
+#[derive(Debug)]
+pub struct ContextWindowExceeded {
+    pub estimated_tokens: usize,
+    pub model_context_window: usize,
 }
 
-impl ToolLoopStop {
-    /// Short reason for run records and alerts.
-    pub fn reason(&self) -> String {
-        match self {
-            Self::MaxIterations(n) => format!("reached maximum tool iterations ({n})"),
-            Self::LoopDetected(msg) => format!("loop detector: {msg}"),
-            Self::IdenticalOutput(n) => {
-                format!("identical tool output for {n} consecutive rounds")
-            }
-        }
+impl std::fmt::Display for ContextWindowExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&crate::i18n::get_required_cli_string(
+            "turn-context-window-exceeded-error",
+        ))
     }
 }
 
-/// A turn the tool loop stopped, with the text it produced before stopping.
+impl std::error::Error for ContextWindowExceeded {}
+
+pub fn context_window_exceeded_from_error(err: &anyhow::Error) -> Option<&ContextWindowExceeded> {
+    err.chain()
+        .find_map(|source| source.downcast_ref::<ContextWindowExceeded>())
+}
+
+/// Fork: a turn `MaxIterationBehavior::SummaryThenStop` ended after it asked
+/// for its final summary — the iteration-cap [`TurnStop`] plus the text the
+/// turn produced, summary included.
+///
+/// `Display` is the stop's and the stop is this error's source, so
+/// `zeroclaw_api::turn_stop::turn_stop` classifies it like any other stop and
+/// the error reads exactly as the stop does.
+///
+/// [`TurnStop`]: zeroclaw_api::turn_stop::TurnStop
 #[derive(Debug)]
-pub struct ToolLoopStopped {
-    pub stop: ToolLoopStop,
+pub struct StoppedTurnOutput {
+    pub stop: zeroclaw_api::turn_stop::TurnStop,
     pub partial_output: String,
 }
 
-impl std::fmt::Display for ToolLoopStopped {
+impl std::fmt::Display for StoppedTurnOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.stop {
-            ToolLoopStop::MaxIterations(n) => {
-                write!(f, "Agent exceeded maximum tool iterations ({n})")
-            }
-            ToolLoopStop::LoopDetected(msg) => {
-                write!(f, "Agent loop aborted by loop detector: {msg}")
-            }
-            ToolLoopStop::IdenticalOutput(n) => write!(
-                f,
-                "Agent loop aborted: identical tool output detected {n} consecutive times"
-            ),
-        }
+        std::fmt::Display::fmt(&self.stop, f)
     }
 }
 
-impl std::error::Error for ToolLoopStopped {}
+impl std::error::Error for StoppedTurnOutput {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.stop)
+    }
+}
 
-/// The `ToolLoopStopped` in `err`'s chain, if the tool loop stopped the turn.
-pub fn tool_loop_stopped(err: &anyhow::Error) -> Option<&ToolLoopStopped> {
+/// The text a stopped turn kept, when `SummaryThenStop` stopped it.
+pub fn stopped_turn_output(err: &anyhow::Error) -> Option<&str> {
     err.chain()
-        .find_map(|source| source.downcast_ref::<ToolLoopStopped>())
+        .find_map(|source| source.downcast_ref::<StoppedTurnOutput>())
+        .map(|stopped| stopped.partial_output.as_str())
 }
 
 #[derive(Debug)]
@@ -115,23 +156,6 @@ impl std::error::Error for StreamInterruptedAfterOutput {
         Some(&self.cause)
     }
 }
-
-/// A transport stream failure before user-visible output. The cumulative usage
-/// snapshot is retained so Reliable recovery can bill the exact selected
-/// stream attempt once.
-#[derive(Debug)]
-pub(crate) struct StreamErrorWithUsage {
-    pub(crate) message: String,
-    pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
-}
-
-impl std::fmt::Display for StreamErrorWithUsage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for StreamErrorWithUsage {}
 
 /// A stream completed without a final response after the provider reported
 /// tool work it had already executed. Replaying the request could repeat those
@@ -284,6 +308,16 @@ fn terminal_completion_error_message_with_renderer(
     agent_name: Option<&str>,
     render: CliStringRenderer,
 ) -> Option<String> {
+    if context_window_exceeded_from_error(err).is_some() {
+        return Some(render("turn-context-window-exceeded-error", &[]));
+    }
+    // A refusal that is still the final cause sits beneath Reliable's
+    // envelopes; it needs safety-specific guidance rather than the generic
+    // provider-failure projection. A later non-refusal failure replaces it as
+    // the final cause and keeps the generic projection below.
+    if zeroclaw_providers::model_refusal_from_error(err).is_some() {
+        return Some(render("cli-agent-error-provider-refusal", &[]));
+    }
     if let Some(failure) = err.chain().find_map(|source| {
         source.downcast_ref::<zeroclaw_providers::ReliableProviderTerminalFailure>()
     }) {
@@ -302,7 +336,7 @@ fn terminal_completion_error_message_with_renderer(
 }
 
 #[cfg(test)]
-fn terminal_completion_error_message_in_english(
+pub(crate) fn terminal_completion_error_message_in_english(
     err: &anyhow::Error,
     agent_name: Option<&str>,
 ) -> Option<String> {
@@ -311,6 +345,39 @@ fn terminal_completion_error_message_in_english(
         agent_name,
         crate::i18n::get_english_cli_string_with_args,
     )
+}
+
+/// Render a safeguard fallback as display-only text at a runtime delivery
+/// boundary. The provider-owned notice is the canonical accepted-route fact;
+/// this helper only resolves its localized presentation when a caller needs a
+/// text surface (direct Agent, CLI, RPC, or ACP).
+pub fn append_safeguard_fallback_notice(
+    mut response: String,
+    notice: Option<&zeroclaw_providers::SafeguardFallbackNotice>,
+) -> String {
+    let Some(notice) = notice else {
+        return response;
+    };
+    let key = match notice.kind {
+        zeroclaw_providers::SafeguardFallbackKind::ServerSide => {
+            "channel-runtime-safeguard-footer-server"
+        }
+        zeroclaw_providers::SafeguardFallbackKind::ClientSide => {
+            "channel-runtime-safeguard-footer-client"
+        }
+        zeroclaw_providers::SafeguardFallbackKind::ClientAndServer => {
+            "channel-runtime-safeguard-footer-client-server"
+        }
+    };
+    response.push_str("\n\n---\n");
+    response.push_str(&crate::i18n::get_required_cli_string_with_args(
+        key,
+        &[
+            ("requested", notice.requested_model.as_str()),
+            ("served", notice.served_model.as_str()),
+        ],
+    ));
+    response
 }
 
 #[derive(Debug)]
@@ -392,6 +459,26 @@ impl std::fmt::Display for ModelSwitchRequested {
 
 impl std::error::Error for ModelSwitchRequested {}
 
+/// A loop running with `LoopKnobs::yield_to_steering` stopped after a tool
+/// round because steering is waiting. The round's messages are already in the
+/// canonical buffer; `display_text` is the text the round showed, for the
+/// caller to commit before it starts the steered round. `reported_usage` is
+/// the last request's provider-reported usage, for the caller to hand to the
+/// resumed run so its token calibration carries over.
+#[derive(Debug)]
+pub(crate) struct SteeringPending {
+    pub(crate) display_text: String,
+    pub(crate) reported_usage: Option<super::ReportedRequestUsage>,
+}
+
+impl std::fmt::Display for SteeringPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("tool loop yielded to pending steering")
+    }
+}
+
+impl std::error::Error for SteeringPending {}
+
 pub fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, String)> {
     err.chain()
         .filter_map(|source| source.downcast_ref::<ModelSwitchRequested>())
@@ -402,6 +489,32 @@ pub fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, String)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_window_error_preserves_its_typed_cause_and_localized_projection() {
+        let error = anyhow::Error::new(ContextWindowExceeded {
+            estimated_tokens: 40_000,
+            model_context_window: 32_768,
+        })
+        .context("private prompt and provider diagnostics");
+        let exceeded = context_window_exceeded_from_error(&error).expect("typed inner cause");
+        assert_eq!(exceeded.estimated_tokens, 40_000);
+        assert_eq!(exceeded.model_context_window, 32_768);
+        assert_eq!(
+            exceeded.to_string(),
+            crate::i18n::get_required_cli_string("turn-context-window-exceeded-error"),
+        );
+        let delivered = terminal_completion_error_message(&error, Some("delegate-a"))
+            .expect("typed capacity failure must have a safe terminal projection");
+        assert_eq!(
+            delivered,
+            crate::i18n::get_required_cli_string("turn-context-window-exceeded-error")
+        );
+        assert!(!delivered.contains("private prompt"));
+        let untyped = anyhow::Error::msg("context window exceeded");
+        assert!(context_window_exceeded_from_error(&untyped).is_none());
+        assert!(terminal_completion_error_message(&untyped, None).is_none());
+    }
 
     #[test]
     fn tool_loop_cancelled_display() {
@@ -671,5 +784,78 @@ mod tests {
             None,
         ));
         assert!(is_tool_loop_cancelled(&e));
+    }
+
+    const REFUSAL_GUIDANCE: &str = "The model's safety system declined this request. Rephrase it, \
+                                    or configure fallback_models on the provider to auto-switch \
+                                    models.";
+
+    fn private_refusal() -> zeroclaw_api::model_provider::ModelRefusalError {
+        zeroclaw_api::model_provider::ModelRefusalError {
+            requested_model: "claude-primary".into(),
+            category: Some("private-category".into()),
+            usage: None,
+            attempted_candidate: None,
+            attempted_candidate_index: None,
+        }
+    }
+
+    #[test]
+    fn refusal_final_cause_projects_safety_guidance_beneath_reliable_envelopes() {
+        use zeroclaw_providers::{
+            ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+        };
+
+        // Production shape: Reliable classifies the refusal as an ordinary
+        // terminal failure and keeps the typed refusal as its cause.
+        let error = anyhow::Error::new(
+            ReliableProviderTerminalFailure::new(
+                ReliableProviderTerminalFailureKind::Other,
+                None,
+                "All model providers/models failed after 1 failure event(s).".to_string(),
+            )
+            .with_terminal_cause(anyhow::Error::new(private_refusal())),
+        );
+
+        let message = terminal_completion_error_message_in_english(&error, None)
+            .expect("an exhausted refusal must project a user-facing message");
+        assert_eq!(message, REFUSAL_GUIDANCE);
+        assert!(!message.contains("private-category"));
+    }
+
+    #[test]
+    fn later_non_refusal_final_cause_keeps_generic_projection() {
+        use zeroclaw_providers::{
+            ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+        };
+
+        let error = anyhow::Error::new(
+            ReliableProviderTerminalFailure::new(
+                ReliableProviderTerminalFailureKind::Other,
+                None,
+                "All model providers/models failed after 2 failure event(s).".to_string(),
+            )
+            .with_terminal_cause(anyhow::Error::msg("500 later provider failure")),
+        );
+
+        assert_eq!(
+            terminal_completion_error_message_in_english(&error, None),
+            Some(crate::i18n::get_english_cli_string_with_args(
+                "cli-agent-error-provider-generic",
+                &[]
+            ))
+        );
+    }
+
+    #[test]
+    fn streamed_refusal_cause_projects_safety_guidance() {
+        let error = anyhow::Error::new(zeroclaw_api::model_provider::StreamError::ModelRefusal(
+            Box::new(private_refusal()),
+        ));
+
+        let message = terminal_completion_error_message_in_english(&error, None)
+            .expect("a streamed refusal must project a user-facing message");
+        assert_eq!(message, REFUSAL_GUIDANCE);
+        assert!(!message.contains("private-category"));
     }
 }

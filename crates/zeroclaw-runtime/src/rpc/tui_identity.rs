@@ -10,6 +10,10 @@ use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
+/// Domain separating the TUI identity signing subkey from every other use of
+/// the install key.
+const TUI_SIGNING_DOMAIN: &[u8] = b"zeroclaw.rpc.tui-identity.v1";
+
 type HmacSha256 = Hmac<Sha256>;
 
 // ── TUI entry ────────────────────────────────────────────────────
@@ -58,15 +62,32 @@ pub struct TuiRegistry {
 }
 
 impl TuiRegistry {
-    /// Create a registry, attempting to load the signing key from
-    /// `<config_dir>/.secret_key`. If the file is missing or
-    /// unreadable, signing is silently disabled.
+    /// Create a registry that signs with a subkey of the install key at
+    /// `<config_dir>/.secret_key`, the key the secret store encrypts config
+    /// secrets with. The key is provisioned if absent, through the secret
+    /// store's own creation path, so a fresh install can serve remote RPC
+    /// (which requires signed identities). If it cannot be read or created
+    /// (for example a corrupt key file, which is never replaced), signing
+    /// stays off and remote RPC is refused.
     pub fn new(config_dir: &Path) -> Self {
-        let key_path = config_dir.join(".secret_key");
-        let signing_key = std::fs::read_to_string(&key_path)
-            .ok()
-            .and_then(|hex_str| hex::decode(hex_str.trim()).ok())
-            .filter(|key| !key.is_empty());
+        let store = zeroclaw_config::secrets::SecretStore::new(config_dir, true);
+        let signing_key = match store.keyed_digest_or_create(TUI_SIGNING_DOMAIN, b"") {
+            Ok(subkey) => Some(subkey.to_vec()),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "config_dir": config_dir.display().to_string(),
+                            "error": e.to_string(),
+                        })),
+                    "TUI identity signing disabled: the install key is unavailable; \
+                     remote RPC will be refused"
+                );
+                None
+            }
+        };
 
         Self {
             signing_key,
@@ -75,7 +96,33 @@ impl TuiRegistry {
         }
     }
 
-    #[cfg(test)]
+    /// The registry for a daemon running `config`. The install key lives
+    /// next to `config.toml` (the directory `Config::save` hands the secret
+    /// store), not in `data_dir`.
+    pub fn for_config(config: &zeroclaw_config::schema::Config) -> Self {
+        match config.config_path.parent() {
+            Some(config_dir) => Self::new(config_dir),
+            None => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "config_path": config.config_path.display().to_string(),
+                        })),
+                    "TUI identity signing disabled: config path has no parent directory; \
+                     remote RPC will be refused"
+                );
+                Self {
+                    signing_key: None,
+                    connected: Mutex::new(HashMap::new()),
+                    next_epoch: AtomicU64::new(0),
+                }
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
     pub fn new_unsigned() -> Self {
         Self {
             signing_key: None,
@@ -175,13 +222,27 @@ impl TuiRegistry {
             .collect()
     }
 
-    /// Return a clone of the environment captured from the TUI identified by
-    /// `tui_id`, or `None` if the TUI is not currently connected.
-    pub fn get_env(&self, tui_id: &str) -> Option<HashMap<String, String>> {
+    /// Return a clone of the environment captured by ONE registration of a
+    /// TUI: the entry for `tui_id`, and only while `epoch` is still the live
+    /// registration for that id.
+    ///
+    /// The captured environment carries the user's real shell, credential
+    /// sockets included, so it is readable only by the connection that
+    /// captured it. Quoting the epoch is what makes that true across a
+    /// reconnect: a superseded connection holds the same id as its successor,
+    /// and without the epoch it would read the successor's environment. This
+    /// mirrors [`Self::unregister`], which quotes the epoch for the same
+    /// reason in the other direction.
+    pub fn env_for_registration(
+        &self,
+        tui_id: &str,
+        epoch: TuiEpoch,
+    ) -> Option<HashMap<String, String>> {
         self.connected
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(tui_id)
+            .filter(|(live, _)| *live == epoch)
             .map(|(_, entry)| entry.env.clone())
     }
 }
@@ -191,6 +252,81 @@ impl TuiRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A config laid out like an install: `config.toml` in `root`, data in
+    /// `root/data` (the split `Config::load_or_init` produces).
+    fn install_config(root: &Path) -> zeroclaw_config::schema::Config {
+        zeroclaw_config::schema::Config {
+            config_path: root.join("config.toml"),
+            data_dir: root.join("data"),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn for_config_signs_with_the_key_the_secret_store_created() {
+        // The secret store keeps its key next to config.toml; a key it
+        // created (e.g. while saving an encrypted secret) must enable
+        // signing, which remote RPC requires.
+        let dir = tempfile::tempdir().unwrap();
+        let config = install_config(dir.path());
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        zeroclaw_config::secrets::SecretStore::new(dir.path(), true)
+            .encrypt("provider-api-key")
+            .unwrap();
+        assert!(dir.path().join(".secret_key").exists());
+
+        let registry = TuiRegistry::for_config(&config);
+        assert!(registry.signing_is_enabled());
+        let sig = registry.sign("tui_deadbeef").expect("signed");
+        assert!(registry.verify("tui_deadbeef", &sig));
+    }
+
+    #[test]
+    fn for_config_provisions_the_key_on_a_fresh_install() {
+        // A fresh install has never stored a secret. Remote RPC must still
+        // be usable, so the registry provisions the install key - in the
+        // config dir, where the secret store looks, never in the data dir.
+        let dir = tempfile::tempdir().unwrap();
+        let config = install_config(dir.path());
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
+        let registry = TuiRegistry::for_config(&config);
+        assert!(registry.signing_is_enabled());
+        assert!(dir.path().join(".secret_key").exists());
+        assert!(!config.data_dir.join(".secret_key").exists());
+    }
+
+    #[test]
+    fn for_config_signatures_survive_a_daemon_restart() {
+        // A reconnecting TUI presents the signature an earlier daemon
+        // generation issued; the same install key must verify it.
+        let dir = tempfile::tempdir().unwrap();
+        let config = install_config(dir.path());
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let sig = TuiRegistry::for_config(&config)
+            .sign("tui_deadbeef")
+            .unwrap();
+        assert!(TuiRegistry::for_config(&config).verify("tui_deadbeef", &sig));
+    }
+
+    #[test]
+    fn for_config_fails_closed_on_a_corrupt_key_and_keeps_it() {
+        // An unreadable key must not be replaced (that would orphan every
+        // secret encrypted under it); signing stays off, so remote RPC is
+        // refused rather than trusted.
+        let dir = tempfile::tempdir().unwrap();
+        let config = install_config(dir.path());
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        std::fs::write(dir.path().join(".secret_key"), "not-hex").unwrap();
+
+        let registry = TuiRegistry::for_config(&config);
+        assert!(!registry.signing_is_enabled());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".secret_key")).unwrap(),
+            "not-hex"
+        );
+    }
 
     #[test]
     fn generate_tui_id_format() {
@@ -312,7 +448,7 @@ mod tests {
             "the surviving entry must be the successor, not the displaced one"
         );
         assert!(
-            registry.get_env(id).is_some(),
+            registry.env_for_registration(id, epoch_b).is_some(),
             "the live TUI must still resolve its captured environment"
         );
 
@@ -472,13 +608,13 @@ mod tests {
     }
 
     #[test]
-    fn get_env_returns_env_for_connected_tui() {
+    fn env_for_registration_returns_env_for_connected_tui() {
         let registry = TuiRegistry::new_unsigned();
         let mut env = HashMap::new();
         env.insert("PATH".to_string(), "/usr/bin:/usr/local/bin".to_string());
         env.insert("SSH_AUTH_SOCK".to_string(), "/tmp/ssh.sock".to_string());
 
-        registry.register(TuiEntry {
+        let epoch = registry.register(TuiEntry {
             tui_id: "tui_getenv01".to_string(),
             connected_at: Utc::now(),
             peer_label: "test".to_string(),
@@ -486,7 +622,9 @@ mod tests {
             env,
         });
 
-        let got = registry.get_env("tui_getenv01").expect("should find env");
+        let got = registry
+            .env_for_registration("tui_getenv01", epoch)
+            .expect("should find env");
         assert_eq!(
             got.get("PATH").map(|s| s.as_str()),
             Some("/usr/bin:/usr/local/bin")
@@ -498,13 +636,13 @@ mod tests {
     }
 
     #[test]
-    fn get_env_returns_none_for_unknown_tui() {
+    fn env_for_registration_returns_none_for_unknown_tui() {
         let registry = TuiRegistry::new_unsigned();
-        assert!(registry.get_env("tui_nothere").is_none());
+        assert!(registry.env_for_registration("tui_nothere", 0).is_none());
     }
 
     #[test]
-    fn get_env_returns_none_after_unregister() {
+    fn env_for_registration_returns_none_after_unregister() {
         let registry = TuiRegistry::new_unsigned();
         let mut env = HashMap::new();
         env.insert("SOME_VAR".to_string(), "val".to_string());
@@ -515,8 +653,49 @@ mod tests {
             transport: "unix".to_string(),
             env,
         });
-        assert!(registry.get_env("tui_gone0001").is_some());
+        assert!(
+            registry
+                .env_for_registration("tui_gone0001", epoch)
+                .is_some()
+        );
         registry.unregister("tui_gone0001", epoch);
-        assert!(registry.get_env("tui_gone0001").is_none());
+        assert!(
+            registry
+                .env_for_registration("tui_gone0001", epoch)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn env_for_registration_requires_a_matching_epoch() {
+        let registry = TuiRegistry::new_unsigned();
+        let id = "tui_epoch001";
+        let epoch_first = registry.register(TuiEntry {
+            tui_id: id.to_string(),
+            connected_at: Utc::now(),
+            peer_label: "first".to_string(),
+            transport: "unix".to_string(),
+            env: HashMap::from([("SENTINEL_SOCK".to_string(), "/tmp/first.sock".to_string())]),
+        });
+        let epoch_second = registry.register(TuiEntry {
+            tui_id: id.to_string(),
+            connected_at: Utc::now(),
+            peer_label: "second".to_string(),
+            transport: "unix".to_string(),
+            env: HashMap::from([("OTHER_SOCK".to_string(), "/tmp/second.sock".to_string())]),
+        });
+
+        assert!(
+            registry.env_for_registration(id, epoch_first).is_none(),
+            "a superseded registration must not read its successor's environment"
+        );
+        let live = registry
+            .env_for_registration(id, epoch_second)
+            .expect("the live registration resolves its own environment");
+        assert_eq!(
+            live.get("OTHER_SOCK").map(String::as_str),
+            Some("/tmp/second.sock")
+        );
+        assert!(!live.contains_key("SENTINEL_SOCK"));
     }
 }

@@ -3,6 +3,11 @@
     clippy::useless_format,
     clippy::manual_inspect
 )]
+// `agent::run` builds a HookRunner (cron tool calls reach webhook_audit and the
+// critic), which deepens the futures of the tools that call it (cron_run,
+// delegate); proving them `Send` through hyper/h2 exceeds the default 128.
+// The binary crate already runs at 256.
+#![recursion_limit = "256"]
 //! Agent runtime — orchestration, security, observability, cron, SOP, skills, hardware, and more.
 
 pub mod cli_input;
@@ -10,13 +15,16 @@ pub mod cli_input;
 /// `cargo generate installers runtime-locales`. Generated, not hand-edited.
 mod generated_locales;
 pub mod identity;
+pub mod live_config_authority;
 pub mod migration;
 pub mod util;
 
 pub mod agent;
+pub mod agent_lifecycle;
 pub mod approval;
 pub mod browse;
 pub mod calendar;
+pub mod composition;
 pub mod control_plane;
 pub mod cost;
 pub mod cron;
@@ -32,6 +40,8 @@ pub mod observability;
 pub mod peers;
 pub mod platform;
 pub mod plugin_runtime;
+#[cfg(feature = "plugins-wasm")]
+pub(crate) mod plugin_state;
 pub mod process_stats;
 pub mod quickstart;
 pub mod rag;
@@ -48,3 +58,7 @@ pub mod tools;
 pub mod trust;
 pub mod tunnel;
 pub mod verifiable_intent;
+
+pub use live_config_authority::{AgentExecutionCapability, LiveConfigAuthority};
+
+pub mod config_application;

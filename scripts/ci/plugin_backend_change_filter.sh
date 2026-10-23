@@ -10,10 +10,17 @@
 # the operator-facing plugin config surface that zeroclaw-plugins compiles
 # against, so a change there can break this job while nothing under
 # crates/zeroclaw-plugins moves.
-# The root-package channel activation e2e is listed individually because it is
-# the one piece of this job's coverage that lives outside a crate directory:
-# it drives zeroclaw-runtime, which zeroclaw-plugins cannot depend on without
-# inverting the crate graph, so it has to be a root `zeroclaw` test target.
+# The root-package channel e2e targets are listed individually because they are
+# the pieces of this job's coverage that live outside a crate directory: they
+# drive zeroclaw-runtime, which zeroclaw-plugins cannot depend on without
+# inverting the crate graph, so they have to be root
+# `zeroclaw` test targets. The root binary's plugin modules are listed for the
+# same reason: `mod plugins` and the plugin registry only compile under
+# `plugins-wasm`, so the default-feature Test job cannot run their tests and
+# this job is where they run. `src/main.rs` holds the plugin CLI itself, and
+# the plugin CLI component tests that drive it run only in this job too.
+# The plugin artifact smoke harness is listed as well: this job is the only
+# place its scripts run before a release, so a change to them has to run it.
 # Prints "false" otherwise. Always exits 0; the workflow step forwards the
 # printed value to GITHUB_OUTPUT.
 
@@ -26,11 +33,18 @@ while IFS= read -r path; do
         crates/zeroclaw-plugins/*|\
         crates/zeroclaw-runtime/*|\
         crates/zeroclaw-config/*|\
+        tests/channel_websocket_e2e.rs|\
         tests/plugin_channel_runtime_e2e.rs|\
+        tests/channel_egress_e2e.rs|\
+        tests/component/plugin_info_cli.rs|tests/component/plugin_update_cli.rs|\
+        src/plugins/*|src/plugin_registry.rs|src/quickstart_plugins/*|src/main.rs|\
         wit/*|\
         Cargo.toml|Cargo.lock|\
         .github/workflows/ci.yml|\
-        scripts/ci/plugin_backend_change_filter*.sh)
+        scripts/ci/plugin_backend_change_filter*.sh|\
+        scripts/ci/plugin_artifact_smoke*.sh|\
+        scripts/ci/plugin_smoke_provider*.py|\
+        scripts/ci/build_plugin_smoke_packages.sh)
             run=true
             ;;
     esac
