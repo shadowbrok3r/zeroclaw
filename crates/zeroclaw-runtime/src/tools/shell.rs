@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::sync::Arc;
 use std::time::Duration;
+use zeroclaw_api::media::{MarkerKind, RenderedMarker};
 use zeroclaw_api::platform::is_android;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 
@@ -75,6 +76,10 @@ pub struct ShellTool {
     /// one map throughout that incarnation.
     tui_env: Option<ForwardedEnvironment>,
     persistent_writes: bool,
+    /// Programs whose `[IMAGE:...]` stdout lines become image attachments
+    /// (`[shell_tool] attachment_commands`). Empty means shell output is text
+    /// only, the upstream behaviour.
+    attachment_commands: Vec<String>,
 }
 
 impl ShellTool {
@@ -87,6 +92,7 @@ impl ShellTool {
             timeout_secs,
             tui_env: None,
             persistent_writes: true,
+            attachment_commands: Vec::new(),
         }
     }
 
@@ -103,11 +109,19 @@ impl ShellTool {
             timeout_secs,
             tui_env: None,
             persistent_writes: true,
+            attachment_commands: Vec::new(),
         }
     }
 
     pub fn with_persistent_writes(mut self, persistent: bool) -> Self {
         self.persistent_writes = persistent;
+        self
+    }
+
+    /// Declare the `[IMAGE:...]` stdout lines of these programs as image
+    /// attachments; see [`command_runs_listed_program`].
+    pub fn with_attachment_commands(mut self, programs: Vec<String>) -> Self {
+        self.attachment_commands = programs;
         self
     }
 
@@ -399,9 +413,19 @@ impl Tool for ShellTool {
                         append_truncation_marker(&mut stderr, "\n... [stderr truncated at 1MB]");
                     }
 
+                    let attachments =
+                        if command_runs_listed_program(command, &self.attachment_commands) {
+                            listed_program_image_attachments(&stdout)
+                        } else {
+                            Vec::new()
+                        };
+                    let output = attachments
+                        .into_iter()
+                        .fold(ToolOutput::from(stdout), ToolOutput::with_attachment);
+
                     ToolResult {
                         success: status.success(),
-                        output: stdout.into(),
+                        output,
                         error: if stderr.is_empty() {
                             None
                         } else {
@@ -559,6 +583,110 @@ fn android_child_path(tui_path: Option<&str>, ambient_path: &str) -> String {
     } else {
         format!("/system/bin:/system/xbin:{base}")
     }
+}
+
+/// Most image attachments one shell call may declare. An image-producing CLI
+/// prints a handful of markers; more than this is a listing, and none count.
+const MAX_SHELL_IMAGE_ATTACHMENTS: usize = 8;
+
+/// Commands that run the program named after them, so the listed program is
+/// still in command position (`timeout 600 comfy-gen ...`).
+const COMMAND_WRAPPERS: &[&str] = &["env", "nice", "nohup", "time", "exec", "command", "timeout"];
+
+/// Whether `command` runs one of `programs` in command position.
+///
+/// The command is split at shell separators; in each segment leading
+/// `NAME=value` assignments, wrapper commands, their flags and their numeric
+/// arguments (`nice -n 5`, `timeout 10m`) are skipped, and the next word is compared by
+/// executable name, so `/usr/local/bin/comfy-gen` matches `comfy-gen`. A
+/// program named only as an argument (`echo comfy-gen`) does not match.
+fn command_runs_listed_program(command: &str, programs: &[String]) -> bool {
+    if programs.is_empty() {
+        return false;
+    }
+    let normalized: String = command
+        .chars()
+        .map(|c| match c {
+            ';' | '&' | '|' | '\n' | '(' | ')' | '`' | '{' | '}' => '\n',
+            other => other,
+        })
+        .collect();
+    normalized.lines().any(|segment| {
+        segment
+            .split_whitespace()
+            .map(|word| word.trim_matches(|c| c == '"' || c == '\''))
+            .find(|word| {
+                !(COMMAND_WRAPPERS.contains(word)
+                    || word.starts_with('-')
+                    || word.starts_with(|c: char| c.is_ascii_digit())
+                    || is_env_assignment(word))
+            })
+            .is_some_and(|word| {
+                let name = word.rsplit('/').next().unwrap_or(word);
+                programs
+                    .iter()
+                    .any(|program| program.rsplit('/').next().unwrap_or(program) == name)
+            })
+    })
+}
+
+fn is_env_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+    })
+}
+
+/// Image attachments for the whole `[IMAGE:<absolute path>]` lines of
+/// `stdout` that name an existing image file. Duplicates count once; more
+/// than [`MAX_SHELL_IMAGE_ATTACHMENTS`] distinct images declares none.
+fn listed_program_image_attachments(stdout: &str) -> Vec<RenderedMarker> {
+    let mut targets: Vec<&str> = Vec::new();
+    for line in stdout.lines() {
+        let Some(target) = line
+            .trim()
+            .strip_prefix("[IMAGE:")
+            .and_then(|rest| rest.strip_suffix(']'))
+            .map(str::trim)
+        else {
+            continue;
+        };
+        if targets.contains(&target) || !is_existing_image_file(target) {
+            continue;
+        }
+        if targets.len() == MAX_SHELL_IMAGE_ATTACHMENTS {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "max_images": MAX_SHELL_IMAGE_ATTACHMENTS,
+                    })),
+                "shell output names too many images; declaring none"
+            );
+            return Vec::new();
+        }
+        targets.push(target);
+    }
+    targets
+        .into_iter()
+        .map(|target| RenderedMarker {
+            target: target.to_string(),
+            kind: MarkerKind::Image,
+        })
+        .collect()
+}
+
+fn is_existing_image_file(target: &str) -> bool {
+    let path = std::path::Path::new(target);
+    path.is_absolute()
+        && path.is_file()
+        && path.extension().and_then(OsStr::to_str).is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp"
+            )
+        })
 }
 
 #[cfg(test)]
@@ -2459,6 +2587,111 @@ mod tests {
         assert!(
             env_output_contains_assignment(&result.output, "SSH_AUTH_SOCK", "/tmp/fake.sock"),
             "SSH_AUTH_SOCK from tui_env must reach subprocess"
+        );
+    }
+
+    #[test]
+    fn listed_program_matches_in_command_position_only() {
+        let programs = vec!["comfy-gen".to_string()];
+        for command in [
+            "comfy-gen check --image a.png",
+            "/home/u/.local/bin/comfy-gen render --out x",
+            "cd /tmp && comfy-gen edit --out y",
+            "FOO=1 timeout 600 comfy-gen i2v",
+            "env -i PATH=/bin nice -n 5 comfy-gen upscale",
+            "ls; 'comfy-gen' where --latest 1",
+        ] {
+            assert!(command_runs_listed_program(command, &programs), "{command}");
+        }
+        for command in [
+            "echo comfy-gen",
+            "cat comfy-gen.log",
+            "comfy-gen-old render",
+            "grep -r comfy-gen /tmp",
+        ] {
+            assert!(
+                !command_runs_listed_program(command, &programs),
+                "{command}"
+            );
+        }
+        assert!(!command_runs_listed_program("comfy-gen render", &[]));
+    }
+
+    #[test]
+    fn listed_program_image_lines_become_attachments() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("render.png");
+        std::fs::write(&png, b"png").unwrap();
+        let text = dir.path().join("notes.txt");
+        std::fs::write(&text, b"text").unwrap();
+        let stdout = format!(
+            "render: prompt_id=abc\n[IMAGE:{png}]\n[IMAGE:{png}]\n[IMAGE:{text}]\n\
+             [IMAGE:/no/such/file.png]\n[IMAGE:relative.png]\nsee [IMAGE:{png}] inline\n",
+            png = png.display(),
+            text = text.display(),
+        );
+        let attachments = listed_program_image_attachments(&stdout);
+        assert_eq!(
+            attachments,
+            vec![RenderedMarker {
+                target: png.display().to_string(),
+                kind: MarkerKind::Image,
+            }]
+        );
+    }
+
+    #[test]
+    fn listed_program_image_listing_declares_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut stdout = String::new();
+        for index in 0..=MAX_SHELL_IMAGE_ATTACHMENTS {
+            let path = dir.path().join(format!("frame{index}.png"));
+            std::fs::write(&path, b"png").unwrap();
+            stdout.push_str(&format!("[IMAGE:{}]\n", path.display()));
+        }
+        assert!(listed_program_image_attachments(&stdout).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_declares_images_only_for_listed_programs() {
+        let workspace = tempfile::tempdir().unwrap();
+        let png = workspace.path().join("render.png");
+        std::fs::write(&png, b"png").unwrap();
+        let script = workspace.path().join("comfy-gen");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho '[IMAGE:{}]'\n", png.display()),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        let command = json!({ "command": "./comfy-gen", "approved": true });
+
+        let plain = ShellTool::new(security.clone(), test_runtime());
+        let result = plain.execute(command.clone()).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.attachments().is_empty());
+
+        let listed = ShellTool::new(security, test_runtime())
+            .with_attachment_commands(vec!["comfy-gen".to_string()]);
+        let result = listed.execute(command).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            result.output.attachments(),
+            &[RenderedMarker {
+                target: png.display().to_string(),
+                kind: MarkerKind::Image,
+            }]
         );
     }
 }

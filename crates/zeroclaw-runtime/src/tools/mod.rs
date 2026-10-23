@@ -1698,7 +1698,8 @@ fn all_tools_with_runtime_on_thread(
                     root_config.shell_tool.timeout_secs
                 })
                 .with_shared_tui_env(tui_env)
-                .with_persistent_writes(persistent_writes),
+                .with_persistent_writes(persistent_writes)
+                .with_attachment_commands(root_config.shell_tool.attachment_commands.clone()),
             security.clone(),
         ))
     );
