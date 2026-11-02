@@ -104,6 +104,24 @@ assert_manifest \
   https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v2.11.4/cargo-tauri-x86_64-pc-windows-msvc.zip \
   cargo-tauri.exe
 
+assert_manifest \
+  cargo-deny Linux X64 \
+  0.19.9 \
+  cargo-deny-0.19.9-x86_64-unknown-linux-musl.tar.gz \
+  cargo-deny \
+  f1f8eedc2a3ac297c540873f93785d4104b102c0079506b2a6b3221b7ec956af \
+  https://github.com/EmbarkStudios/cargo-deny/releases/download/0.19.9/cargo-deny-0.19.9-x86_64-unknown-linux-musl.tar.gz \
+  cargo-deny
+
+assert_manifest \
+  cargo-audit Linux X64 \
+  0.22.2 \
+  cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz \
+  cargo-audit \
+  ab28a1bdb54db4d5d8ad5981cf1f959410370b3d28250dbd35f6a44248620e39 \
+  https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz \
+  cargo-audit
+
 if ZEROCLAW_RELEASE_TOOL_OS=Linux ZEROCLAW_RELEASE_TOOL_ARCH=ARM64 \
   bash "$installer" cross --print-manifest >/dev/null 2>&1; then
   echo "expected cross on Linux/ARM64 to fail closed" >&2
@@ -114,6 +132,47 @@ if bash "$installer" unknown-tool --print-manifest >/dev/null 2>&1; then
   echo "expected an unknown release tool to fail closed" >&2
   exit 1
 fi
+
+for tool in cargo-deny cargo-audit; do
+  if ZEROCLAW_RELEASE_TOOL_OS=Linux ZEROCLAW_RELEASE_TOOL_ARCH=ARM64 \
+    bash "$installer" "$tool" --print-manifest >/dev/null 2>&1; then
+    echo "expected $tool on Linux/ARM64 to fail closed" >&2
+    exit 1
+  fi
+done
+
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+mkdir -p "$tmp_dir/bin"
+cat > "$tmp_dir/bin/curl" <<'SH'
+#!/usr/bin/env bash
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "-o" ]]; then
+    printf 'invalid archive' > "$2"
+    exit 0
+  fi
+  shift
+done
+exit 1
+SH
+cat > "$tmp_dir/bin/tar" <<'SH'
+#!/usr/bin/env bash
+printf 'extracted' > "$EXTRACTION_MARKER"
+exit 1
+SH
+chmod +x "$tmp_dir/bin/curl" "$tmp_dir/bin/tar"
+for tool in cargo-deny cargo-audit; do
+  if PATH="$tmp_dir/bin:$PATH" CARGO_HOME="$tmp_dir/cargo" \
+    EXTRACTION_MARKER="$tmp_dir/extracted" \
+    ZEROCLAW_RELEASE_TOOL_OS=Linux ZEROCLAW_RELEASE_TOOL_ARCH=X64 \
+    bash "$installer" "$tool" > "$tmp_dir/output" 2>&1; then
+    echo "expected $tool to refuse an unverified download" >&2
+    exit 1
+  fi
+  grep -Fq 'checksum mismatch' "$tmp_dir/output"
+  [[ ! -e "$tmp_dir/extracted" ]]
+  [[ ! -d "$tmp_dir/cargo/bin" ]]
+done
 
 smoke_job="$(extract_job release-tool-smoke)"
 

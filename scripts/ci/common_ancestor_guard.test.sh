@@ -14,21 +14,26 @@ git -C "$repo" config user.email "zeroclaw-test@example.invalid"
 git -C "$repo" commit --quiet --allow-empty -m "base"
 base_sha="$(git -C "$repo" rev-parse HEAD)"
 git -C "$repo" update-ref refs/remotes/origin/master "$base_sha"
+git -C "$repo" update-ref refs/remotes/origin/main "$base_sha"
 
 git -C "$repo" commit --quiet --allow-empty -m "related"
 related_sha="$(git -C "$repo" rev-parse HEAD)"
-if ! (cd "$repo" && bash "$guard" origin/master "$related_sha") >/dev/null; then
-  echo "expected a related history to pass" >&2
-  exit 1
-fi
+for branch in main master; do
+  if ! (cd "$repo" && bash "$guard" "origin/$branch" "$related_sha") >/dev/null; then
+    echo "expected a related history on $branch to pass" >&2
+    exit 1
+  fi
+done
 
 git -C "$repo" checkout --quiet --orphan unrelated
 git -C "$repo" commit --quiet --allow-empty -m "unrelated"
 unrelated_sha="$(git -C "$repo" rev-parse HEAD)"
-if (cd "$repo" && bash "$guard" origin/master "$unrelated_sha") >/dev/null 2>&1; then
-  echo "expected independent valid histories to fail" >&2
-  exit 1
-fi
+for branch in main master; do
+  if (cd "$repo" && bash "$guard" "origin/$branch" "$unrelated_sha") >/dev/null 2>&1; then
+    echo "expected independent valid histories on $branch to fail" >&2
+    exit 1
+  fi
+done
 
 if (cd "$repo" && bash "$guard" origin/master missing-target) >/dev/null 2>&1; then
   echo "expected a missing target ref to fail" >&2
@@ -40,8 +45,13 @@ grep -Fqx "$expected_target" "$workflow" || {
   echo "history guard must select pull_request.head.sha for PRs and github.sha otherwise" >&2
   exit 1
 }
-grep -Fqx '        run: bash scripts/ci/common_ancestor_guard.sh origin/master "$HISTORY_CHECK_SHA"' "$workflow" || {
+grep -Fqx '        run: bash scripts/ci/common_ancestor_guard.sh "origin/$CI_BASE_BRANCH" "$HISTORY_CHECK_SHA"' "$workflow" || {
   echo "history guard must pass the selected commit to the guard script" >&2
+  exit 1
+}
+
+grep -Fqx '          CI_BASE_BRANCH: ${{ github.event.pull_request.base.ref || github.event.repository.default_branch }}' "$workflow" || {
+  echo "history guard must resolve the PR base or repository default branch" >&2
   exit 1
 }
 

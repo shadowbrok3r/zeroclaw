@@ -2,9 +2,9 @@ name: Quality Gate
 
 on:
   pull_request:
-    branches: [master]
+    branches: [main, master]
   push:
-    branches: [master]
+    branches: [main, master]
   # Merge queue: GitHub builds a temporary `gh-readonly-queue/master/…` branch
   # and fires `merge_group`. The required `CI Required Gate` must report on that
   # branch or queued PRs stall, so the full gate runs here too.
@@ -57,9 +57,7 @@ env:
 # no longer a runtime kill switch for that path — rolling back is a one-line
 # commit here rather than flipping a repo variable.
 #
-# UNCHANGED SAFETY PROPERTY: every rust-cache call still passes
-# `save-if: github.ref == 'refs/heads/master'`, so fork PRs remain cache READERS
-# only and cannot poison the cache master seeds.
+# Pull requests read caches; default-branch pushes may write them.
 #
 # PRECONDITIONS: the Blacksmith GitHub App must stay installed on the org, or
 # these jobs queue with no runner (~24h) instead of failing fast. Blacksmith
@@ -84,7 +82,7 @@ jobs:
   master-debounce:
     name: Debounce master push
     if: github.event_name == 'push'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - name: Wait for a newer push to supersede this run
@@ -103,7 +101,7 @@ jobs:
 
   fmt:
     name: Format
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -116,7 +114,7 @@ jobs:
 
   history-guard:
     name: Common Ancestor
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -126,13 +124,14 @@ jobs:
         run: bash scripts/ci/common_ancestor_guard.test.sh
       - name: Reject unrelated PR history
         env:
+          CI_BASE_BRANCH: ${{ github.event.pull_request.base.ref || github.event.repository.default_branch }}
           HISTORY_CHECK_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-        run: bash scripts/ci/common_ancestor_guard.sh origin/master "$HISTORY_CHECK_SHA"
+        run: bash scripts/ci/common_ancestor_guard.sh "origin/$CI_BASE_BRANCH" "$HISTORY_CHECK_SHA"
 
   # Guards the approved submodule layout introduced in PR #8516; see the bespoke gate registry in README.md.
   repo-structure:
     name: Repository Structure
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -220,7 +219,7 @@ jobs:
     # does not wait on `fmt`. Waiting would serialise its own multi-minute
     # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
     # See the ordering note above `fmt` for which dependents still wait on it.
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 5
     outputs:
       run: ${{ steps.changed.outputs.run }}
@@ -266,7 +265,7 @@ jobs:
     name: Relay Container Fresh-Volume Smoke
     needs: [relay-container-smoke-changes]
     if: needs.relay-container-smoke-changes.outputs.run == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -289,7 +288,7 @@ jobs:
     name: Lint
     needs: [master-debounce]
     if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     # Measured green run on b86b1737: rustdoc step 2m22s, total Lint 10m40s
     # (under the prior 15m ceiling). Keep 15 unless a cold-cache run proves more.
     timeout-minutes: 15
@@ -304,9 +303,9 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: 'true'
+          use-blacksmith: ${{ github.repository == 'zeroclaw-labs/zeroclaw' }}
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Install system dependencies
         run: bash scripts/ci/apt_install.sh libudev-dev ripgrep
       - name: Ensure web/dist placeholder exists
@@ -345,7 +344,7 @@ jobs:
     # does not wait on `fmt`. Waiting would serialise its own multi-minute
     # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
     # See the ordering note above `fmt` for which dependents still wait on it.
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 5
     outputs:
       run: ${{ steps.changed.outputs.run }}
@@ -398,7 +397,7 @@ jobs:
         id: rust-cache
         with:
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Ensure web/dist placeholder exists
         shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
@@ -415,7 +414,7 @@ jobs:
 
   windows-required-changes:
     name: Select required Windows jobs
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 5
     outputs:
       windows_root: ${{ steps.select.outputs.windows_root }}
@@ -477,7 +476,7 @@ jobs:
         with:
           key: dev-fixture-v1
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Build controlled Windows service fixture
         # This unshipped fixture proves service lifecycle behavior, so avoid
         # release optimization and thin LTO before the short smoke.
@@ -525,7 +524,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: blacksmith-8vcpu-ubuntu-2404
+          - os: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
             target: x86_64-unknown-linux-gnu
             cmd: build
             label: Build
@@ -542,9 +541,9 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+          use-blacksmith: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && matrix.target == 'x86_64-unknown-linux-gnu' }}
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: bash scripts/ci/apt_install.sh mold libasound2-dev
@@ -620,7 +619,7 @@ jobs:
           use-blacksmith: 'false'
           shared-key: build
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Ensure web/dist placeholder exists
         shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
@@ -672,7 +671,7 @@ jobs:
     name: Test Windows task-owner recovery
     needs: [windows-required-changes, master-debounce]
     if: ${{ !cancelled() && needs.master-debounce.result != 'failure' && needs.windows-required-changes.result == 'success' && needs.windows-required-changes.outputs.windows_recovery == 'true' }}
-    runs-on: blacksmith-8vcpu-windows-2025
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-8vcpu-windows-2025' || 'windows-latest' }}
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -687,7 +686,7 @@ jobs:
         with:
           shared-key: windows-recovery-blacksmith
           cache-on-failure: 'false'
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Ensure web/dist placeholder exists
         shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
@@ -708,7 +707,7 @@ jobs:
     name: Check (${{ matrix.name }})
     needs: [master-debounce]
     if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 20
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
@@ -743,10 +742,10 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: 'true'
+          use-blacksmith: ${{ github.repository == 'zeroclaw-labs/zeroclaw' }}
           shared-key: ${{ matrix.cache-key }}
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Install system dependencies
         if: matrix.sys_deps != ''
         run: bash scripts/ci/apt_install.sh ${{ matrix.sys_deps }}
@@ -759,7 +758,7 @@ jobs:
     name: Check (${{ matrix.name }})
     needs: [master-debounce]
     if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: ${{ matrix.timeout-minutes || 20 }}
     strategy:
       fail-fast: false
@@ -819,11 +818,11 @@ jobs:
       - uses: ./.github/actions/rust-cache
         if: steps.changed.outputs.run == 'true'
         with:
-          use-blacksmith: 'true'
+          use-blacksmith: ${{ github.repository == 'zeroclaw-labs/zeroclaw' }}
           # Keep the new runtime build separate from the existing backend caches.
           shared-key: ${{ matrix.cache-key }}
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Check
         if: steps.changed.outputs.run == 'true' && matrix.suite != 'runtime' && matrix.suite != 'smoke'
         run: cargo check --locked -p zeroclaw-plugins --no-default-features --features ${{ matrix.features }}
@@ -1379,7 +1378,7 @@ jobs:
     # Explicit status check: an implicit success() would be skipped on PRs,
     # because the skipped push-only master-debounce is a transitive ancestor.
     if: ${{ !cancelled() && needs.installer-drift.result == 'success' }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1402,9 +1401,9 @@ jobs:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: ./.github/actions/rust-cache
         with:
-          use-blacksmith: 'true'
+          use-blacksmith: ${{ github.repository == 'zeroclaw-labs/zeroclaw' }}
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Install system dependencies
         run: bash scripts/ci/apt_install.sh libudev-dev
       - name: Ensure web/dist placeholder exists
@@ -1422,7 +1421,7 @@ jobs:
     name: Check (32-bit)
     needs: [master-debounce]
     if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1433,9 +1432,9 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: 'true'
+          use-blacksmith: ${{ github.repository == 'zeroclaw-labs/zeroclaw' }}
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Install 32-bit system libraries
         run: bash scripts/ci/apt_install.sh gcc-multilib
       - name: Ensure web/dist placeholder exists
@@ -1453,7 +1452,7 @@ jobs:
     # and manual runs still execute it, so benches cannot rot undetected before
     # a release; only the per-PR 570s is dropped. Revert by deleting this `if`.
     if: ${{ !cancelled() && needs.master-debounce.result != 'failure' && github.event_name != 'pull_request' }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1463,9 +1462,9 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: 'true'
+          use-blacksmith: ${{ github.repository == 'zeroclaw-labs/zeroclaw' }}
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Verify benchmarks compile
@@ -1509,7 +1508,7 @@ jobs:
     name: Test
     needs: [master-debounce]
     if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1520,9 +1519,9 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: 'true'
+          use-blacksmith: ${{ github.repository == 'zeroclaw-labs/zeroclaw' }}
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Check firmware protocol crate
         run: ./scripts/ci/firmware_protocol_gate.sh
       - name: Ensure web/dist placeholder exists
@@ -1585,7 +1584,7 @@ jobs:
     name: Test (channel ${{ matrix.name }})
     needs: [master-debounce]
     if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -1609,10 +1608,10 @@ jobs:
           components: rustfmt, clippy
       - uses: ./.github/actions/rust-cache
         with:
-          use-blacksmith: 'true'
+          use-blacksmith: ${{ github.repository == 'zeroclaw-labs/zeroclaw' }}
           shared-key: channel-feature-${{ matrix.name }}
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install test system dependencies
@@ -1636,7 +1635,7 @@ jobs:
     name: Test (opt-in tools)
     needs: [master-debounce]
     if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1645,10 +1644,10 @@ jobs:
           toolchain: 1.98.0
       - uses: ./.github/actions/rust-cache
         with:
-          use-blacksmith: 'true'
+          use-blacksmith: ${{ github.repository == 'zeroclaw-labs/zeroclaw' }}
           shared-key: tool-features
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install test system dependencies
@@ -1679,7 +1678,7 @@ jobs:
     name: Test (PostgreSQL Memory)
     needs: [master-debounce]
     if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 20
     services:
       postgres:
@@ -1703,9 +1702,9 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: 'true'
+          use-blacksmith: ${{ github.repository == 'zeroclaw-labs/zeroclaw' }}
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install mold linker
@@ -1732,7 +1731,7 @@ jobs:
     # does not wait on `fmt`. Waiting would serialise its own multi-minute
     # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
     # See the ordering note above `fmt` for which dependents still wait on it.
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 5
     outputs:
       run: ${{ steps.changed.outputs.run }}
@@ -1776,7 +1775,7 @@ jobs:
     name: Parallel Runtime Test
     needs: [parallel-runtime-test-changes]
     if: ${{ !cancelled() && needs.parallel-runtime-test-changes.result == 'success' && needs.parallel-runtime-test-changes.outputs.run == 'true' }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1786,10 +1785,10 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: 'true'
+          use-blacksmith: ${{ github.repository == 'zeroclaw-labs/zeroclaw' }}
           shared-key: test
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install mold linker
@@ -1816,7 +1815,7 @@ jobs:
         id: rust-cache
         with:
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install mold linker
@@ -1833,7 +1832,7 @@ jobs:
 
   security:
     name: Security
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1844,11 +1843,9 @@ jobs:
         id: rust-cache
         with:
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Install cargo-deny
-        run: |
-          curl -LsSf https://github.com/EmbarkStudios/cargo-deny/releases/download/0.19.9/cargo-deny-0.19.9-x86_64-unknown-linux-musl.tar.gz \
-            | tar zxf - -C ~/.cargo/bin --strip-components=1
+        run: bash scripts/ci/install_release_tool.sh cargo-deny
       - name: Validate scoped lru advisory exception
         run: python3 scripts/ci/lru_advisory_scope_test.py
       - name: Check licenses, sources, and advisories
@@ -1873,12 +1870,12 @@ jobs:
               yaml.safe_load(open(path))
               print(f"{path}: valid")
           PY
+      - name: Validate fork workflow boundaries
+        run: python3 scripts/ci/fork_workflow_contract_test.py
       - name: Validate GitHub helper scripts
         run: python3 -m unittest discover -s scripts/github -p '*_test.py'
       - name: Install cargo-audit
-        run: |
-          curl -LsSf https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz \
-            | tar zxf - -C ~/.cargo/bin --strip-components=1
+        run: bash scripts/ci/install_release_tool.sh cargo-audit
       - name: Run cargo audit (RustSec advisory database)
         run: cargo audit
 
@@ -1894,7 +1891,7 @@ jobs:
     # does not wait on `fmt`. Waiting would serialise its own multi-minute
     # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
     # See the ordering note above `fmt` for which dependents still wait on it.
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 5
     outputs:
       docs: ${{ steps.filter.outputs.docs }}
@@ -1952,7 +1949,7 @@ jobs:
     name: Nix Module Eval
     needs: [path-changes]
     if: needs.path-changes.outputs.nix == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1968,7 +1965,7 @@ jobs:
     name: Nix Hash Drift
     needs: [path-changes]
     if: needs.path-changes.outputs.nix_hash == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1981,7 +1978,7 @@ jobs:
     name: Docs Style
     needs: [path-changes]
     if: needs.path-changes.outputs.docs == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1989,7 +1986,9 @@ jobs:
           fetch-depth: 0
       - name: Resolve base SHA
         id: base
-        run: echo "sha=$(git merge-base origin/master HEAD)" >> "$GITHUB_OUTPUT"
+        env:
+          CI_BASE_BRANCH: ${{ github.event.pull_request.base.ref || github.event.repository.default_branch }}
+        run: echo "sha=$(git merge-base "origin/$CI_BASE_BRANCH" HEAD)" >> "$GITHUB_OUTPUT"
       - name: Docs quality gate (markdown lint + em-dash prose check)
         env:
           BASE_SHA: ${{ steps.base.outputs.sha }}
@@ -2006,7 +2005,7 @@ jobs:
   # Guards Zerocode's RPC-only dependency boundary established in PR #7850; see the bespoke gate registry in README.md.
   zerocode-rpc-boundary:
     name: Zerocode RPC Boundary
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -2014,9 +2013,11 @@ jobs:
           fetch-depth: 0
       - name: Detect zerocode changes
         id: changed
+        env:
+          CI_BASE_BRANCH: ${{ github.event.pull_request.base.ref || github.event.repository.default_branch }}
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            base="$(git merge-base origin/master HEAD)"
+            base="$(git merge-base "origin/$CI_BASE_BRANCH" HEAD)"
             if git diff --name-only "$base" HEAD | grep -q '^apps/zerocode/'; then
               echo "run=true" >> "$GITHUB_OUTPUT"
             else
@@ -2034,7 +2035,7 @@ jobs:
     name: Installer Drift
     needs: [master-debounce]
     if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 15
     outputs:
       all_features: ${{ steps.all_features.outputs.value }}
@@ -2048,9 +2049,9 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: 'true'
+          use-blacksmith: ${{ github.repository == 'zeroclaw-labs/zeroclaw' }}
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Check generated install surfaces are in sync with the spec
         run: cargo generate installers --check
       - name: Check source-backed SOP syntax reference
@@ -2070,7 +2071,7 @@ jobs:
     name: Web Permission Tests
     needs: [path-changes]
     if: needs.path-changes.outputs.web == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -2081,7 +2082,7 @@ jobs:
         with:
           use-blacksmith: 'false'
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: '.nvmrc'
@@ -2117,7 +2118,7 @@ jobs:
   # Other changes skip it; the static publish contract still runs in `test`.
   crates-preflight-changes:
     name: Detect crates.io version bump
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 5
     outputs:
       run: ${{ steps.bump.outputs.run }}
@@ -2147,13 +2148,13 @@ jobs:
       release_sha: ${{ github.sha }}
       stage: preflight
       dry_run: true
-      runner: blacksmith-8vcpu-ubuntu-2404
+      runner: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
 
   gate:
     name: CI Required Gate
     if: always()
     needs: [master-debounce, fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, windows-required-changes, windows-service-smoke, build, windows-build, windows-task-owner-recovery, check, check-plugin-backends, msrv, check-32bit, bench, test, test-channel-features, test-tool-features, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests, crates-preflight-changes, crates-preflight]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     steps:
       - name: Check results
         env:

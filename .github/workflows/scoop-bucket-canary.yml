@@ -33,6 +33,7 @@ permissions:
 
 jobs:
   latest-release:
+    if: github.repository == 'zeroclaw-labs/zeroclaw'
     name: Resolve Current Release
     runs-on: ubuntu-latest
     outputs:

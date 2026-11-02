@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/ci/install_release_tool.sh <cross|tauri-cli> [--print-manifest]
+Usage: scripts/ci/install_release_tool.sh <cross|tauri-cli|cargo-deny|cargo-audit> [--print-manifest]
 
 Installs a SHA-256-pinned release binary into Cargo's bin directory. The
 --print-manifest mode resolves the runner-specific asset without downloading it
@@ -86,6 +86,7 @@ fi
 
 os="$(normalize_os)"
 arch="$(normalize_arch)"
+archive_subdir=""
 
 case "$tool" in
   cross)
@@ -100,6 +101,36 @@ case "$tool" in
         sha256="642375d1bcf3bd88272c32ba90e999f3d983050adf45e66bd2d3887e8e838bad"
         ;;
       *) die "cross ${version} is not pinned for ${os}/${arch}" ;;
+    esac
+    ;;
+  cargo-deny)
+    version="0.19.9"
+    tag="${version}"
+    repository="EmbarkStudios/cargo-deny"
+    primary_binary="cargo-deny"
+    binaries=("cargo-deny")
+    case "${os}/${arch}" in
+      linux/x86_64)
+        asset="cargo-deny-${version}-x86_64-unknown-linux-musl.tar.gz"
+        archive_subdir="${asset%.tar.gz}"
+        sha256="f1f8eedc2a3ac297c540873f93785d4104b102c0079506b2a6b3221b7ec956af"
+        ;;
+      *) die "cargo-deny ${version} is not pinned for ${os}/${arch}" ;;
+    esac
+    ;;
+  cargo-audit)
+    version="0.22.2"
+    tag="cargo-audit%2Fv${version}"
+    repository="rustsec/rustsec"
+    primary_binary="cargo-audit"
+    binaries=("cargo-audit")
+    case "${os}/${arch}" in
+      linux/x86_64)
+        asset="cargo-audit-x86_64-unknown-linux-gnu-v${version}.tgz"
+        archive_subdir="${asset%.tgz}"
+        sha256="ab28a1bdb54db4d5d8ad5981cf1f959410370b3d28250dbd35f6a44248620e39"
+        ;;
+      *) die "cargo-audit ${version} is not pinned for ${os}/${arch}" ;;
     esac
     ;;
   tauri-cli)
@@ -181,7 +212,7 @@ fi
 install_dir="${cargo_home}/bin"
 mkdir -p "$install_dir"
 for binary in "${binaries[@]}"; do
-  source_binary="${extract_dir}/${binary}"
+  source_binary="${extract_dir}/${archive_subdir:+${archive_subdir}/}${binary}"
   [[ -f "$source_binary" ]] || die "$binary was not present in $asset"
   cp "$source_binary" "${install_dir}/${binary}"
   chmod +x "${install_dir}/${binary}"
