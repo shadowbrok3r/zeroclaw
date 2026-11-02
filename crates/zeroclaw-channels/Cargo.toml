@@ -65,7 +65,7 @@ lettre = { version = "0.11.22", default-features = false, features = [
   "rustls-tls",
   "smtp-transport",
 ], optional = true }
-pulldown-cmark = "0.13"
+pulldown-cmark = "0.13.6"
 mail-parser = { version = "0.11.2", optional = true }
 matrix-sdk = { version = "0.19", optional = true, default-features = false, features = [
   # 0.19 moved the TLS provider out of `reqwest/rustls` into its own feature
