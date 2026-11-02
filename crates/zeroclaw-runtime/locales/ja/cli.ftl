@@ -608,6 +608,7 @@ cli-quickstart-auth-anthropic-skip-hint = {"  "}後で完了させるには: cla
 cli-quickstart-auth-failed = {"  "}認証の設定が完了しませんでした: {$error}
 cli-quickstart-model-field-missing-warning = 警告: スキーマが `{$provider}` の `model` フィールドを生成しませんでした — 手動入力にフォールバックします。報告してください。
 cli-quickstart-model-id-for = {$name} のモデルID
+cli-quickstart-model-type-id = モデルIDを入力…
 cli-quickstart-risk-profile-prompt = リスクプロファイル
 cli-quickstart-memory-backend-prompt = メモリバックエンド
 cli-quickstart-add-channel = + チャンネルを追加
@@ -736,7 +737,6 @@ cli-quickstart-plugins-missing-row = {$name} には設定エントリがない�
 cli-quickstart-plugins-row-skipped = {$name} は設定エントリがないままインストールされているため、どのネットワーク送信先にも接続できません。ネットワークアクセスを許可しないエントリは、後で次のコマンドで作成できます: {$command}
 cli-quickstart-plugins-grant-declared-later = {$name} が宣言された {$count} 件の送信先に接続できるようにするには、エントリを作成した後に次のコマンドも実行してください: {$command}
 cli-quickstart-plugins-no-declared-hosts = {$name} はネットワークアクセスを要求していますが送信先を宣言していないため、設定エントリはどの送信先も許可していません。デプロイで使うホストを許可するには、それらをカンマ区切りの 1 つの値としてこのコマンドの末尾に追加してください: {$command}
-cli-quickstart-plugins-declared-hosts-not-granted = {$name} は次の送信先を宣言しています: {$hosts}。クイックスタートが宣言された送信先の許可を提案するのは http_client を要求するプラグインだけなので、設定エントリはそのどれも許可していません。許可するには次のコマンドを実行してください: {$command}
 cli-quickstart-plugins-activation-heading = プラグインを有効化すると {$settings} がオンになり、次が有効になります:
 cli-quickstart-plugins-activation-tool = ツールプラグイン {$name}
 cli-quickstart-plugins-activation-skill = スキルプラグイン {$name}
@@ -1049,6 +1049,9 @@ cli-plugin-info-load-failed =
     このホストに同梱された WIT（wit/v0 を参照）でプラグインを再ビルドし、再インストールしてください。
 cli-plugin-info-load-not-applicable = 読み込み: 対象外。スキルのみのプラグインのため、インスタンス化するコンポーネントはありません。
 cli-plugin-info-load-failed-exit = プラグイン '{$name}' はこのホストで読み込めません
+cli-plugin-info-load-config-refused =
+    読み込み: 不可。コンポーネントはこのホストの WIT ワールドでインスタンス化できますが、ランタイムがその設定を拒否しています: {$error}
+    設定は '{$key}' という名前の [[plugins.entries]] 行の `config` マップです。インストールされたパッケージの config_schema に合わせるか、パッケージが config_schema を宣言していない場合はその値を削除してください。
 cli-estop-domains-none = {"  "}domain_blocks:  (なし)
 cli-estop-domains = {"  "}domain_blocks:  {$v}
 cli-estop-tools-none = {"  "}tool_freeze:    (なし)

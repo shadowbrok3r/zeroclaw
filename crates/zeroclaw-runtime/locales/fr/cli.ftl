@@ -613,6 +613,7 @@ cli-quickstart-auth-anthropic-skip-hint = {"  "}Terminez plus tard avec : claude
 cli-quickstart-auth-failed = {"  "}La configuration de l'authentification ne s'est pas terminée : {$error}
 cli-quickstart-model-field-missing-warning = AVERTISSEMENT : le schéma n'a produit aucun champ `model` pour `{$provider}` — saisie manuelle utilisée. Merci de le signaler.
 cli-quickstart-model-id-for = ID de modèle pour {$name}
+cli-quickstart-model-type-id = Saisir un ID de modèle…
 cli-quickstart-risk-profile-prompt = Profil de risque
 cli-quickstart-memory-backend-prompt = Backend mémoire
 cli-quickstart-add-channel = + Ajouter un canal
@@ -741,7 +742,6 @@ cli-quickstart-plugins-missing-row = {$name} n'a pas d'entrée de configuration,
 cli-quickstart-plugins-row-skipped = {$name} reste installé sans entrée de configuration : il n'atteint donc aucune destination réseau. Pour créer plus tard l'entrée sans accès réseau, exécutez : {$command}
 cli-quickstart-plugins-grant-declared-later = Pour que {$name} atteigne ses {$count} destination(s) déclarée(s), exécutez aussi ceci après avoir créé l'entrée : {$command}
 cli-quickstart-plugins-no-declared-hosts = {$name} demande un accès réseau mais ne déclare aucune destination, donc son entrée de configuration n'en accorde aucune. Pour accorder les hôtes qu'utilise votre déploiement, ajoutez-les à la fin de cette commande sous la forme d'une seule valeur séparée par des virgules : {$command}
-cli-quickstart-plugins-declared-hosts-not-granted = {$name} déclare ces destinations : {$hosts}. Quickstart ne propose d'accorder les destinations déclarées qu'aux plugins qui demandent http_client, donc son entrée de configuration n'en accorde aucune. Pour les accorder, exécutez : {$command}
 cli-quickstart-plugins-activation-heading = L'activation des plugins active {$settings}, ce qui rend actifs :
 cli-quickstart-plugins-activation-tool = plugin d'outil {$name}
 cli-quickstart-plugins-activation-skill = plugin de compétence {$name}
@@ -1054,6 +1054,9 @@ cli-plugin-info-load-failed =
     Recompilez le plugin avec le WIT fourni par cet hôte (voir wit/v0), puis réinstallez-le.
 cli-plugin-info-load-not-applicable = Chargement : sans objet. Ce plugin ne contient que des compétences, il n'y a donc aucun composant à instancier.
 cli-plugin-info-load-failed-exit = le plugin « {$name} » ne se charge pas sur cet hôte
+cli-plugin-info-load-config-refused =
+    Chargement : non. Le composant s'instancie avec le monde WIT de cet hôte, mais le runtime refuse sa configuration : {$error}
+    La configuration est la table `config` de la ligne [[plugins.entries]] nommée « {$key} ». Rendez-la conforme au config_schema du paquet installé, ou supprimez ses valeurs si le paquet n'en déclare aucun.
 cli-estop-domains-none = {"  "}domain_blocks:  (aucun)
 cli-estop-domains = {"  "}domain_blocks:  { $v }
 cli-estop-tools-none = {"  "}tool_freeze:    (aucun)

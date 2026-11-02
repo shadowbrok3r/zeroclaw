@@ -522,6 +522,31 @@ cli-self-test-web-dist-dir-fail-expansion = WARNING: {$path} — {$reason}; gate
 
 # Service lifecycle warnings.
 cli-service-systemd-linger-disabled-warning = systemd user lingering is disabled. ZeroClaw's user service may stop after logout. Enable it with: loginctl enable-linger {$user}
+cli-config-lifecycle-dir-not-directory =
+    Config lifecycle path {$path} is not a directory. ZeroClaw creates it as a directory, so something else replaced it. Check what it is, remove it, then retry:
+    {$command}
+cli-config-lifecycle-dir-root-owner =
+    Config lifecycle directory {$path} belongs to root, usually because ZeroClaw was run with sudo. Run ZeroClaw as {$user}, not with sudo. Other files written during that run may belong to root too. Check the directory's contents, then give it back and retry:
+    {$command}
+    If chown has no effect, the data directory is on a filesystem that does not keep Unix permissions; point data_dir at a local filesystem.
+cli-config-lifecycle-dir-running-as-root = Config lifecycle directory {$path} belongs to {$owner}, but ZeroClaw is running as root. Run ZeroClaw as {$owner}, without sudo.
+cli-config-lifecycle-dir-foreign-owner =
+    Config lifecycle directory {$path} belongs to {$owner}, but ZeroClaw is running as {$user}. If it should belong to {$user}, check its contents first, because chown -R also hands over anything another user hard-linked into it (ZeroClaw's .lifecycle holds only config-lifecycle.lock, with a link count of 1). Then take it over and retry:
+    {$command}
+    Otherwise run ZeroClaw as {$owner}. If chown has no effect, the data directory is on a filesystem that does not keep Unix permissions; point data_dir at a local filesystem.
+cli-config-lifecycle-dir-writable =
+    Config lifecycle directory {$path} is writable by its group or by other users (mode {$mode}), so they could replace its config lock. ZeroClaw creates it owner-only and does not change the permissions of an existing directory. Check its contents, then restrict it and retry:
+    {$command}
+    If chmod has no effect, the data directory is on a filesystem that does not keep Unix permissions; point data_dir at a local filesystem.
+cli-config-data-dir-root-owner =
+    Data directory {$path} belongs to root, so ZeroClaw cannot create its config lock directory there. If an earlier run with sudo created it, give it back and retry:
+    {$command}
+    If it belongs to root on purpose, run ZeroClaw as its owner or point data_dir elsewhere.
+cli-config-data-dir-running-as-root = Data directory {$path} belongs to {$owner}, but ZeroClaw is running as root. Run ZeroClaw as {$owner}, without sudo.
+cli-config-data-dir-foreign-owner =
+    Data directory {$path} belongs to {$owner}, so ZeroClaw, running as {$user}, cannot create its config lock directory there. Run ZeroClaw as {$owner}, or point data_dir at a directory of your own. If the directory really is yours, check its contents first, because chown -R also hands over anything another user hard-linked into it, then take it over and retry:
+    {$command}
+    If chown has no effect, the data directory is on a filesystem that does not keep Unix permissions; point data_dir at a local filesystem.
 cli-standalone-daemon-owned = Cannot run `zeroclaw {$command}` while another ZeroClaw process owns the config state at {$path}. Stop the owning process or use its daemon-backed interface, then retry. No agent work was started.
 
 # ── peripherals (zeroclaw peripheral) ──
@@ -564,6 +589,10 @@ cli-sop-logs-row = {$timestamp} {$severity} {$category}.{$action} {$message}
 cli-sop-logs-disabled = Log persistence is not enabled.
 cli-sop-logs-incomplete = Some retained log segments could not be read; this history may be incomplete.
 cli-sop-status-failure-reason = Failure reason: {$reason}
+cli-sop-run-copy-stale = Run {$run_id} changed in the store since this engine last read it (revision {$seen_revision} -> {$stored_revision}, now {$status} on step {$step}); this engine adopted the stored record and did not apply the transition
+cli-sop-run-copy-revision-unknown = unknown
+cli-sop-run-copy-changed = Run {$run_id} changed in the store since this engine last read it
+cli-sop-run-copy-reload-failed = Run {$run_id} changed in the store since this engine last read it, and reloading it failed: {$error}
 # gateway WebSocket SOP approval error frames (UI-surfaced)
 cli-sop-ws-invalid-approval = sop approval_response requires run_id and a decision of approve or deny
 cli-sop-ws-resolve-failed = sop resolve failed: {$error}
@@ -704,6 +733,7 @@ cli-quickstart-auth-anthropic-skip-hint = {"  "}Finish later with: claude setup-
 cli-quickstart-auth-failed = {"  "}Auth setup didn't complete: {$error}
 cli-quickstart-model-field-missing-warning = WARN: schema produced no `model` field for `{$provider}` — falling back to manual entry. Please report this.
 cli-quickstart-model-id-for = Model id for {$name}
+cli-quickstart-model-type-id = Type a model ID…
 cli-quickstart-risk-profile-prompt = Risk profile
 cli-quickstart-memory-backend-prompt = Memory backend
 cli-quickstart-add-channel = + Add a channel
@@ -835,7 +865,6 @@ cli-quickstart-plugins-missing-row = {$name} has no config entry, so Quickstart 
 cli-quickstart-plugins-row-skipped = {$name} stays installed without a config entry, so it reaches no network destination. To create the entry later, without network access, run: {$command}
 cli-quickstart-plugins-grant-declared-later = To let {$name} reach its {$count} declared destination(s), also run this after creating the entry: {$command}
 cli-quickstart-plugins-no-declared-hosts = {$name} requests network access but declares no destinations, so its config entry grants none. To grant the hosts your deployment uses, append them to this command as one comma-separated value: {$command}
-cli-quickstart-plugins-declared-hosts-not-granted = {$name} declares these destinations: {$hosts}. Quickstart offers to grant declared destinations only to plugins that request http_client, so its config entry grants none of them. To grant them, run: {$command}
 cli-quickstart-plugins-activation-heading = Activating plugins turns on {$settings}, which activates:
 cli-quickstart-plugins-activation-tool = tool plugin {$name}
 cli-quickstart-plugins-activation-skill = skill plugin {$name}
@@ -913,6 +942,11 @@ cli-security-status-autonomy = Autonomy:   {$v}
 cli-security-status-approvals = Approvals:  medium-risk approval required: {$medium}, high-risk commands blocked: {$high}
 cli-security-status-sandbox = Sandbox:    requested {$requested}, active {$active} ({$description})
 cli-security-status-sandbox-description-docker-runtime = Docker runtime container isolation (runtime.kind = "docker"; no additional sandbox wrapper)
+cli-security-status-sandbox-description-firejail-args-rejected = Firejail selected, but firejail_args were rejected; commands are blocked ({$reason})
+cli-security-firejail-args-error-empty = firejail_args rejected: an entry is empty
+cli-security-firejail-args-error-whitespace = firejail_args rejected: {$arg} has leading or trailing whitespace
+cli-security-firejail-args-error-not-option = firejail_args rejected: {$arg} is not a Firejail option; write each option as one `--option` or `--option=value` entry
+cli-security-firejail-args-error-conflict = firejail_args rejected: {$name} conflicts with the options ZeroClaw's Firejail wrapper sets
 cli-security-status-workspace = Workspace:  {$dir}; workspace-only: {$workspace_only}; rw roots: {$read_write_roots}; read-only roots: {$read_only_roots}; write-only roots: {$write_only_roots}; env passthrough: {$env_passthrough}
 cli-security-status-credentials = Credentials: encryption: {$encryption}; secrets set: {$secrets_set}/{$secrets_total}; classified fields: {$classified_total}; classes: {$classification_summary}
 cli-security-status-credentials-classes-none = none
@@ -1165,6 +1199,9 @@ cli-plugin-info-load-failed =
     Rebuild the plugin against the WIT shipped with this host (see wit/v0) and reinstall it.
 cli-plugin-info-load-not-applicable = Loads: not applicable. This is a skill-only plugin, so there is no component to instantiate.
 cli-plugin-info-load-failed-exit = plugin '{$name}' does not load against this host
+cli-plugin-info-load-config-refused =
+    Loads: no. The component instantiates against this host's WIT world, but the runtime refuses its configuration: {$error}
+    The configuration is the `config` map of the [[plugins.entries]] row named '{$key}'. Make it match the installed package's config_schema, or remove its values if the package declares none.
 cli-estop-domains-none = {"  "}domain_blocks:  (none)
 cli-estop-domains = {"  "}domain_blocks:  {$v}
 cli-estop-tools-none = {"  "}tool_freeze:    (none)
