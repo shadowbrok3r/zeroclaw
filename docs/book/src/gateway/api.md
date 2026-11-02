@@ -57,6 +57,36 @@ After guest authentication, the host applies the live peer group for
 use route-namespaced, ownership-safe reservations: an in-flight duplicate waits
 for commit or rollback instead of being acknowledged prematurely.
 
+## Machine memory namespaces
+
+The memory REST endpoints reserve `machine_<id>` aliases for isolated machine
+memory, where `<id>` is exactly 64 lowercase hexadecimal digits. A caller such
+as MasterTech derives that ID from the exact machine connection string using
+SHA-256 and sends the alias in the existing `agent` field on reads, writes,
+and deletes. Successful responses echo `machine_namespace`. Older gateways
+reject these aliases as unknown agents before storage; clients must not fall
+back to a shared alias.
+
+These aliases use the existing private principal plane under the configured
+SQLite `diagnostician` agent and the fixed `mastertech-machine-v1` namespace.
+The backend enforces the principal, agent, namespace, and tenant in every
+read, list, count, overwrite, and delete. Shared memories are excluded, and
+identical visible keys on two machines remain independent. The memory factory
+resolves the current configuration and scan/audit policy for each request.
+Unsupported backends, missing configuration, and backend errors fail closed.
+Existing configured agent aliases and general technician memories are unchanged.
+
+The bearer token still grants installation administration; a namespace is a
+storage boundary and does not attest device possession. The caller must bind
+its chosen namespace to its authenticated session. Legacy shared machine
+memories are not automatically imported into any private namespace.
+
+Machine writes limit keys to 256 bytes, content to 32 KiB, categories to 64
+bytes, and entries to 1,024 per namespace. Writes are serialized through the
+count check and storage operation; updating an existing key remains possible
+at the entry limit. An oversized field returns `413`; a new key at the entry
+limit returns `429`. Machine recall queries are limited to 4,096 bytes.
+
 ## Discovering the surface
 
 Two endpoints answer the question "what can I do here?":
