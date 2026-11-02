@@ -59,7 +59,7 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem",
 # 0600, and never transmitted).
 zeroize = "1.8"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
-pulldown-cmark = { version = "0.13", default-features = false }
+pulldown-cmark = { version = "0.13.6", default-features = false }
 mime_guess = "2"
 shellexpand = "3.1"
 directories = { workspace = true }
