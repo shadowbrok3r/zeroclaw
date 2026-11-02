@@ -1065,6 +1065,33 @@ pub async fn handle_api_doctor(
     .into_response()
 }
 
+const MACHINE_PREFIX: &str = "machine_";
+const MACHINE_AGENT: &str = "diagnostician";
+const MACHINE_NAMESPACE: &str = "mastertech-machine-v1";
+const MACHINE_ENTRY_LIMIT: usize = 1024;
+const MACHINE_CONTENT_BYTES: usize = 32_768;
+static MACHINE_WRITES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn machine_scope(alias: &str) -> Result<zeroclaw_api::memory_traits::PrincipalScope, &'static str> {
+    let id = alias
+        .strip_prefix(MACHINE_PREFIX)
+        .ok_or("Invalid machine namespace")?;
+    if id.len() != 64
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("Machine namespaces require 64 lowercase hexadecimal digits");
+    }
+    Ok(zeroclaw_api::memory_traits::PrincipalScope::new(alias)
+        .with_agent(Some(MACHINE_AGENT.to_string()))
+        .with_namespace(Some(MACHINE_NAMESPACE.to_string())))
+}
+
+fn confirmed_machine_namespace(agent: Option<&str>) -> Option<&str> {
+    agent.filter(|alias| alias.starts_with(MACHINE_PREFIX))
+}
+
 async fn resolve_memory_handle(
     state: &AppState,
     agent_alias: Option<&str>,
@@ -1074,6 +1101,42 @@ async fn resolve_memory_handle(
         None => return Ok(state.mem.clone()),
     };
     let config = state.config.read().clone();
+    if alias.starts_with(MACHINE_PREFIX) {
+        let scope = machine_scope(alias).map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": error})),
+            )
+        })?;
+        if agent_alias != Some(alias) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Machine namespace must be exact"})),
+            ));
+        }
+        let configured = config.agent(MACHINE_AGENT).is_some_and(|agent| {
+            agent.memory.backend == zeroclaw_config::multi_agent::MemoryBackendKind::Sqlite
+        });
+        if !configured
+            || zeroclaw_memory::classify_memory_backend(&config.memory.backend)
+                != zeroclaw_memory::MemoryBackendKind::Sqlite
+        {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(
+                    serde_json::json!({"error": "Isolated machine memory requires the configured SQLite diagnostician backend"}),
+                ),
+            ));
+        }
+        let api_key = config
+            .resolved_model_provider_for_agent(MACHINE_AGENT)
+            .and_then(|(_, _, provider)| provider.api_key.clone());
+        let raw = zeroclaw_memory::create_memory_from_config(&config, api_key.as_deref())
+            .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":"Isolated machine memory backend is unavailable"}))))?;
+        return Ok(std::sync::Arc::new(
+            zeroclaw_memory::PrincipalPlaneMemory::new(std::sync::Arc::from(raw), scope),
+        ));
+    }
     if config.agent(alias).is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1107,6 +1170,18 @@ pub async fn handle_api_memory_list(
         return e.into_response();
     }
 
+    if confirmed_machine_namespace(params.agent.as_deref()).is_some()
+        && params
+            .query
+            .as_ref()
+            .is_some_and(|query| query.len() > 4096)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"Machine memory query is too large"})),
+        )
+            .into_response();
+    }
     let mem = match resolve_memory_handle(&state, params.agent.as_deref()).await {
         Ok(m) => m,
         Err(e) => return e.into_response(),
@@ -1127,7 +1202,8 @@ pub async fn handle_api_memory_list(
                     None => entries,
                 };
                 Json(serde_json::json!({
-                    "entries": sanitize_memory_entries_for_api(entries)
+                    "entries": sanitize_memory_entries_for_api(entries),
+                    "machine_namespace": confirmed_machine_namespace(params.agent.as_deref())
                 }))
                 .into_response()
             }
@@ -1148,7 +1224,8 @@ pub async fn handle_api_memory_list(
 
         match mem.list(category.as_ref(), None).await {
             Ok(entries) => Json(serde_json::json!({
-                "entries": sanitize_memory_entries_for_api(entries)
+                "entries": sanitize_memory_entries_for_api(entries),
+                "machine_namespace": confirmed_machine_namespace(params.agent.as_deref())
             }))
             .into_response(),
             Err(e) => (
@@ -1212,8 +1289,46 @@ pub async fn handle_api_memory_store(
         Err(e) => return e.into_response(),
     };
 
+    let namespace = confirmed_machine_namespace(body.agent.as_deref());
+    let _write = if namespace.is_some() {
+        Some(MACHINE_WRITES.lock().await)
+    } else {
+        None
+    };
+    if namespace.is_some() {
+        if body.key.trim().is_empty()
+            || body.key.len() > 256
+            || body.key.chars().any(char::is_control)
+            || body.content.len() > MACHINE_CONTENT_BYTES
+            || body
+                .category
+                .as_ref()
+                .is_some_and(|category| category.len() > 64)
+        {
+            return (StatusCode::PAYLOAD_TOO_LARGE, Json(serde_json::json!({"error":"Machine memory key, content or category exceeds its limit"}))).into_response();
+        }
+        let count =
+            match mem.count().await {
+                Ok(count) => count,
+                Err(_) => return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(
+                        serde_json::json!({"error":"Isolated machine memory count is unavailable"}),
+                    ),
+                )
+                    .into_response(),
+            };
+        if count >= MACHINE_ENTRY_LIMIT {
+            match mem.get(&body.key).await {
+                Ok(Some(_)) => {},
+                Ok(None) => return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error":"Machine memory entry limit reached"}))).into_response(),
+                Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":"Isolated machine memory lookup is unavailable"}))).into_response(),
+            }
+        }
+    }
     match mem.store(&body.key, &body.content, category, None).await {
-        Ok(()) => Json(serde_json::json!({"status": "ok"})).into_response(),
+        Ok(()) => Json(serde_json::json!({"status": "ok", "machine_namespace": namespace}))
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Memory store failed: {e}")})),
@@ -1240,7 +1355,7 @@ pub async fn handle_api_memory_delete(
 
     match mem.forget(&key).await {
         Ok(deleted) => {
-            Json(serde_json::json!({"status": "ok", "deleted": deleted})).into_response()
+            Json(serde_json::json!({"status": "ok", "deleted": deleted, "machine_namespace": confirmed_machine_namespace(query.agent.as_deref())})).into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3574,6 +3689,204 @@ pub(crate) mod tests {
         assert_eq!(truncated.chars().count(), MEMORY_API_CONTENT_MAX_CHARS);
         assert!(truncated.ends_with("..."));
         assert_ne!(truncated, over);
+    }
+
+    #[tokio::test]
+    async fn machine_memory_same_keys_recall_list_get_and_delete_stay_private() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        config.memory.backend = "sqlite".into();
+        config.data_dir = temp.path().to_path_buf();
+        config
+            .agents
+            .insert(MACHINE_AGENT.into(), Default::default());
+        let sqlite = Arc::new(zeroclaw_memory::SqliteMemory::new("test", temp.path()).unwrap());
+        sqlite
+            .store("same", "shared marker", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let mut state = test_state(config);
+        state.mem = sqlite.clone();
+        let a = format!("machine_{}", "a".repeat(64));
+        let b = format!("machine_{}", "b".repeat(64));
+        for (alias, content) in [(&a, "a marker"), (&b, "b marker"), (&a, "a updated marker")] {
+            let response = machine_memory_write(state.clone(), alias, "same", content).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response_json(response).await["machine_namespace"],
+                alias.as_str()
+            );
+        }
+        for (alias, content) in [(&a, "a updated marker"), (&b, "b marker")] {
+            let handle = resolve_memory_handle(&state, Some(alias)).await.unwrap();
+            assert_eq!(handle.count().await.unwrap(), 1);
+            assert_eq!(handle.get("same").await.unwrap().unwrap().content, content);
+            for query in [None, Some("marker")] {
+                let response = machine_memory_read(state.clone(), alias, query).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let value = response_json(response).await;
+                assert_eq!(value["entries"].as_array().unwrap().len(), 1);
+                assert_eq!(value["entries"][0]["content"], content);
+            }
+        }
+        assert_eq!(sqlite.list(None, None).await.unwrap().len(), 1);
+        assert_eq!(
+            sqlite.get("same").await.unwrap().unwrap().content,
+            "shared marker"
+        );
+        let response = handle_api_memory_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("same".into()),
+            Query(MemoryDeleteQuery {
+                agent: Some(a.clone()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["deleted"], true);
+        let handle = resolve_memory_handle(&state, Some(&a)).await.unwrap();
+        assert!(handle.get("same").await.unwrap().is_none());
+        assert_eq!(handle.count().await.unwrap(), 0);
+        let b_rows = response_json(machine_memory_read(state, &b, None).await).await;
+        assert_eq!(b_rows["entries"][0]["content"], "b marker");
+        assert_eq!(
+            sqlite.get("same").await.unwrap().unwrap().content,
+            "shared marker"
+        );
+    }
+
+    async fn machine_memory_write(
+        state: AppState,
+        alias: &str,
+        key: &str,
+        content: &str,
+    ) -> axum::response::Response {
+        handle_api_memory_store(
+            State(state),
+            HeaderMap::new(),
+            Json(MemoryStoreBody {
+                agent: Some(alias.into()),
+                key: key.into(),
+                content: content.into(),
+                category: Some("core".into()),
+            }),
+        )
+        .await
+        .into_response()
+    }
+
+    async fn machine_memory_read(
+        state: AppState,
+        alias: &str,
+        query: Option<&str>,
+    ) -> axum::response::Response {
+        handle_api_memory_list(
+            State(state),
+            HeaderMap::new(),
+            Query(MemoryQuery {
+                agent: Some(alias.into()),
+                query: query.map(str::to_string),
+                category: None,
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .into_response()
+    }
+
+    #[tokio::test]
+    async fn machine_memory_caps_count_and_content_without_overwriting_another_machine() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        config.memory.backend = "sqlite".into();
+        config.data_dir = temp.path().to_path_buf();
+        config
+            .agents
+            .insert(MACHINE_AGENT.into(), Default::default());
+        let mut state = test_state(config);
+        state.mem = Arc::new(zeroclaw_memory::SqliteMemory::new("test", temp.path()).unwrap());
+        let a = format!("machine_{}", "a".repeat(64));
+        let handle = resolve_memory_handle(&state, Some(&a)).await.unwrap();
+        for index in 0..MACHINE_ENTRY_LIMIT {
+            handle
+                .store(&index.to_string(), "fixture", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            machine_memory_write(state.clone(), &a, "overflow", "fixture")
+                .await
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            machine_memory_write(state.clone(), &a, "0", "updated")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(handle.count().await.unwrap(), MACHINE_ENTRY_LIMIT);
+        assert_eq!(
+            machine_memory_write(
+                state.clone(),
+                &a,
+                "0",
+                &"x".repeat(MACHINE_CONTENT_BYTES + 1)
+            )
+            .await
+            .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        let b = format!("machine_{}", "b".repeat(64));
+        assert_eq!(
+            machine_memory_write(state, &b, "0", "other").await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(handle.get("0").await.unwrap().unwrap().content, "updated");
+    }
+
+    #[tokio::test]
+    async fn machine_memory_invalid_aliases_and_unsupported_backends_fail_closed() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        config.memory.backend = "sqlite".into();
+        config
+            .agents
+            .insert(MACHINE_AGENT.into(), Default::default());
+        let state = test_state(config.clone());
+        for alias in [
+            "machine_",
+            "machine_../shared",
+            &format!("machine_{}", "A".repeat(64)),
+            &format!("machine_{}", "a".repeat(65)),
+        ] {
+            assert_eq!(
+                machine_memory_write(state.clone(), alias, "same", "fixture")
+                    .await
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let alias = format!("machine_{}", "a".repeat(64));
+        config.agents.clear();
+        assert_eq!(
+            machine_memory_write(test_state(config.clone()), &alias, "same", "fixture")
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        config.memory.backend = "markdown".into();
+        assert_eq!(
+            machine_memory_read(test_state(config), &alias, None)
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[tokio::test]
