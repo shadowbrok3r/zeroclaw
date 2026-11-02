@@ -2,16 +2,8 @@
 //!
 //! `GET /admin/sop/pending`, `GET /admin/sop/logs`, `POST /admin/sop/approve`,
 //! `POST /admin/sop/deny`.
-//! Auth reuses the vetted `/admin/reload` gate: loopback is always allowed and
-//! attributed as `cli` UNLESS pairing is required and it also presents a valid
-//! bearer token, in which case it is attributed as `http` (the authenticated
-//! subject); a non-loopback caller needs `gateway.allow_remote_admin` + pairing
-//! and passes `require_auth`, attributed as an `http` principal. The principal
-//! is ALWAYS derived from the transport here, never from the request body.
-//! Resolution funnels through `resolve_via_broker` (EPIC G's authorization/
-//! quorum layer over the shared engine's `resolve_gate` chokepoint - a no-op
-//! pass-through when no `[sop.approval]` policy applies); `sop_engine = None`
-//! yields 503.
+//! Loopback requests require the gateway admin token; remote requests require paired bearer auth.
+//! Approval principals are derived from authenticated transport credentials.
 
 use std::net::SocketAddr;
 
@@ -74,23 +66,8 @@ fn authorize(
     let allow_remote = state.config.read().gateway.allow_remote_admin;
     let require_pairing = state.pairing.require_pairing();
     match admin_reload_gate(peer.ip().is_loopback(), allow_remote, require_pairing) {
-        AdminReloadGate::Allow => {
-            // A loopback caller is always allowed, but if pairing is actually
-            // REQUIRED and it ALSO presents a valid paired bearer token, capture
-            // that authenticated identity instead of discarding it as anonymous
-            // CLI - otherwise a local dashboard/HTTP client with a valid token and
-            // `http:<hash>` group membership would be rejected as an anonymous
-            // `cli(None)` (no identity, so it can never satisfy a required-group
-            // policy), while the SAME token from a non-loopback peer (the
-            // `RequireAuth` arm below) resolves correctly.
-            //
-            // Gated on `require_pairing`: when pairing is OFF,
-            // `authenticate_and_hash` treats EVERY token as valid (a no-op
-            // pass-through for that mode - see `PairingGuard::is_authenticated`),
-            // so deriving an identity from an unauthenticated header in that mode
-            // would let any caller-supplied bearer value fabricate an approval
-            // identity. WS already only derives a subject when auth is actually
-            // meaningful; this matches that.
+        AdminReloadGate::RequireLocalToken => {
+            crate::require_gateway_admin_token(state, headers)?;
             let subject = require_pairing
                 .then(|| crate::api::extract_bearer_token(headers))
                 .flatten()
@@ -469,6 +446,102 @@ pub(crate) mod tests {
         headers
     }
 
+    fn local_bearer(state: &AppState, token: &str) -> HeaderMap {
+        let data_dir = tempfile::tempdir().unwrap();
+        let secret = state.pairing.rotate_admin_token(data_dir.path()).unwrap();
+        let mut headers = bearer(token);
+        headers.insert(crate::GATEWAY_ADMIN_TOKEN_HEADER, secret.parse().unwrap());
+        headers
+    }
+
+    #[tokio::test]
+    async fn loopback_sop_admin_routes_require_current_admin_token() {
+        for with_forwarding in [false, true] {
+            for wrong_token in [false, true] {
+                let (state, run_id) = state_with_policied_gate("test-paired-token");
+                let _current = local_bearer(&state, "test-paired-token");
+                let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
+                let mut headers = HeaderMap::new();
+                if with_forwarding {
+                    headers.insert("X-Forwarded-For", "203.0.113.7".parse().unwrap());
+                }
+                if wrong_token {
+                    headers.insert(crate::GATEWAY_ADMIN_TOKEN_HEADER, "wrong".parse().unwrap());
+                }
+                assert_eq!(
+                    handle_sop_pending(State(state.clone()), ConnectInfo(peer), headers.clone())
+                        .await
+                        .err()
+                        .unwrap()
+                        .0,
+                    StatusCode::FORBIDDEN
+                );
+                assert_eq!(
+                    handle_sop_logs(
+                        State(state.clone()),
+                        ConnectInfo(peer),
+                        headers.clone(),
+                        Query(SopLogsQuery {
+                            run_id: run_id.clone(),
+                            limit: None,
+                            until_line_offset: None,
+                            until_segment_cursor: None
+                        })
+                    )
+                    .await
+                    .err()
+                    .unwrap()
+                    .0,
+                    StatusCode::FORBIDDEN
+                );
+                assert_eq!(
+                    handle_sop_approve(
+                        State(state.clone()),
+                        ConnectInfo(peer),
+                        headers.clone(),
+                        Json(SopResolveBody {
+                            run_id: run_id.clone(),
+                            reason: None
+                        })
+                    )
+                    .await
+                    .err()
+                    .unwrap()
+                    .0,
+                    StatusCode::FORBIDDEN
+                );
+                assert_eq!(
+                    handle_sop_deny(
+                        State(state.clone()),
+                        ConnectInfo(peer),
+                        headers,
+                        Json(SopResolveBody {
+                            run_id: run_id.clone(),
+                            reason: None
+                        })
+                    )
+                    .await
+                    .err()
+                    .unwrap()
+                    .0,
+                    StatusCode::FORBIDDEN
+                );
+                assert_eq!(
+                    state
+                        .sop_engine
+                        .as_ref()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .get_run(&run_id)
+                        .unwrap()
+                        .status,
+                    SopRunStatus::WaitingApproval
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn http_surface_enforces_policy_membership_via_authenticated_subject() {
         let run_status = |state: &AppState, id: &str| {
@@ -547,15 +620,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn loopback_caller_with_a_valid_token_keeps_its_authenticated_identity() {
-        // Regression: a loopback caller is always allowed
-        // (`AdminReloadGate::Allow`), but `authorize()` used to map that straight
-        // to `ApprovalPrincipal::cli(None)` regardless of whether a valid paired
-        // bearer token was also presented, discarding the authenticated identity.
-        // A local dashboard/HTTP client with a valid token whose hash is a policy's
-        // `required_group` member would then be rejected as an anonymous CLI (no
-        // identity, cannot satisfy any required-group membership), even though the
-        // same token from a non-loopback peer resolves correctly (see
-        // `http_surface_enforces_policy_membership_via_authenticated_subject`).
         let run_status = |state: &AppState, id: &str| {
             state
                 .sop_engine
@@ -573,7 +637,7 @@ pub(crate) mod tests {
         let resp = handle_sop_approve(
             State(state.clone()),
             ConnectInfo(loopback),
-            bearer(token),
+            local_bearer(&state, token),
             Json(SopResolveBody {
                 run_id: run_id.clone(),
                 reason: None,
@@ -598,16 +662,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn loopback_bearer_identity_is_not_derived_when_pairing_is_disabled() {
-        // Regression: a loopback caller's identity must only be derived from a
-        // bearer token when pairing is required and the token is a real
-        // authentication credential. `PairingGuard::is_authenticated` treats every
-        // token as valid when `require_pairing` is false (a pass-through for that
-        // mode, not real authentication). Without gating on `require_pairing`, a
-        // loopback caller with pairing disabled could present an arbitrary bearer
-        // value and be attributed the derived hash as its approval identity,
-        // fabricating membership in a required group from an unauthenticated
-        // header. The gate must not clear from an unauthenticated loopback request
-        // even if its pairing-off token hash happens to match a real group member.
         let run_status = |state: &AppState, id: &str| {
             state
                 .sop_engine
@@ -634,7 +688,7 @@ pub(crate) mod tests {
         let resp = handle_sop_approve(
             State(state.clone()),
             ConnectInfo(loopback),
-            bearer(token),
+            local_bearer(&state, token),
             Json(SopResolveBody {
                 run_id: run_id.clone(),
                 reason: None,
