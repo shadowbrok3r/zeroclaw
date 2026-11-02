@@ -18,6 +18,7 @@ env:
 
 jobs:
   advisories:
+    if: github.repository == 'zeroclaw-labs/zeroclaw'
     name: Advisory Scan
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -29,12 +30,10 @@ jobs:
           toolchain: 1.98.0
 
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+        run: bash scripts/ci/install_release_tool.sh cargo-deny
 
       - name: Install cargo-audit
-        run: |
-          curl -LsSf https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz \
-            | tar zxf - -C ~/.cargo/bin --strip-components=1
+        run: bash scripts/ci/install_release_tool.sh cargo-audit
 
       - name: Run advisory scan
         id: scan

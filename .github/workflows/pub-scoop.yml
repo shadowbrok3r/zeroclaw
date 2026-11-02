@@ -47,6 +47,7 @@ permissions:
 
 jobs:
   publish-scoop:
+    if: github.repository == 'zeroclaw-labs/zeroclaw'
     name: Update Scoop Manifest
     runs-on: ubuntu-latest
     env:

@@ -2757,7 +2757,7 @@ fn crates_io_publisher_is_preflighted_gated_and_resumable() {
         }
     }
     assert!(
-        publish.contains("if: ${{ inputs.dry_run == false && inputs.stage != 'preflight' }}"),
+        publish.contains("if: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && inputs.dry_run == false && inputs.stage != 'preflight' }}"),
         "the preflight stage must never reach the upload job"
     );
     assert!(

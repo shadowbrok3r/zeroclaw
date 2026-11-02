@@ -258,7 +258,7 @@ jobs:
     name: Publish to crates.io
     needs: [preflight]
     # Called by workflow_dispatch, `inputs.stage` is empty and means `all`.
-    if: ${{ inputs.dry_run == false && inputs.stage != 'preflight' }}
+    if: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && inputs.dry_run == false && inputs.stage != 'preflight' }}
     runs-on: ubuntu-latest
     timeout-minutes: 350
     # v0.8.5 creates the relay protocol, shared TLS, and ZeroRelay crate names.

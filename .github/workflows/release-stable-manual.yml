@@ -30,6 +30,7 @@ env:
 
 jobs:
   validate:
+    if: github.repository == 'zeroclaw-labs/zeroclaw'
     name: Validate Version
     runs-on: ubuntu-latest
     outputs:
@@ -80,6 +81,7 @@ jobs:
           echo "version=${input_version}" >> "$GITHUB_OUTPUT"
 
   web:
+    if: github.repository == 'zeroclaw-labs/zeroclaw'
     name: Build Web Dashboard
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -111,6 +113,7 @@ jobs:
           retention-days: 1
 
   release-notes:
+    if: github.repository == 'zeroclaw-labs/zeroclaw'
     name: Generate Release Notes
     runs-on: ubuntu-latest
     outputs:

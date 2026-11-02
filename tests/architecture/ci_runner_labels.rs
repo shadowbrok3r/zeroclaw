@@ -94,10 +94,19 @@ const REUSABLE_COMPILE_JOBS: [&str; 1] = ["crates-preflight"];
 /// expression belongs to `build`, whose macOS leg stays on the GitHub-hosted
 /// cache; `'false'` also belongs to the separate Windows jobs and the web job.
 const ALLOWED_CACHE_INPUTS: [&str; 3] = [
-    "'true'",
+    "${{ github.repository == 'zeroclaw-labs/zeroclaw' }}",
     "'false'",
-    "${{ matrix.target == 'x86_64-unknown-linux-gnu' }}",
+    "${{ github.repository == 'zeroclaw-labs/zeroclaw' && matrix.target == 'x86_64-unknown-linux-gnu' }}",
 ];
+
+fn selected_runner(label: &str) -> String {
+    let fallback = if label.contains("windows") {
+        "windows-latest"
+    } else {
+        "ubuntu-latest"
+    };
+    format!("${{{{ github.repository == 'zeroclaw-labs/zeroclaw' && '{label}' || '{fallback}' }}}}")
+}
 
 fn ci_workflow() -> String {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -183,10 +192,10 @@ fn compile_jobs_pin_the_runner_label_instead_of_reading_it_from_fmt() {
         let pins_label = if name == "build" {
             // The Linux leg carries the label through the matrix; macOS names
             // its GitHub-hosted image. Windows is selected independently.
-            block.contains(&format!("- os: {RUNNER_LABEL}\n"))
+            block.contains(&format!("- os: {}\n", selected_runner(RUNNER_LABEL)))
                 && block.contains("runs-on: ${{ matrix.os }}\n")
         } else {
-            block.contains(&format!("    runs-on: {RUNNER_LABEL}\n"))
+            block.contains(&format!("    runs-on: {}\n", selected_runner(RUNNER_LABEL)))
         };
         assert!(pins_label, "{name} must run on {RUNNER_LABEL}");
     }
@@ -248,7 +257,10 @@ fn windows_recovery_pins_its_runner_and_trusted_cache_writer() {
 
     let recovery = &blocks["ci.yml/windows-task-owner-recovery"];
     assert!(
-        recovery.contains(&format!("    runs-on: {WINDOWS_RECOVERY_LABEL}\n")),
+        recovery.contains(&format!(
+            "    runs-on: {}\n",
+            selected_runner(WINDOWS_RECOVERY_LABEL)
+        )),
         "recovery must pin the measured Windows runner"
     );
     assert!(
@@ -263,9 +275,9 @@ fn windows_recovery_pins_its_runner_and_trusted_cache_writer() {
     assert!(
         recovery.contains("          cache-on-failure: 'false'\n")
             && recovery.contains(
-                "          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}\n"
+                "          save-if: ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}\n"
             ),
-        "only successful master pushes may seed recovery; PRs and merge-queue runs must only read"
+        "only successful default-branch pushes may seed recovery; PRs and merge-queue runs must only read"
     );
 }
 
@@ -278,7 +290,10 @@ fn housekeeping_jobs_pin_the_four_vcpu_label() {
             .get(name)
             .unwrap_or_else(|| panic!("missing workflow job {name}"));
         assert!(
-            block.contains(&format!("    runs-on: {HOUSEKEEPING_LABEL}\n")),
+            block.contains(&format!(
+                "    runs-on: {}\n",
+                selected_runner(HOUSEKEEPING_LABEL)
+            )),
             "{name} must run on {HOUSEKEEPING_LABEL}"
         );
     }
@@ -364,7 +379,10 @@ fn reusable_compile_jobs_pass_the_fleet_label() {
             .unwrap_or_else(|| panic!("ci.yml must define the {name} job"));
         assert!(
             block.contains("    uses: ./.github/workflows/")
-                && block.contains(&format!("      runner: {RUNNER_LABEL}\n")),
+                && block.contains(&format!(
+                    "      runner: {}\n",
+                    selected_runner(RUNNER_LABEL)
+                )),
             "{name} must pass runner: {RUNNER_LABEL} to its reusable workflow"
         );
     }
@@ -449,6 +467,34 @@ fn jobs_downstream_of_the_master_debounce_never_skip_silently() {
                 "{name} must check `{expected}` so replacing implicit success() does not \
                  let it run after a failed dependency"
             );
+        }
+    }
+}
+
+#[test]
+fn fork_validation_uses_hosted_runners_and_read_only_permissions() {
+    for filename in ["ci.yml", "windows-tests.yml"] {
+        let workflow = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(".github/workflows")
+                .join(filename),
+        )
+        .expect("workflow is readable");
+        assert!(workflow.contains("branches: [main, master]"));
+        assert!(workflow.contains("permissions:\n  contents: read\n"));
+        assert!(!workflow.contains("secrets:"));
+        assert!(!workflow.contains("${{ secrets."));
+        assert!(!workflow.contains("pull_request_target:"));
+        for line in workflow.lines().filter(|line| {
+            line.trim_start().starts_with("runs-on:")
+                || line.trim_start().starts_with("- os:")
+                || line.trim_start().starts_with("runner:")
+        }) {
+            for label in [RUNNER_LABEL, HOUSEKEEPING_LABEL, WINDOWS_RECOVERY_LABEL] {
+                if line.contains(label) {
+                    assert!(line.contains(&selected_runner(label)), "{filename}: {line}");
+                }
+            }
         }
     }
 }

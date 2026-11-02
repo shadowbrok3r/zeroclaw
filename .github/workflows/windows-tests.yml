@@ -3,7 +3,7 @@ run-name: "Windows tests for PR #${{ github.event.pull_request.number }} (${{ gi
 
 on:
   pull_request:
-    branches: [master]
+    branches: [main, master]
     types: [opened, synchronize, reopened, labeled]
 
 permissions:
@@ -24,7 +24,7 @@ jobs:
   windows-test-scope:
     name: Advisory Windows test selection
     if: contains(github.event.pull_request.labels.*.name, 'ci:windows') && (github.event.action != 'labeled' || github.event.label.name == 'ci:windows')
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'zeroclaw-labs/zeroclaw' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 10
     outputs:
       mode: ${{ steps.select.outputs.mode }}

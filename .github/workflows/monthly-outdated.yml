@@ -25,6 +25,7 @@ env:
 
 jobs:
   outdated:
+    if: github.repository == 'zeroclaw-labs/zeroclaw'
     name: Outdated Dependency Scan
     runs-on: ubuntu-24.04
     timeout-minutes: 20

@@ -41,6 +41,7 @@ permissions:
 
 jobs:
   publish-aur:
+    if: github.repository == 'zeroclaw-labs/zeroclaw'
     name: Update AUR Package
     runs-on: ubuntu-latest
     timeout-minutes: 20

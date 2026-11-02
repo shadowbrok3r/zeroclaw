@@ -49,7 +49,7 @@ concurrency:
 
 jobs:
   deploy:
-    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'build'
+    if: github.repository == 'zeroclaw-labs/zeroclaw' && (github.event_name != 'workflow_dispatch' || inputs.mode == 'build')
     runs-on: ubuntu-24.04-arm
     steps:
       # A push to master may flip the stable pointer (docs/book/stable-version.txt).
@@ -437,7 +437,7 @@ jobs:
           popd > /dev/null
 
   promote-stable:
-    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'promote-stable'
+    if: github.repository == 'zeroclaw-labs/zeroclaw' && github.event_name == 'workflow_dispatch' && inputs.mode == 'promote-stable'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 10
     steps:

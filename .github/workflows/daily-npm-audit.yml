@@ -15,6 +15,7 @@ permissions:
 
 jobs:
   npm-audit:
+    if: github.repository == 'zeroclaw-labs/zeroclaw'
     name: npm Audit
     runs-on: ubuntu-latest
     timeout-minutes: 10
