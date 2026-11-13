@@ -70,6 +70,20 @@ async fn emit_summary_attempt_usage(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Estimate the summary request without letting its appended prompt move the
+/// turn boundary. The summary prompt is a plain `user` message, so estimating
+/// the whole request at once makes every tool result of the turn look stale:
+/// their prepared carriers (with inlined base64 images) are then priced by raw
+/// bytes instead of per image, and an image-heavy turn that hits the iteration
+/// cap is rejected as millions of tokens over the context window. The prepared
+/// prefix is estimated on its own, exactly as the main loop estimates it, and
+/// the transient suffix separately.
+fn estimate_summary_request_tokens(messages: &[ChatMessage], prefix_len: usize) -> usize {
+    let split = prefix_len.min(messages.len());
+    crate::agent::history::estimate_history_tokens(&messages[..split])
+        + crate::agent::history::estimate_history_tokens(&messages[split..])
+}
+
 pub(crate) async fn finish_after_max_iterations(
     injected_memory_preamble: &mut Option<super::MemoryPreamble>,
     model_provider: &dyn ModelProvider,
@@ -294,6 +308,9 @@ async fn summarize_after_max_iterations(
             .await?
             .messages;
             let prepared_message_count = messages.len();
+            // Length of the prepared prefix; everything after it is the
+            // synthetic summary prompt plus any hook suffix.
+            let mut prefix_len = prepared_message_count;
             messages.push(summary_prompt_mirror.clone());
             let pre_hook_messages = messages.clone();
             let mut selected_model = model.to_string();
@@ -338,15 +355,16 @@ async fn summarize_after_max_iterations(
                     &quarantined_image_ids,
                     false,
                 );
+                prefix_len = messages.len();
                 messages.extend(transient_suffix);
             }
             let tokens_before =
-                token_counter.count(crate::agent::history::estimate_history_tokens(&messages));
+                token_counter.count(estimate_summary_request_tokens(&messages, prefix_len));
             let mut dropped_messages = 0;
             let mut dropped_turns = 0;
             loop {
                 let tokens =
-                    token_counter.count(crate::agent::history::estimate_history_tokens(&messages));
+                    token_counter.count(estimate_summary_request_tokens(&messages, prefix_len));
                 let mut trim = super::surface_oversized_dispatch_if_needed(
                     injected_memory_preamble,
                     history,
@@ -377,6 +395,7 @@ async fn summarize_after_max_iterations(
                         &quarantined_image_ids,
                         false,
                     );
+                    prefix_len = messages.len();
                     messages.push(summary_prompt_mirror.clone());
                     messages.extend(hook_suffix.iter().cloned());
                     continue;
@@ -2390,6 +2409,66 @@ mod tests {
         assert_eq!(
             tree.to_string(),
             "Agent exhausted the execution-tree iteration budget"
+        );
+    }
+}
+
+#[cfg(test)]
+mod summary_estimate_tests {
+    use super::estimate_summary_request_tokens;
+    use crate::agent::history::{IMAGE_TOKEN_ESTIMATE, estimate_history_tokens};
+    use zeroclaw_providers::ChatMessage;
+
+    /// A prepared native tool-result carrier whose image attachment has been
+    /// inlined as a large base64 data URI, as preparation sends it.
+    fn prepared_image_carrier(id: &str, base64_len: usize) -> ChatMessage {
+        let target = format!("data:image/png;base64,{}", "A".repeat(base64_len));
+        let attachments = vec![zeroclaw_api::media::RenderedMarker {
+            target,
+            kind: zeroclaw_api::media::MarkerKind::Image,
+        }];
+        ChatMessage::tool(
+            serde_json::json!({
+                "tool_call_id": id,
+                "content": "rendered",
+                "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&attachments),
+            })
+            .to_string(),
+        )
+    }
+
+    #[test]
+    fn appended_summary_prompt_does_not_reprice_turn_images_by_bytes() {
+        // An image-heavy turn that hit the iteration cap: 13 renders of
+        // ~450 KB base64 each, then the synthetic summary prompt.
+        let mut messages = vec![ChatMessage::user("render a big batch")];
+        for i in 0..13 {
+            messages.push(ChatMessage::assistant(format!("call {i}")));
+            messages.push(prepared_image_carrier(&format!("call-{i}"), 450_000));
+        }
+        let prefix_len = messages.len();
+        messages.push(ChatMessage::user("Summarize what you did."));
+
+        let estimate = estimate_summary_request_tokens(&messages, prefix_len);
+        assert!(
+            estimate < 13 * IMAGE_TOKEN_ESTIMATE + 2_000,
+            "images must be charged per image, got {estimate}"
+        );
+        assert!(
+            estimate >= 13 * IMAGE_TOKEN_ESTIMATE,
+            "every current-turn image must still be charged, got {estimate}"
+        );
+        // The pre-fix whole-request estimate prices the same carriers by
+        // their base64 bytes (the 2026-11-12 bogus 1.47M-token rejection).
+        assert!(estimate_history_tokens(&messages) > 1_000_000);
+    }
+
+    #[test]
+    fn prefix_len_past_the_end_is_clamped() {
+        let messages = vec![ChatMessage::user("u")];
+        assert_eq!(
+            estimate_summary_request_tokens(&messages, 5),
+            estimate_history_tokens(&messages)
         );
     }
 }
