@@ -12,7 +12,9 @@ use crate::observability::Observer;
 use crate::tools::scoped::{ScopedAssembly, ScopedToolRegistry};
 use crate::tools::{AllToolsResult, ArcToolRef, Tool};
 
-use super::tool_execution::{ToolDispatchContext, ToolExecutionOutcome, execute_one_tool};
+use super::tool_execution::{
+    ToolDispatchContext, ToolExecutionOutcome, execute_one_tool_with_provenance,
+};
 use super::turn::context::TurnMeta;
 
 pub const NAMES: [&str; 2] = ["web_search_tool", "web_fetch"];
@@ -92,9 +94,8 @@ pub async fn execute(
         channel_name: "web-tool-bridge",
     };
     zeroclaw_api::TOOL_LOOP_THREAD_ID
-        .scope(
-            Some(format!("web-tools:{agent}")),
-            execute_one_tool(
+        .scope(Some(format!("web-tools:{agent}")), async {
+            execute_one_tool_with_provenance(
                 &name,
                 arguments,
                 Some(&turn_id),
@@ -109,7 +110,9 @@ pub async fn execute(
                 None,
                 None,
                 None,
-            ),
-        )
+            )
+            .await
+            .map(|completed| completed.outcome)
+        })
         .await
 }

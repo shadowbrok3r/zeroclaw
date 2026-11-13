@@ -626,6 +626,26 @@ so a reply can still copy it for channel delivery. `~/.zeroclaw/config.toml` lis
 | `crates/zeroclaw-runtime/src/tools/shell.rs` | `with_attachment_commands`, `command_runs_listed_program`, `listed_program_image_attachments`. Tests: `listed_program_matches_in_command_position_only`, `listed_program_image_lines_become_attachments`, `listed_program_image_listing_declares_none`, `shell_declares_images_only_for_listed_programs`. |
 | `crates/zeroclaw-runtime/src/tools/mod.rs` | The registered `shell` tool takes the root config's list. |
 
+### Local admin needs this run's admin token (gateway)
+
+Upstream admits any loopback caller on `/admin/reload`, `/admin/shutdown` and
+`/admin/sop/*` as the local CLI. A reverse proxy or tunnel on the same host relays
+remote callers from loopback, so on a gateway published that way those routes
+answered remote callers with no credential. Ours requires the current
+`X-ZeroClaw-Admin-Token` on every local admin route: the per-run token the gateway
+writes owner-only to `gateway-admin.token` in its data directory. The CLI reads and
+sends it. Remote administration is unchanged (`gateway.allow_remote_admin` plus a
+paired bearer). Upstream v0.9.0 still allows loopback without a token.
+
+| File | Why |
+|---|---|
+| `crates/zeroclaw-gateway/src/lib.rs` | `require_gateway_admin_token`; `AdminReloadGate::RequireLocalToken` replaces `Allow`; shutdown and the pairing-code routes require the token too. Tests: `admin_reload_gate_loopback_requires_local_token`, `admin_mutations_refuse_proxied_loopback_without_current_admin_token`. |
+| `crates/zeroclaw-gateway/src/api_sop.rs` | `/admin/sop/*` take the same gate. |
+| `src/main.rs` | `gateway_local_admin_client`: loopback hosts only, sends the token, follows no redirects. Tests: `gateway_local_admin_client_requires_local_host_and_token_file`, `gateway_admin_cli_sends_owner_file_token_and_does_not_follow_redirects`. |
+| `crates/zeroclaw-config/src/pairing.rs` | Header documentation. |
+| `crates/zeroclaw-runtime/locales/en/cli.ftl` | Two CLI messages. |
+| `docs/book/src/ops/network-deployment.md` | Local admin needs the token; proxies must not inject it. |
+
 ### Documentation
 
 | File | Why |
@@ -666,6 +686,8 @@ Conflicts concentrate in the shared files below.
 | `crates/zeroclaw-channels/src/webhook.rs` | Bind address + direct-message treatment | Keep both; re-apply on top of upstream's rewrite. **After every merge, grep for `WebhookChannel::new` and `WebhookConfig {` across the tree.** The fork's `bind_address` is parameter 3 of 11 and a field of `WebhookConfig`, so any call site or literal upstream adds shifts every later argument by one — a new positional site fails to compile, but one that upstream later grows an 11th argument for would compile with `secret` landing in `auth_header`. v0.8.5 added two such sites: `orchestrator/mod.rs` (test helper) and `zeroclaw-runtime/src/daemon/mod.rs` (`webhook_only_config_is_supervised`). |
 | `web/src/lib/ws.ts` | `adopt` flag | v0.8.5 moved session-id storage out of `ws.ts` into `web/src/lib/chatSessions.ts` (`getActiveSessionId` / `setActiveSessionId`) and made `sessionId` a required `WebSocketClientOptions` field. Keep only `adopt` here; repoint any `setSessionId` importer at `chatSessions`. |
 | `src/main.rs` | `sessions` subcommand arm | Keep both arms; upstream adds subcommands in the same match. |
+| `crates/zeroclaw-gateway/src/dashboard_core.rs` | `session_messages` passes `SessionMessagesQuery` (tool context) to the fork's handler | Keep the extra argument if upstream rewrites the wrapper. |
+| `crates/zeroclaw-runtime/src/tools/delegate.rs` | Exact-name `delegate_admits` and the critic `sub_hooks` on the delegated child loop | Take upstream's file and re-apply both: upstream still auto-admits `__` names and passes `hooks: None`. |
 
 ## v0.8.6 merge record (2026-10-23)
 
@@ -720,16 +742,85 @@ Conflicts concentrate in the shared files below.
 - `TurnHub::turns_finished` is unused.
 - Stale doc comments: `turn/knobs.rs:16`, the schema doc for `loop_detection_no_progress_min_calls`, and the `__` auto-admit wording in `tool_search.rs` tests and `schema.rs`.
 
+## v0.9.0 merge record (2026-11-13)
+
+`v0.9.0` (`6c78ba59b`, 120 commits) merged on top of fork `main` `accbaeecb` and the
+admin-token hardening (`4fee567eb`): 10 files conflicted.
+
+**Superseded by upstream** (resolved toward upstream):
+- `418d409a5` (boot-time `reclaim_orphaned_running`) → #11523's `recover_abandoned_turns`,
+  which runs under the cross-process config-ownership guard before the daemon starts and
+  settles the same rows (state `error`, turn id kept). The fork's trait method, SQLite
+  implementation, daemon call and three tests are removed.
+
+**Re-ported onto upstream's shape:**
+- `delegate.rs`: upstream's file (bounded-registry rewrite, typed target-memory
+  replacements, new tests) with exact-name MCP admission (`delegate_admits`, `892cd610c`),
+  the fork's three admission tests, and the critic `sub_hooks` on the delegated child loop
+  (`4aa4a2128`) re-applied.
+- `ws.rs`: the fork's turn-hub loop (chained steering, `send_turn_frame`, reconnect replay)
+  with upstream's dashboard `SessionWatch` threaded through it. `handle_socket` takes
+  upstream's `SocketCaller` plus `adopt`; `process_chat_message` takes the watch. For a
+  signed-in socket the turn follows upstream: a `session_lost` arm, a `session_admits_now`
+  check on each client frame, and every write raced against the session ending close the
+  socket with the session's code, and `end_session_mid_turn` denies its parked approvals.
+  A signed-in viewer that left or whose session ended chains no unread steering
+  (`finish_or_chain_admitted`). A signed-in socket that rejoins a running turn
+  (`observe_running_turn`) closes when its session ends, and its messages wait for its own
+  turn instead of steering. Upstream's between-turn arms merged unchanged. A paired-token
+  socket carries no watch, so nothing changes for it.
+- `/api/sessions` list, delete, rename and abort route through upstream's `dashboard_core`
+  wrappers, which hand every caller but a scoped account to the fork's
+  `api::handle_api_session_*`. `dashboard_core::session_messages` passes the fork's
+  `SessionMessagesQuery` through.
+- Web: `AgentContext` keeps the adopt flow and ownership guard beside upstream's per-socket
+  conversations, with one `socketGeneration` counter for both. `AgentChat` takes upstream's
+  header and `canSend` gating and keeps the threads button (operator pages only), the
+  jump-to-bottom toolbar and the approval lock. `Sidebar` takes both import sets.
+
+**Kept as is:**
+- Session-store tool context (`append_turn`, `load_conversation`) beside upstream's
+  `append_authorized` / `set_session_name_authorized`, which only the RPC core path uses.
+- The fork's media, jobs and experiments session routes, `claude_transcript_router`, and
+  `render_delivery` beside upstream's `relay_ingress`.
+
+**Checked for silent mis-merges:** upstream added no `WebhookChannel::new` call site (all 20
+take the fork's 11 arguments); no `contains("__")` admission came back in
+`ToolAccessPolicy` or `delegate_admits`; `/admin/sop/*` still go through
+`RequireLocalToken`.
+
+**Validation** (Windows 11, Rust 1.98.1, isolated `ZEROCLAW_CONFIG_DIR`; fork CI does not run on PRs):
+- `cargo check` and `cargo clippy` (`--workspace --all-targets --exclude zeroclaw-desktop`) and
+  `cargo fmt --check` are clean apart from pre-existing Windows-only dead-code warnings.
+- Unit tests: `zeroclaw` bin 511/511, lib 287/287; channels 2051/2051; infra 345/345;
+  runtime 6029/6045 (the 16 tunnel tests spawn `sh`/`sleep`); config 1946/1948 (Windows
+  code page; the harness's `ZEROCLAW_CONFIG_DIR`); gateway 1004/1009 (three Windows-only
+  tests, and two web-tools search tests that need `tools-external`, which only `ci-all`
+  enables). All 103 `ws::tests` pass, upstream's signed-in session tests included.
+- Web: `tsc -b` clean after `cargo web gen-api`; every unit test script passes
+  (`sessionLifecycle` 63/63); `vite build` succeeds.
+- Found by the tests and fixed in the merge: the signed-in session-end gaps in `ws.rs`;
+  the admin CLI test's paircode mock lacked `"success": true` (it had never passed); an
+  `#[allow(clippy::too_many_arguments)]` that the auto-merge moved onto the wrong function
+  in `max_iter.rs`.
+
+**Open follow-ups:**
+- `zeroclaw config migrate` (schema v4) on each host after its first v0.9.0 start; the
+  shop box and the warehouse controller configs use none of the retired keys.
+
 ## Behavior deltas vs upstream
 
 Re-check these after every upstream merge; they are easy to silently lose:
 
+- **Local admin needs the current admin token.** A merge that restores
+  `AdminReloadGate::Allow` for loopback reopens `/admin/*` to any same-host proxy or
+  tunnel. `admin_reload_gate_loopback_requires_local_token` pins it.
 - **The WS chat path persists by append, not by whole-transcript rewrite.**
   - `persist_turn` → `append_turn` + `retain_tool_context_turns` is the post-turn writer.
   - Upstream's #9713 rewrite (`replace_conversation_state_if_exists` / `rewrite_messages_on`) deletes all of a session's tool context. Using it per turn would wipe tool context on every reconnect.
   - The stored transcript is therefore not trimmed to the agent window.
   - Pinned by `websocket_connect_trims_a_restored_history_without_rewriting_the_store`.
-- **Approvals stay parked in the TurnHub when the viewer leaves.** `detach_mid_turn` logs only; upstream denies them as "unreachable operator".
+- **Approvals stay parked in the TurnHub when the viewer leaves.** `detach_mid_turn` logs only; upstream denies them as "unreachable operator". When a signed-in session ends, `end_session_mid_turn` denies them as upstream does; the `ws::tests::*sign_out*` and `*slow_check*` tests pin it.
 - **Session metadata carries both owners.** Upstream's `principal_id` and the fork's `origin_principal`, each with an idempotent migration. The resume guard and device scoping read `origin_principal`.
 - **`ApprovalManager::for_new_turn` keeps the shell policy; `derive_for_risk_profile` drops it.** Git swapped these silently in the v0.8.6 merge. If channel turns lose the policy, an auto-approved shell call reaches the policy as approved with nothing to escalate against.
 - **Cron hooks.** `agent::run` builds `HookRunner::from_config_for_agent(&config, alias)`, which is `from_root_config` plus the agent-scoped critic.
