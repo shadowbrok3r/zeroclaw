@@ -5317,14 +5317,7 @@ fn require_localhost(peer: &SocketAddr) -> Result<(), (StatusCode, Json<serde_js
     }
 }
 
-/// Reject a pairing-code admin request that does not present this run's admin
-/// secret. [`require_localhost`] alone is not enough for these routes: a reverse
-/// proxy or tunnel on the same host relays remote callers from loopback, and
-/// a code read or minted here is exchanged at `/pair` for a shared-operator
-/// bearer. The secret reaches local clients through an owner-only file, so
-/// presenting it proves the caller runs as the gateway's user on its host.
-/// Admission compares against the token the pairing guard holds for this
-/// run, never the file, so a stale file or a failed rotation matches nothing.
+/// Require the current gateway admin token.
 fn require_gateway_admin_token(
     state: &AppState,
     headers: &HeaderMap,
@@ -5339,7 +5332,7 @@ fn require_gateway_admin_token(
         Err((
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
-                "error": "Pairing-code admin requests need this gateway's admin token. \
+                "error": "Local admin requests need this gateway's admin token. \
                           Run `zeroclaw gateway get-paircode` on the gateway host, as the \
                           user that runs the gateway."
             })),
@@ -5351,8 +5344,10 @@ fn require_gateway_admin_token(
 async fn handle_admin_shutdown(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_localhost(&peer)?;
+    require_gateway_admin_token(&state, &headers)?;
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -5374,8 +5369,8 @@ async fn handle_admin_shutdown(
 /// whether pairing is enabled.
 #[derive(Debug, PartialEq, Eq)]
 enum AdminReloadGate {
-    /// Loopback caller (the CLI) — allow without further checks.
-    Allow,
+    /// Loopback caller requires the current gateway admin token.
+    RequireLocalToken,
     /// Non-loopback caller, opted in with pairing on — allow only if pairing
     /// auth passes.
     RequireAuth,
@@ -5394,7 +5389,7 @@ fn admin_reload_gate(
     require_pairing: bool,
 ) -> AdminReloadGate {
     if is_loopback {
-        AdminReloadGate::Allow
+        AdminReloadGate::RequireLocalToken
     } else if !allow_remote_admin {
         AdminReloadGate::Forbidden
     } else if require_pairing {
@@ -5409,17 +5404,13 @@ async fn handle_admin_reload(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    // Loopback (the CLI) is always allowed. A non-loopback caller is rejected
-    // unless the operator opted in via `gateway.allow_remote_admin`, and even
-    // then must pass pairing auth — which requires pairing to be enabled, so
-    // opting in without pairing is rejected rather than left unauthenticated.
     let allow_remote = state.config.read().gateway.allow_remote_admin;
     // Source pairing status from the guard `require_auth` consults, not the
     // raw config field, so the gate's `RequireAuth` decision can never
     // diverge from what `require_auth` will actually enforce.
     let require_pairing = state.pairing.require_pairing();
     match admin_reload_gate(peer.ip().is_loopback(), allow_remote, require_pairing) {
-        AdminReloadGate::Allow => {}
+        AdminReloadGate::RequireLocalToken => require_gateway_admin_token(&state, &headers)?,
         AdminReloadGate::RequireAuth => api::require_auth(&state, &headers)?,
         AdminReloadGate::Forbidden => {
             return Err((
@@ -13918,15 +13909,23 @@ data: [DONE]\n\n";
     }
 
     #[test]
-    fn admin_reload_gate_loopback_always_allowed() {
-        // Loopback is allowed regardless of the opt-in or pairing flags.
+    fn admin_reload_gate_loopback_requires_local_token() {
         assert_eq!(
             admin_reload_gate(true, false, false),
-            AdminReloadGate::Allow
+            AdminReloadGate::RequireLocalToken
         );
-        assert_eq!(admin_reload_gate(true, true, true), AdminReloadGate::Allow);
-        assert_eq!(admin_reload_gate(true, false, true), AdminReloadGate::Allow);
-        assert_eq!(admin_reload_gate(true, true, false), AdminReloadGate::Allow);
+        assert_eq!(
+            admin_reload_gate(true, true, true),
+            AdminReloadGate::RequireLocalToken
+        );
+        assert_eq!(
+            admin_reload_gate(true, false, true),
+            AdminReloadGate::RequireLocalToken
+        );
+        assert_eq!(
+            admin_reload_gate(true, true, false),
+            AdminReloadGate::RequireLocalToken
+        );
     }
 
     #[test]
@@ -14012,15 +14011,115 @@ data: [DONE]\n\n";
     }
 
     #[tokio::test]
-    async fn admin_reload_loopback_no_token_reloads() {
+    async fn admin_reload_loopback_with_admin_token_reloads() {
         let tmp = tempfile::tempdir().unwrap();
         let state = admin_reload_state(&tmp, false, true, &[]);
-        let resp =
-            handle_admin_reload(State(state), ConnectInfo(loopback_peer()), HeaderMap::new())
-                .await
-                .unwrap()
-                .into_response();
+        let headers = admin_headers(&state);
+        let resp = handle_admin_reload(State(state), ConnectInfo(loopback_peer()), headers)
+            .await
+            .unwrap()
+            .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_mutations_refuse_proxied_loopback_without_current_admin_token() {
+        for with_forwarding_header in [false, true] {
+            for wrong_token in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let state = admin_reload_state(&tmp, false, true, &[]);
+                let _current = admin_headers(&state);
+                let mut headers = proxied_headers(with_forwarding_header);
+                if wrong_token {
+                    headers.insert(
+                        GATEWAY_ADMIN_TOKEN_HEADER,
+                        HeaderValue::from_static("wrong"),
+                    );
+                }
+                let mut shutdown_rx = state.shutdown_tx.subscribe();
+                let err = handle_admin_shutdown(
+                    State(state.clone()),
+                    ConnectInfo(loopback_peer()),
+                    headers.clone(),
+                )
+                .await
+                .err()
+                .unwrap();
+                assert_eq!(err.0, StatusCode::FORBIDDEN);
+                let err = handle_admin_reload(State(state), ConnectInfo(loopback_peer()), headers)
+                    .await
+                    .err()
+                    .unwrap();
+                assert_eq!(err.0, StatusCode::FORBIDDEN);
+                assert!(!*shutdown_rx.borrow_and_update());
+                assert!(!shutdown_rx.has_changed().unwrap_or(false));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_routes_reject_anonymous_proxied_loopback_requests_before_effects() {
+        for pairing_required in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = admin_reload_state(&tmp, false, pairing_required, &[]);
+            let _current = admin_headers(&state);
+            let router = Router::new()
+                .route("/admin/shutdown", post(handle_admin_shutdown))
+                .route("/admin/reload", post(handle_admin_reload))
+                .route("/admin/sop/pending", get(api_sop::handle_sop_pending))
+                .route("/admin/sop/logs", get(api_sop::handle_sop_logs))
+                .route("/admin/sop/approve", post(api_sop::handle_sop_approve))
+                .route("/admin/sop/deny", post(api_sop::handle_sop_deny))
+                .with_state(state.clone())
+                .layer(axum::Extension(ConnectInfo(loopback_peer())));
+            let mut shutdown_rx = state.shutdown_tx.subscribe();
+            for (method, path) in [
+                ("POST", "/admin/shutdown"),
+                ("POST", "/admin/reload"),
+                ("GET", "/admin/sop/pending"),
+                ("GET", "/admin/sop/logs?run_id=fixture"),
+                ("POST", "/admin/sop/approve"),
+                ("POST", "/admin/sop/deny"),
+            ] {
+                let request = Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .header("x-forwarded-for", "203.0.113.7")
+                    .body(Body::from(r#"{"run_id":"fixture"}"#))
+                    .unwrap();
+                assert_eq!(
+                    router.clone().oneshot(request).await.unwrap().status(),
+                    StatusCode::FORBIDDEN,
+                    "{method} {path}"
+                );
+            }
+            assert!(!*shutdown_rx.borrow_and_update());
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_shutdown_requires_loopback_and_current_admin_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, false, true, &[]);
+        let headers = admin_headers(&state);
+        let mut shutdown_rx = state.shutdown_tx.subscribe();
+        let err = handle_admin_shutdown(
+            State(state.clone()),
+            ConnectInfo(remote_peer()),
+            headers.clone(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(!*shutdown_rx.borrow_and_update());
+        let response = handle_admin_shutdown(State(state), ConnectInfo(loopback_peer()), headers)
+            .await
+            .unwrap()
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(*shutdown_rx.borrow_and_update());
     }
 
     #[tokio::test]

@@ -848,8 +848,7 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
     (len_diff == 0) & (byte_diff == 0)
 }
 
-/// Request header that carries the gateway admin secret on the pairing-code
-/// admin routes (`/admin/paircode`, `/admin/paircode/new`).
+/// Request header carrying the current gateway admin token for local admin routes.
 pub const GATEWAY_ADMIN_TOKEN_HEADER: &str = "x-zeroclaw-admin-token";
 
 const GATEWAY_ADMIN_TOKEN_FILE: &str = "gateway-admin.token";

@@ -10268,7 +10268,13 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     );
 
                     // Try to gracefully shutdown existing gateway via admin endpoint
-                    match shutdown_gateway(&host, port, config.gateway.path_prefix.as_deref()).await
+                    match shutdown_gateway(
+                        &host,
+                        port,
+                        config.gateway.path_prefix.as_deref(),
+                        &config.data_dir,
+                    )
+                    .await
                     {
                         Ok(()) => {
                             ::zeroclaw_log::record!(
@@ -14342,9 +14348,14 @@ fn log_gateway_start(host: &str, port: u16) {
 
 /// Gracefully shutdown a running gateway via the admin endpoint.
 #[cfg(feature = "agent-runtime")]
-async fn shutdown_gateway(host: &str, port: u16, path_prefix: Option<&str>) -> Result<()> {
+async fn shutdown_gateway(
+    host: &str,
+    port: u16,
+    path_prefix: Option<&str>,
+    data_dir: &std::path::Path,
+) -> Result<()> {
     let url = gateway_admin_url(host, port, path_prefix, "/admin/shutdown");
-    let client = reqwest::Client::new();
+    let client = gateway_local_admin_client(host, data_dir)?;
 
     match client
         .post(&url)
@@ -14397,7 +14408,7 @@ async fn sop_admin_request(cmd: SopCommands, config: &crate::config::Config) -> 
     let host = config.gateway.host.clone();
     let port = config.gateway.port;
     let prefix = config.gateway.path_prefix.as_deref();
-    let client = reqwest::Client::new();
+    let client = gateway_local_admin_client(&host, &config.data_dir)?;
     match cmd {
         SopCommands::Pending => {
             let url = gateway_admin_url(&host, port, prefix, "/admin/sop/pending");
@@ -14685,17 +14696,7 @@ async fn fetch_paircode(
     data_dir: &std::path::Path,
     action: &PaircodeAction,
 ) -> Result<PaircodeResult> {
-    // The pairing-code admin routes accept only this run's admin token, which
-    // the gateway writes owner-only into its data directory at startup.
-    let admin_token =
-        zeroclaw_config::pairing::read_gateway_admin_token(data_dir).ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "No gateway admin token at {}. Run this on the gateway host, as the user that \
-             runs the gateway, while the gateway is running.",
-                zeroclaw_config::pairing::gateway_admin_token_path(data_dir).display()
-            ))
-        })?;
-    let client = reqwest::Client::new();
+    let client = gateway_local_admin_client(host, data_dir)?;
 
     let response = if action.mints_code() {
         let mut url = gateway_admin_url(host, port, path_prefix, "/admin/paircode/new");
@@ -14705,10 +14706,6 @@ async fn fetch_paircode(
         }
         client
             .post(&url)
-            .header(
-                zeroclaw_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER,
-                &admin_token,
-            )
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
@@ -14716,10 +14713,6 @@ async fn fetch_paircode(
         let url = gateway_admin_url(host, port, path_prefix, "/admin/paircode");
         client
             .get(&url)
-            .header(
-                zeroclaw_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER,
-                &admin_token,
-            )
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
@@ -14784,8 +14777,44 @@ async fn fetch_paircode(
 }
 
 #[cfg(feature = "agent-runtime")]
+fn gateway_local_admin_client(host: &str, data_dir: &std::path::Path) -> Result<reqwest::Client> {
+    let local = host == "localhost"
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified());
+    anyhow::ensure!(
+        local,
+        t(
+            "cli-gateway-admin-local-host",
+            "Local gateway admin commands require a loopback host"
+        )
+    );
+    let admin_token = zeroclaw_config::pairing::read_gateway_admin_token(data_dir)
+        .ok_or_else(|| anyhow::anyhow!(ta(
+            "cli-gateway-admin-token-missing",
+            &[("path", &zeroclaw_config::pairing::gateway_admin_token_path(data_dir).display().to_string())],
+            "No gateway admin token at {$path}. Run this on the gateway host as the gateway user while it is running."
+        )))?;
+    let mut token = reqwest::header::HeaderValue::from_str(&admin_token)?;
+    token.set_sensitive(true);
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(zeroclaw_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER, token);
+    Ok(reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .default_headers(headers)
+        .build()?)
+}
+
+#[cfg(feature = "agent-runtime")]
 fn gateway_admin_url(host: &str, port: u16, path_prefix: Option<&str>, admin_path: &str) -> String {
     let prefix = path_prefix.unwrap_or("");
+    let host = match host {
+        "0.0.0.0" => "127.0.0.1",
+        "::" | "::1" => "[::1]",
+        other => other,
+    };
     format!("http://{host}:{port}{prefix}{admin_path}")
 }
 
@@ -18684,6 +18713,107 @@ mod tests {
             has_model_flag,
             "onboard help should include --model for quick setup overrides"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn gateway_local_admin_client_requires_local_host_and_token_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(gateway_local_admin_client("127.0.0.1", tmp.path()).is_err());
+        std::fs::write(
+            zeroclaw_config::pairing::gateway_admin_token_path(tmp.path()),
+            "fixture-admin-token",
+        )
+        .unwrap();
+        assert!(gateway_local_admin_client("203.0.113.7", tmp.path()).is_err());
+        assert!(gateway_local_admin_client("127.0.0.1", tmp.path()).is_ok());
+        assert_eq!(
+            gateway_admin_url("0.0.0.0", 42617, None, "/admin/shutdown"),
+            "http://127.0.0.1:42617/admin/shutdown"
+        );
+        assert_eq!(
+            gateway_admin_url("::", 42617, None, "/admin/shutdown"),
+            "http://[::1]:42617/admin/shutdown"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn gateway_admin_cli_sends_owner_file_token_and_does_not_follow_redirects() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let gateway = MockServer::start().await;
+        let destination = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            zeroclaw_config::pairing::gateway_admin_token_path(tmp.path()),
+            "fixture-admin-token",
+        )
+        .unwrap();
+        Mock::given(method("POST"))
+            .and(path("/admin/shutdown"))
+            .and(header(
+                zeroclaw_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER,
+                "fixture-admin-token",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&gateway)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/admin/sop/pending"))
+            .and(header(
+                zeroclaw_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER,
+                "fixture-admin-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"pending": []})),
+            )
+            .expect(1)
+            .mount(&gateway)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/admin/paircode"))
+            .and(header(
+                zeroclaw_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER,
+                "fixture-admin-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"pairing_code": "fixture-code"})),
+            )
+            .expect(1)
+            .mount(&gateway)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/redirect"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", destination.uri()))
+            .expect(1)
+            .mount(&gateway)
+            .await;
+        let port = gateway.address().port();
+        shutdown_gateway("127.0.0.1", port, None, tmp.path())
+            .await
+            .unwrap();
+        let mut config = Config::default();
+        config.data_dir = tmp.path().to_path_buf();
+        config.gateway.host = "127.0.0.1".into();
+        config.gateway.port = port;
+        sop_admin_request(SopCommands::Pending, &config)
+            .await
+            .unwrap();
+        let code = fetch_paircode("127.0.0.1", port, None, tmp.path(), &PaircodeAction::Show)
+            .await
+            .unwrap();
+        assert!(matches!(code, PaircodeResult::Code { code, .. } if code == "fixture-code"));
+        let response = gateway_local_admin_client("127.0.0.1", tmp.path())
+            .unwrap()
+            .get(format!("{}/redirect", gateway.uri()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        assert!(destination.received_requests().await.unwrap().is_empty());
     }
 
     #[test]
