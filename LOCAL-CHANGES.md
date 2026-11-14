@@ -646,6 +646,23 @@ paired bearer). Upstream v0.9.0 still allows loopback without a token.
 | `crates/zeroclaw-runtime/locales/en/cli.ftl` | Two CLI messages. |
 | `docs/book/src/ops/network-deployment.md` | Local admin needs the token; proxies must not inject it. |
 
+### Every workspace Markdown file is readable and editable through `/api/personality` (gateway)
+
+Agents like `director` (workspace `~/comfy-gate/director`) keep notes such as `OWNER.md`,
+`SCREENPLAY.md` and `queue/*/report.md` beside the fixed personality files, and the zc-codex
+Memory tab could not see them. `GET /api/personality?agent=<alias>&all=true` now also lists every
+other `.md` file in the workspace by relative path (shallowest first, `complete: false` past 2,000
+files); without `all` the index is upstream's. Hidden entries (`.prev-*`, `.git`),
+`node_modules`, `target`, `__pycache__` and symlinks are not listed, and depth stops at 8 folders.
+`GET`/`PUT /api/personality/{*filename}` serve those paths: an existing regular file whose
+canonical path stays inside the workspace, saved only with `expected_mtime_ms`. Allowlisted names
+keep upstream's behavior, including creating a missing file.
+
+| File | Why |
+|---|---|
+| `crates/zeroclaw-gateway/src/api_personality.rs` | `AgentQuery.all`, `Target`, `is_workspace_markdown_path`, `resolve_workspace_file`, `list_workspace_markdown`, `FILE_ROUTE`. Tests: `validate_filename_admits_workspace_markdown_paths_only`, `workspace_listing_skips_hidden_skipped_symlinked_and_root_allowlisted_files`, `workspace_files_resolve_only_inside_the_workspace`, `file_route_carries_nested_paths_and_leaves_templates_static`. |
+| `crates/zeroclaw-gateway/src/lib.rs` | The file route is the `{*filename}` wildcard (`api_personality::FILE_ROUTE`) instead of `{filename}`. |
+
 ### Documentation
 
 | File | Why |
@@ -812,6 +829,10 @@ take the fork's 11 arguments); no `contains("__")` admission came back in
 
 Re-check these after every upstream merge; they are easy to silently lose:
 
+- **The personality file route is a wildcard.** A merge that restores
+  `/api/personality/{filename}` makes nested workspace paths 404 while root files keep
+  working. `file_route_carries_nested_paths_and_leaves_templates_static` uses the same
+  `FILE_ROUTE` constant, so a merge that keeps the constant stays covered.
 - **Local admin needs the current admin token.** A merge that restores
   `AdminReloadGate::Allow` for loopback reopens `/admin/*` to any same-host proxy or
   tunnel. `admin_reload_gate_loopback_requires_local_token` pins it.
