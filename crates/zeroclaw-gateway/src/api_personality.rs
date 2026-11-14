@@ -1,6 +1,8 @@
 //! Read/write endpoints for per-agent personality markdown files
 //! (`SOUL.md`, `IDENTITY.md`, `USER.md`, `AGENTS.md`, `TOOLS.md`,
-//! `HEARTBEAT.md`, `BOOTSTRAP.md`, `MEMORY.md`).
+//! `HEARTBEAT.md`, `MEMORY.md`), plus any other existing `.md` file in the
+//! agent's workspace, addressed by its relative path (`OWNER.md`,
+//! `notes/plan.md`).
 
 use axum::{
     Json,
@@ -27,6 +29,9 @@ use super::api::require_auth;
 pub struct AgentQuery {
     #[serde(default)]
     pub agent: Option<String>,
+    /// Index only: also list every other `.md` file in the workspace.
+    #[serde(default)]
+    pub all: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -64,27 +69,169 @@ pub struct PersonalityConflict {
 
 // ── Sandbox helpers ─────────────────────────────────────────────────
 
-fn validate_filename(
-    filename: &str,
-) -> Result<&'static str, (StatusCode, Json<serde_json::Value>)> {
-    EDITABLE_PERSONALITY_FILES
+/// Route for one file; the wildcard admits relative paths with `/`.
+pub(crate) const FILE_ROUTE: &str = "/api/personality/{*filename}";
+
+/// Directories never listed or served, besides hidden ones.
+const SKIPPED_DIRS: &[&str] = &["node_modules", "target", "__pycache__"];
+/// Deepest folder below the workspace root that is listed or served.
+const MAX_WORKSPACE_DEPTH: usize = 8;
+/// Most extra files one index lists.
+const MAX_WORKSPACE_FILES: usize = 2_000;
+
+/// A personality request's file, before it is resolved against a workspace.
+#[derive(Debug, PartialEq, Eq)]
+enum Target {
+    /// An allowlisted file at the workspace root; it may not exist yet.
+    Allowlisted(&'static str),
+    /// Any other existing `.md` file in the workspace, by relative path.
+    Workspace(String),
+}
+
+impl Target {
+    fn name(&self) -> &str {
+        match self {
+            Self::Allowlisted(name) => name,
+            Self::Workspace(path) => path,
+        }
+    }
+}
+
+fn has_markdown_extension(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+}
+
+/// A `/`-separated relative `.md` path with no hidden, skipped, empty or
+/// parent components.
+fn is_workspace_markdown_path(path: &str) -> bool {
+    let parts: Vec<&str> = path.split('/').collect();
+    path.len() <= 1024
+        && parts.len() <= MAX_WORKSPACE_DEPTH + 1
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && !part.starts_with('.')
+                && !part.contains(['\\', '\0'])
+                && !SKIPPED_DIRS.contains(part)
+        })
+        && parts
+            .last()
+            .is_some_and(|name| has_markdown_extension(name))
+}
+
+fn validate_filename(filename: &str) -> Result<Target, (StatusCode, Json<serde_json::Value>)> {
+    if let Some(allowed) = EDITABLE_PERSONALITY_FILES
         .iter()
         .copied()
         .find(|allowed| *allowed == filename)
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "filename not in personality allowlist",
-                    "filename": filename,
-                    "allowed": EDITABLE_PERSONALITY_FILES,
-                })),
-            )
-        })
+    {
+        return Ok(Target::Allowlisted(allowed));
+    }
+    if is_workspace_markdown_path(filename) {
+        return Ok(Target::Workspace(filename.to_string()));
+    }
+    Err((
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": "filename is neither in the personality allowlist nor a workspace Markdown path",
+            "filename": filename,
+            "allowed": EDITABLE_PERSONALITY_FILES,
+        })),
+    ))
 }
 
-fn personality_path(workspace_dir: &Path, filename: &'static str) -> PathBuf {
-    workspace_dir.join(filename)
+/// Resolve an existing workspace file, following symlinks only while they
+/// stay inside the workspace.
+fn resolve_workspace_file(workspace_dir: &Path, relative: &str) -> std::io::Result<PathBuf> {
+    let root = workspace_dir.canonicalize()?;
+    let path = root.join(relative).canonicalize()?;
+    if !path.starts_with(&root) || !std::fs::metadata(&path)?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "not a file inside the workspace",
+        ));
+    }
+    Ok(path)
+}
+
+/// Resolve a target to its path on disk; a missing workspace file is a 404.
+fn target_path(
+    workspace_dir: &Path,
+    target: &Target,
+) -> Result<PathBuf, (StatusCode, Json<serde_json::Value>)> {
+    match target {
+        Target::Allowlisted(name) => Ok(workspace_dir.join(name)),
+        Target::Workspace(relative) => {
+            resolve_workspace_file(workspace_dir, relative).map_err(|_| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "personality file not found in the agent workspace",
+                        "filename": relative,
+                    })),
+                )
+            })
+        }
+    }
+}
+
+/// Every non-allowlisted `.md` file in the workspace, shallowest first.
+/// Hidden entries, [`SKIPPED_DIRS`] and symlinks are not listed. The flag is
+/// false when [`MAX_WORKSPACE_FILES`] cut the listing short.
+fn list_workspace_markdown(workspace_dir: &Path) -> (Vec<PersonalityFileEntry>, bool) {
+    let mut files = Vec::new();
+    let mut complete = true;
+    let mut dirs = vec![(workspace_dir.to_path_buf(), String::new(), 0usize)];
+    'walk: while let Some((dir, prefix, depth)) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let relative = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if name.starts_with('.') || SKIPPED_DIRS.contains(&name.as_str()) {
+                continue;
+            }
+            if kind.is_dir() {
+                if depth < MAX_WORKSPACE_DEPTH {
+                    dirs.push((entry.path(), relative, depth + 1));
+                }
+                continue;
+            }
+            if !kind.is_file()
+                || !is_workspace_markdown_path(&relative)
+                || (depth == 0 && EDITABLE_PERSONALITY_FILES.contains(&name.as_str()))
+            {
+                continue;
+            }
+            if files.len() == MAX_WORKSPACE_FILES {
+                complete = false;
+                break 'walk;
+            }
+            let meta = entry.metadata().ok();
+            files.push(PersonalityFileEntry {
+                filename: relative,
+                exists: true,
+                size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                mtime_ms: meta.as_ref().and_then(mtime_ms_of),
+            });
+        }
+    }
+    files.sort_by(|a, b| {
+        (a.filename.matches('/').count(), &a.filename)
+            .cmp(&(b.filename.matches('/').count(), &b.filename))
+    });
+    (files, complete)
 }
 
 /// Resolve the per-agent workspace directory for personality I/O. Returns
@@ -137,7 +284,9 @@ fn truncate_to_chars(content: &str, max: usize) -> (String, bool) {
 // ── Handlers ────────────────────────────────────────────────────────
 
 /// GET /api/personality?agent=`<alias>` — index of all allowlist files in the
-/// named agent's workspace.
+/// named agent's workspace. With `&all=true` it also lists every other `.md`
+/// file there by relative path, and reports `complete: false` when the
+/// listing was capped.
 pub async fn handle_index(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -174,14 +323,25 @@ pub async fn handle_index(
         })
         .collect();
 
-    Json(PersonalityListResult {
-        files,
-        max_chars: MAX_FILE_CHARS,
-    })
+    if !q.all {
+        return Json(PersonalityListResult {
+            files,
+            max_chars: MAX_FILE_CHARS,
+        })
+        .into_response();
+    }
+    let (extra, complete) = list_workspace_markdown(&workspace_dir);
+    let mut files = files;
+    files.extend(extra);
+    Json(serde_json::json!({
+        "files": files,
+        "max_chars": MAX_FILE_CHARS,
+        "complete": complete,
+    }))
     .into_response()
 }
 
-/// GET /api/personality/{filename} — read one file's full content.
+/// GET /api/personality/{*filename} — read one file's full content.
 pub async fn handle_get(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -192,7 +352,7 @@ pub async fn handle_get(
         return e.into_response();
     }
 
-    let allowed = match validate_filename(&filename) {
+    let target = match validate_filename(&filename) {
         Ok(f) => f,
         Err(e) => return e.into_response(),
     };
@@ -201,7 +361,11 @@ pub async fn handle_get(
         Ok(p) => p,
         Err(resp) => return resp.into_response(),
     };
-    let path = personality_path(&workspace_dir, allowed);
+    let path = match target_path(&workspace_dir, &target) {
+        Ok(p) => p,
+        Err(resp) => return resp.into_response(),
+    };
+    let allowed = target.name();
 
     match std::fs::read_to_string(&path) {
         Ok(raw) => {
@@ -236,7 +400,8 @@ pub async fn handle_get(
     }
 }
 
-/// PUT /api/personality/{filename} — overwrite the file.
+/// PUT /api/personality/{*filename} — overwrite the file. A non-allowlisted
+/// workspace file must already exist and needs `expected_mtime_ms`.
 pub async fn handle_put(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -248,10 +413,22 @@ pub async fn handle_put(
         return e.into_response();
     }
 
-    let allowed = match validate_filename(&filename) {
+    let target = match validate_filename(&filename) {
         Ok(f) => f,
         Err(e) => return e.into_response(),
     };
+    let allowed = target.name();
+
+    if matches!(target, Target::Workspace(_)) && body.expected_mtime_ms.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "expected_mtime_ms is required to save a workspace file",
+                "filename": allowed,
+            })),
+        )
+            .into_response();
+    }
 
     if body.content.chars().count() > MAX_FILE_CHARS {
         return (
@@ -268,7 +445,10 @@ pub async fn handle_put(
         Ok(p) => p,
         Err(resp) => return resp.into_response(),
     };
-    let path = personality_path(&workspace_dir, allowed);
+    let path = match target_path(&workspace_dir, &target) {
+        Ok(p) => p,
+        Err(resp) => return resp.into_response(),
+    };
 
     // Disk-drift guard: if the editor told us what mtime it saw, reject
     // the write when disk has moved since.
@@ -386,22 +566,152 @@ mod tests {
     }
 
     #[test]
-    fn validate_filename_rejects_traversal() {
+    fn validate_filename_admits_workspace_markdown_paths_only() {
+        assert_eq!(
+            validate_filename("SOUL.md").unwrap(),
+            Target::Allowlisted("SOUL.md")
+        );
+        for ok in [
+            "OWNER.md",
+            "identity.md",
+            "queue/2026-10-24-sofa/report.md",
+            "notes/Plan.MD",
+        ] {
+            assert_eq!(
+                validate_filename(ok).unwrap(),
+                Target::Workspace(ok.to_string())
+            );
+        }
+        let deep = format!("{}x.md", "d/".repeat(MAX_WORKSPACE_DEPTH + 1));
         for bad in [
             "../etc/passwd",
+            "../OWNER.md",
+            "notes/../SOUL.md",
+            "./OWNER.md",
             "IDENTITY.md/foo",
-            "OTHER.md",
-            "identity.md", // case-sensitive on purpose; matches runtime
+            ".prev-20260920/SOUL.md",
+            ".hidden.md",
+            "/abs.md",
+            "notes//plan.md",
+            "notes/",
+            "node_modules/pkg/README.md",
+            "target/doc.md",
+            "a\\b.md",
+            "nul\0.md",
+            "notes.txt",
             "",
+            deep.as_str(),
         ] {
-            assert!(validate_filename(bad).is_err());
+            assert!(validate_filename(bad).is_err(), "{bad}");
         }
     }
 
     #[test]
-    fn personality_path_joins_workspace_root() {
-        let p = personality_path(Path::new("/tmp/ws"), "SOUL.md");
+    fn allowlisted_targets_join_the_workspace_root_even_when_missing() {
+        let p = target_path(Path::new("/tmp/ws"), &Target::Allowlisted("SOUL.md")).unwrap();
         assert_eq!(p, Path::new("/tmp/ws/SOUL.md"));
+        let missing = target_path(Path::new("/tmp/ws"), &Target::Workspace("OWNER.md".into()));
+        assert_eq!(missing.unwrap_err().0, StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(unix)]
+    fn workspace() -> (tempfile::TempDir, tempfile::TempDir) {
+        use std::os::unix::fs::symlink;
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = ws.path();
+        for (path, body) in [
+            ("SOUL.md", "soul"),
+            ("OWNER.md", "owner"),
+            ("readme.txt", "text"),
+            ("notes/plan.md", "plan"),
+            ("notes/deep/x.MD", "deep"),
+            ("sub/SOUL.md", "nested soul"),
+            (".prev-20260920/SOUL.md", "backup"),
+            ("node_modules/pkg/README.md", "dependency"),
+        ] {
+            let file = root.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, body).unwrap();
+        }
+        std::fs::write(outside.path().join("secret.md"), "secret").unwrap();
+        symlink(outside.path().join("secret.md"), root.join("escape.md")).unwrap();
+        symlink(outside.path(), root.join("linked")).unwrap();
+        symlink(root.join("OWNER.md"), root.join("alias.md")).unwrap();
+        (ws, outside)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_listing_skips_hidden_skipped_symlinked_and_root_allowlisted_files() {
+        let (ws, _outside) = workspace();
+        let (files, complete) = list_workspace_markdown(ws.path());
+        let names: Vec<&str> = files.iter().map(|f| f.filename.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "OWNER.md",
+                "notes/plan.md",
+                "sub/SOUL.md",
+                "notes/deep/x.MD"
+            ]
+        );
+        assert!(complete);
+        assert!(files.iter().all(|f| f.exists && f.mtime_ms.is_some()));
+        assert_eq!(files[0].size, 5);
+        for name in names {
+            assert!(validate_filename(name).is_ok(), "{name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_files_resolve_only_inside_the_workspace() {
+        let (ws, _outside) = workspace();
+        let root = ws.path().canonicalize().unwrap();
+        assert_eq!(
+            resolve_workspace_file(ws.path(), "notes/plan.md").unwrap(),
+            root.join("notes/plan.md")
+        );
+        assert_eq!(
+            resolve_workspace_file(ws.path(), "alias.md").unwrap(),
+            root.join("OWNER.md")
+        );
+        for bad in ["missing.md", "escape.md", "linked/secret.md", "notes"] {
+            assert!(resolve_workspace_file(ws.path(), bad).is_err(), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn file_route_carries_nested_paths_and_leaves_templates_static() {
+        use axum::{Router, routing::get};
+        use tower::ServiceExt as _;
+        let app = Router::new()
+            .route("/api/personality/templates", get(|| async { "templates" }))
+            .route(
+                FILE_ROUTE,
+                get(|axum::extract::Path(f): axum::extract::Path<String>| async move { f }),
+            );
+        for (uri, expected) in [
+            ("/api/personality/templates", "templates"),
+            ("/api/personality/OWNER.md?agent=director", "OWNER.md"),
+            ("/api/personality/queue/a/report.md", "queue/a/report.md"),
+            (
+                "/api/personality/queue%2Fa%2Freport.md",
+                "queue/a/report.md",
+            ),
+        ] {
+            let request = axum::http::Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(body, expected.as_bytes(), "{uri}");
+        }
     }
 
     #[test]

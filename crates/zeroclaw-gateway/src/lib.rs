@@ -2753,7 +2753,7 @@ pub async fn run_gateway_with_plugin_webhooks(
             get(api_personality::handle_templates),
         )
         .route(
-            "/api/personality/{filename}",
+            api_personality::FILE_ROUTE,
             get(api_personality::handle_get).put(api_personality::handle_put),
         )
         .route("/api/browse", get(api_browse::handle_browse))
