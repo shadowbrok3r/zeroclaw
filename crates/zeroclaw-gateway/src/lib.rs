@@ -55,6 +55,7 @@ mod render_delivery;
 pub mod security_headers;
 pub(crate) mod session_events;
 mod session_experiments;
+mod session_films;
 mod session_jobs;
 mod session_media;
 pub mod session_queue;
@@ -2852,6 +2853,11 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route("/api/sessions/{id}/jobs/{job}/outputs/{index}", get(session_jobs::output))
         .route("/api/sessions/{id}/experiments", get(session_experiments::list))
         .route("/api/sessions/{id}/experiments/{name}/pick", post(session_experiments::pick))
+        .route("/api/sessions/{id}/films", get(session_films::list))
+        .route("/api/sessions/{id}/films/casting", post(session_films::cast))
+        .route("/api/sessions/{id}/films/casting/{sheet}/pick", post(session_films::pick))
+        .route("/api/sessions/{id}/films/orders", post(session_films::order))
+        .route("/api/sessions/{id}/films/orders/{order}/cancel", post(session_films::cancel))
         .route("/api/sessions/{id}/abort", post(dashboard_core::session_abort))
         .route("/api/agents/available", get(dashboard_core::agents_available))
         // ── Pairing + Device management API ──
