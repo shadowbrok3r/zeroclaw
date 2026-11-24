@@ -663,6 +663,19 @@ keep upstream's behavior, including creating a missing file.
 | `crates/zeroclaw-gateway/src/api_personality.rs` | `AgentQuery.all`, `Target`, `is_workspace_markdown_path`, `resolve_workspace_file`, `list_workspace_markdown`, `FILE_ROUTE`. Tests: `validate_filename_admits_workspace_markdown_paths_only`, `workspace_listing_skips_hidden_skipped_symlinked_and_root_allowlisted_files`, `workspace_files_resolve_only_inside_the_workspace`, `file_route_carries_nested_paths_and_leaves_templates_static`. |
 | `crates/zeroclaw-gateway/src/lib.rs` | The file route is the `{*filename}` wildcard (`api_personality::FILE_ROUTE`) instead of `{filename}`. |
 
+### The phone's Films cards (gateway)
+
+Logan picks the nightly films from the zc-codex Films tab: he keeps or drops women from casting
+sheets and orders films (one of his women, a place, one to three acts). As with the rating card,
+the gateway only authorizes the paired device and runs the helper named by `ZEROCLAW_FILM_CARDS`
+(`comfy-gate/director/cards.py`) with a fixed argument array. The helper owns what all of it means
+and answers every call with the whole snapshot. Unset, every route answers 501.
+
+| File | Why |
+|---|---|
+| `crates/zeroclaw-gateway/src/session_films.rs` (NEW) | `GET /api/sessions/{id}/films` runs `list`; `POST …/films/casting` runs `cast` (the helper draws in the background, so the 12 s `run_args` limit holds); `POST …/films/casting/{sheet}/pick` maps `{"index","verdict"}` through `pick_args()`; `POST …/films/orders` maps `{"woman","place","acts","notes"}` through `order_args()`; `POST …/films/orders/{order}/cancel`. Values go in as `--name=value` so phone text never becomes an option; ids must be the helper's shapes (`valid_id`). A helper's non-zero exit is a 400 carrying its stderr (the `Comfy job observer: ` prefix stripped); anything else from it is a 502. Tests: `a_keep_or_drop_is_one_fixed_helper_call`, `an_order_cannot_smuggle_options_or_run_long`, `ids_are_the_helpers_own_shapes`. |
+| `crates/zeroclaw-gateway/src/lib.rs` | `mod session_films;` and the five routes. |
+
 ### Documentation
 
 | File | Why |
