@@ -28,6 +28,28 @@ Context that shapes the design:
 Architecture documentation for the overhaul:
 `docs/book/src/architecture/session-lifecycle.md`.
 
+## Deploy build
+
+The binary at `~/.cargo/bin/zeroclaw` on ubuntu-ai-amd is built from `fork/main` in a
+throwaway worktree. Local `~/zeroclaw` `main` lags `fork/main` by hundreds of commits: never
+build the deploy from it.
+
+```
+git -C ~/zeroclaw fetch fork
+git -C ~/zeroclaw worktree add --detach ~/zeroclaw-deploy-<tag> fork/main
+cd ~/zeroclaw-deploy-<tag> && cargo build --release --locked --features tools-compat,channel-mqtt
+```
+
+- `tools-compat`: `codex_cli`, `claude_code`, `web_search_tool` and `browser` are not in
+  `default`.
+- `channel-mqtt`: the MQTT -> SOP listener is not in `default-channels`. Without it the daemon
+  still reports the mqtt component healthy but never subscribes, so MQTT-triggered SOPs
+  (`jarvis-events`, `order-prep`) never run. The 2026-10-23 v0.8.6 deploy dropped it this way;
+  restored 2026-11-25. Check a build with `strings <binary> | grep -c rumqttc` (must be > 0).
+
+Swap the binary by rename (keep the old one as `zeroclaw.bak-<reason>-<ts>`) and restart with
+`systemctl --user restart zeroclaw` after checking `session_metadata` for running turns.
+
 ## Change inventory
 
 ### `crates/zeroclaw-gateway/src/ws.rs` — a turn outlives its client's socket
